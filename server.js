@@ -13,6 +13,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production
 const CORTEX_MODEL = 'claude-sonnet-4-5';     // Fast brain — handles live conversation (<2s)
 const PREFRONTAL_MODEL = 'claude-opus-4-6';    // Deep brain — async background thinking (3-5s)
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';    // Reflex brain — instant reactions (<500ms)
+console.log('[BOOT] Dual-brain architecture loading...');
 
 // ============================================================
 // SHARED CONSCIOUSNESS STATE
