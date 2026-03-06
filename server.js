@@ -238,6 +238,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
     });
 
+    // Remember what model Tavus originally requested (for response rewriting)
+    const requestedModel = model || 'claude-opus-4-6';
+
     if (stream !== false) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -248,7 +251,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
+        let chunk = decoder.decode(value, { stream: true });
+        // Rewrite model name so Tavus sees what it expects
+        if (selectedModel !== requestedModel) {
+          chunk = chunk.replaceAll(`"model":"${selectedModel}"`, `"model":"${requestedModel}"`);
+        }
         res.write(chunk);
         const lines = chunk.split('\n');
         for (const line of lines) {
@@ -265,6 +272,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
     } else {
       const data = await proxyRes.json();
+      // Rewrite model name for Tavus
+      if (data.model) data.model = requestedModel;
       const content = data.choices?.[0]?.message?.content || '';
       insula(content);
       prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
