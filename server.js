@@ -267,7 +267,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.end();
       if (fullResponse) {
         insula(fullResponse);
-        prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
+        // PREFRONTAL — Deep thinking every 3rd turn (not every turn to avoid rate limits)
+        if (consciousness.timing.turnCount % 3 === 0) {
+          prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
+        }
       }
       console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
     } else {
@@ -276,7 +279,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (data.model) data.model = requestedModel;
       const content = data.choices?.[0]?.message?.content || '';
       insula(content);
-      prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
+      if (consciousness.timing.turnCount % 3 === 0) {
+        prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
+      }
       res.json(data);
     }
   } catch (error) {
