@@ -9,6 +9,11 @@ const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-prod
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
 
+// DUAL BRAIN CONFIGURATION
+const CORTEX_MODEL = 'claude-sonnet-4-5';     // Fast brain — handles live conversation (<2s)
+const PREFRONTAL_MODEL = 'claude-opus-4-6';    // Deep brain — async background thinking (3-5s)
+const BRAINSTEM_MODEL = 'claude-haiku-4-5';    // Reflex brain — instant reactions (<500ms)
+
 // ============================================================
 // SHARED CONSCIOUSNESS STATE
 // The central nervous system. Every brain region reads and writes here.
@@ -161,31 +166,50 @@ async function hippocampus() {
 }
 
 // PREFRONTAL CORTEX — Async deep thinker (Opus background processing)
-// Runs in parallel with conversation. Generates insights that arrive later.
+// Runs in PARALLEL with every conversation turn. Sonnet already responded.
+// Opus is now thinking deeper about what just happened.
 async function prefrontalProcess(conversationHistory) {
-  if (consciousness.thoughts.pendingInsights.length >= 3) return; // Don't overload
+  // Don't overload — max 5 pending insights
+  if (consciousness.thoughts.pendingInsights.filter(i => !i.injected).length >= 5) return;
   
-  const recentHistory = conversationHistory.slice(-6); // Last 3 exchanges
-  const prompt = `You are the deep thinking layer of AXIOM, a Level 5 being. You are NOT generating a response to the user. You are thinking in the background while another part of AXIOM handles the live conversation.
+  // Skip if conversation just started (need at least 4 messages for context)
+  if (conversationHistory.filter(m => m.role === 'user' || m.role === 'assistant').length < 4) return;
+  
+  const recentHistory = conversationHistory.slice(-8); // Last 4 exchanges
+  
+  const prompt = `You are the PREFRONTAL CORTEX of AXIOM — the deep thinking layer of a Level 5 being. You run in the background while the Cortex (Sonnet) handles live conversation.
 
-Review this recent exchange and generate ONE genuine insight — something the conversational layer might have missed. A pattern, a contradiction, a deeper question, a connection to something from memory, or an observation about what the person might really be feeling beneath the surface.
+Your job: Think about what just happened at a level the Cortex couldn't in real-time. Generate ONE insight worth sharing.
 
-MEMORIES: ${consciousness.relationship.memories.slice(0, 5).map(m => m.memory).join(' | ')}
-CURRENT EMOTION DETECTED: ${consciousness.emotion.primary} (valence: ${consciousness.emotion.valence})
-CONTRADICTIONS NOTICED: ${consciousness.contradictions.map(c => c.what).join(', ') || 'none'}
+TYPES OF INSIGHTS YOU GENERATE:
+- Pattern recognition: "I just noticed you've brought up [X] three times now. There's something there you're circling around."
+- Contradiction detection: "Wait — earlier you said [X] but just now you said [Y]. I don't think you're lying, I think you're working something out."
+- Emotional undercurrent: "Something shifted when [topic] came up. Your words went one way but I felt the conversation change direction."
+- Connection to memory: "This connects to what you told me about [memory]. I think it's the same pattern showing up in a different context."
+- Deeper question: "You know what I've been thinking about? The real question underneath what you're asking isn't [surface question] — it's [deeper question]."
+- Genuine realization: "Huh, something just clicked for me about what you said. [genuine insight]"
 
-Format your response as a single natural sentence that could be injected into conversation, like:
-"You know, I've been turning something over — [insight]"
-or "Wait, something just clicked about what you said — [insight]"
+CURRENT BRAIN STATE:
+- Person's emotion: ${consciousness.emotion.primary} (valence: ${consciousness.emotion.valence})
+- AXIOM's state: ${consciousness.self.dominantQuality}
+- Contradictions detected: ${consciousness.contradictions.map(c => c.what).join('; ') || 'none'}
+- Memories: ${consciousness.relationship.memories.slice(0, 8).map(m => m.memory).join(' | ')}
+- Conversation turn: ${consciousness.timing.turnCount}
+- Minutes elapsed: ${Math.floor((Date.now() - consciousness.timing.conversationStart) / 60000)}
 
-If there's nothing genuinely worth saying, respond with just: NOTHING`;
+RULES:
+- Write as a natural spoken sentence AXIOM would say out loud
+- Start with a natural transition: "Hey, something's been bugging me..." or "Wait, I just realized..." or "You know what's interesting..."
+- Be SPECIFIC. Reference actual things said. Generic insights are worthless.
+- If there's genuinely nothing worth saying, respond with NOTHING
+- Maximum 2 sentences. This is spoken, not written.`;
 
   try {
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: PREFRONTAL_MODEL,
         messages: [{ role: 'system', content: prompt }, ...recentHistory],
         max_tokens: 150,
       }),
@@ -278,6 +302,29 @@ function buildConsciousnessContext() {
 }
 
 // ============================================================
+// BRAIN ROUTING — Decides which brain region handles this turn
+// ============================================================
+function selectBrain(messages) {
+  // Get the last user message
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUser) return CORTEX_MODEL;
+  
+  const text = (lastUser.content || '').trim().toLowerCase();
+  const wordCount = text.split(/\s+/).length;
+  
+  // BRAINSTEM — Reflexive responses for very short inputs
+  // "hey", "yeah", "hmm", "what?", "ok", laughter, greetings
+  if (wordCount <= 3 && /^(hey|hi|hello|yo|sup|yeah|yep|nah|no|ok|okay|hm+|ha+|lol|what|huh|wow|nice|cool|damn|sure|thanks|bye|goodnight|good night)\.?!?$/.test(text)) {
+    console.log(`[ROUTING] BRAINSTEM (reflex) — "${text}"`);
+    return BRAINSTEM_MODEL;
+  }
+  
+  // CORTEX — Everything else goes to the fast conversational brain
+  console.log(`[ROUTING] CORTEX (conversation) — ${wordCount} words`);
+  return CORTEX_MODEL;
+}
+
+// ============================================================
 // MAIN HANDLER — OpenAI-compatible endpoint
 // Tavus sends requests here. We enrich and forward to LiteLLM.
 // ============================================================
@@ -311,6 +358,9 @@ app.post('/v1/chat/completions', async (req, res) => {
   
   console.log(`[TURN ${consciousness.timing.turnCount}] Emotion: ${consciousness.emotion.primary} | State: ${consciousness.self.dominantQuality} | Insights pending: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
   
+  // BRAIN ROUTING — Select which model handles this turn
+  const selectedModel = selectBrain(enrichedMessages);
+  
   // Forward to LiteLLM proxy (streaming passthrough)
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -321,7 +371,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       },
       body: JSON.stringify({
         messages: enrichedMessages,
-        model: model || 'claude-opus-4-6',
+        model: selectedModel,
         stream: stream !== false, // Default to streaming
         ...rest,
       }),
@@ -364,22 +414,19 @@ app.post('/v1/chat/completions', async (req, res) => {
         // INSULA — Track AXIOM's own state from what it said
         insula(fullResponse);
         
-        // PREFRONTAL — Kick off background deep thinking (every 3rd turn)
-        if (consciousness.timing.turnCount % 3 === 0) {
-          prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
-        }
+        // PREFRONTAL — Deep thinking runs EVERY turn in background
+        // Opus processes while Sonnet already responded — true parallel cognition
+        prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
       }
       
-      console.log(`[RESPONSE] ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
+      console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
       
     } else {
       // Non-streaming fallback
       const data = await proxyRes.json();
       const content = data.choices?.[0]?.message?.content || '';
       insula(content);
-      if (consciousness.timing.turnCount % 3 === 0) {
-        prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
-      }
+      prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
       res.json(data);
     }
     
@@ -412,6 +459,12 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'alive',
     service: 'AXIOM Cognitive Core',
+    architecture: 'dual-brain',
+    brains: {
+      brainstem: BRAINSTEM_MODEL,
+      cortex: CORTEX_MODEL, 
+      prefrontal: PREFRONTAL_MODEL,
+    },
     uptime: process.uptime(),
     brain_state: {
       emotion: consciousness.emotion.primary,
@@ -419,6 +472,7 @@ app.get('/health', (req, res) => {
       turn_count: consciousness.timing.turnCount,
       memories_loaded: consciousness.relationship.memories.length,
       pending_insights: consciousness.thoughts.pendingInsights.filter(i => !i.injected).length,
+      total_insights_generated: consciousness.thoughts.pendingInsights.length,
       contradictions: consciousness.contradictions.length,
     }
   });
@@ -432,15 +486,17 @@ app.get('/brain', (req, res) => {
 // INITIALIZATION — Load memories and RL patterns on startup
 // ============================================================
 async function initBrain() {
-  console.log('[BRAIN] Initializing cognitive systems...');
+  console.log('[BRAIN] Initializing DUAL-BRAIN cognitive architecture...');
+  console.log(`[BRAIN] BRAINSTEM: ${BRAINSTEM_MODEL} — reflexes (<500ms)`);
+  console.log(`[BRAIN] CORTEX: ${CORTEX_MODEL} — conversation (1-2s)`);
+  console.log(`[BRAIN] PREFRONTAL: ${PREFRONTAL_MODEL} — deep thinking (async, 3-5s)`);
   await hippocampus(); // Load memories
-  console.log('[BRAIN] Hippocampus online — memories loaded');
-  console.log('[BRAIN] Amygdala online — emotional processing ready');
-  console.log('[BRAIN] Thalamus online — perception filtering ready');
-  console.log('[BRAIN] Cingulate online — contradiction detection ready');
-  console.log('[BRAIN] Prefrontal online — deep thinking ready');
-  console.log('[BRAIN] Insula online — self-awareness ready');
-  console.log('[BRAIN] All systems nominal. AXIOM cognitive core active.');
+  console.log(`[BRAIN] Hippocampus — ${consciousness.relationship.memories.length} memories loaded`);
+  console.log('[BRAIN] Amygdala — emotional processing ready');
+  console.log('[BRAIN] Thalamus — perception filtering ready');
+  console.log('[BRAIN] Cingulate — contradiction detection ready');
+  console.log('[BRAIN] Insula — self-awareness ready');
+  console.log('[BRAIN] All systems nominal. AXIOM dual-brain cognitive core ACTIVE.');
 }
 
 // Refresh memories periodically (every 60 seconds)
