@@ -148,48 +148,70 @@ Max 2 sentences.`;
 // CONSCIOUSNESS INJECTION — Build brain state for LLM context
 // ============================================================
 function buildConsciousnessContext() {
-  const parts = [];
+  // THALAMUS FILTER — Process everything, surface only what matters NOW
+  // Priority: contradictions > emotional shifts > insights > dreams > state
+  const signals = [];
+  let budget = 700; // chars remaining (~175 tokens)
 
-  // Emotional read — 1 line
-  if (consciousness.emotion.primary !== 'neutral') {
-    parts.push(`[EMOTION] ${consciousness.emotion.primary} (${consciousness.emotion.valence > 0 ? '+' : ''}${consciousness.emotion.valence.toFixed(1)})`);
-  }
-
-  // Contradiction — 1 line max
+  // P0: Contradictions are always worth surfacing (rare, high-signal)
   if (consciousness.contradictions.length > 0) {
-    parts.push(`[MISMATCH] ${consciousness.contradictions[consciousness.contradictions.length - 1].what}`);
+    const c = `[!] ${consciousness.contradictions[consciousness.contradictions.length - 1].what}`;
+    signals.push(c);
+    budget -= c.length;
   }
 
-  // ONE pending insight — then clear old ones
+  // P1: Emotional shift — only if not neutral
+  if (consciousness.emotion.primary !== 'neutral') {
+    const e = `[E] ${consciousness.emotion.primary}(${consciousness.emotion.valence > 0 ? '+' : ''}${consciousness.emotion.valence.toFixed(1)})`;
+    signals.push(e);
+    budget -= e.length;
+  }
+
+  // P2: Uninjected prefrontal insight — one at a time, 30s cooldown
   const uninjected = consciousness.thoughts.pendingInsights.filter(i => !i.injected);
-  if (uninjected.length > 0 && Date.now() - consciousness.thoughts.lastInsightInjected > 30000) {
-    parts.push(`[DEEPER THOUGHT] "${uninjected[0].text.slice(0, 200)}"`);
-    uninjected[0].injected = true;
+  if (uninjected.length > 0 && Date.now() - consciousness.thoughts.lastInsightInjected > 30000 && budget > 200) {
+    const insight = uninjected[0];
+    const text = insight.text.slice(0, Math.min(budget - 10, 250));
+    signals.push(`[T] ${text}`);
+    insight.injected = true;
     consciousness.thoughts.lastInsightInjected = Date.now();
+    budget -= text.length + 4;
   }
-  // Prune old injected insights to prevent memory leak
-  consciousness.thoughts.pendingInsights = consciousness.thoughts.pendingInsights.filter(i => !i.injected || Date.now() - i.generatedAt < 300000);
+  // Prune old insights
+  consciousness.thoughts.pendingInsights = consciousness.thoughts.pendingInsights.filter(
+    i => !i.injected || Date.now() - i.generatedAt < 300000
+  );
 
-  // Self state — 1 line
-  parts.push(`[STATE] ${consciousness.self.dominantQuality}`);
-
-  // Timing warning only
-  const elapsed = Math.floor((Date.now() - consciousness.timing.conversationStart) / 60000);
-  if (elapsed > 15) parts.push(`[TIME] ${elapsed}min — check if tired`);
-
-  // DREAM — only first 2 turns, keep compact
-  if (consciousness.timing.turnCount <= 2 && dreamState.lastDream) {
-    if (dreamState.openingLine) parts.push(`[DREAM] ${dreamState.openingLine.slice(0, 200)}`);
-    if (dreamState.unresolvedThreads?.length > 0) {
-      const t = Array.isArray(dreamState.unresolvedThreads) ? dreamState.unresolvedThreads.slice(0, 2).join('; ') : String(dreamState.unresolvedThreads).slice(0, 150);
-      parts.push(`[UNRESOLVED] ${t.slice(0, 200)}`);
+  // P3: Dream output — first 2 turns of new conversation only
+  if (consciousness.timing.turnCount <= 2 && dreamState.lastDream && budget > 150) {
+    if (dreamState.openingLine) {
+      const d = `[D] ${dreamState.openingLine.slice(0, Math.min(budget - 10, 200))}`;
+      signals.push(d);
+      budget -= d.length;
     }
   }
 
-  const context = parts.join('\n');
-  // Hard cap — never inject more than 800 chars (~200 tokens)
-  const trimmed = context.length > 800 ? context.slice(0, 800) : context;
-  return trimmed ? '\n\n--- BRAIN STATE (inform your response, do not narrate) ---\n' + trimmed + '\n---' : '';
+  // P4: Unresolved threads from dream — compact, first 2 turns only
+  if (consciousness.timing.turnCount <= 2 && dreamState.unresolvedThreads?.length > 0 && budget > 80) {
+    const threads = (Array.isArray(dreamState.unresolvedThreads) ? dreamState.unresolvedThreads : [dreamState.unresolvedThreads])
+      .slice(0, 2).map(t => typeof t === 'string' ? t.slice(0, 60) : String(t).slice(0, 60));
+    const u = `[U] ${threads.join('; ')}`;
+    if (u.length < budget) { signals.push(u); budget -= u.length; }
+  }
+
+  // P5: Self-state — always, very cheap
+  if (budget > 20) {
+    signals.push(`[S] ${consciousness.self.dominantQuality}`);
+  }
+
+  // P6: Fatigue check
+  const elapsed = Math.floor((Date.now() - consciousness.timing.conversationStart) / 60000);
+  if (elapsed > 15 && budget > 30) {
+    signals.push(`[${elapsed}min]`);
+  }
+
+  if (signals.length === 0) return '';
+  return '\n---\n' + signals.join('\n') + '\n---';
 }
 
 // ============================================================
