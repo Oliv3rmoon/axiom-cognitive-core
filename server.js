@@ -1248,6 +1248,29 @@ Respond in JSON with these keys:
     console.log(`[DREAM] Complete in ${Date.now() - startTime}ms`);
     console.log(`[DREAM] Threads: ${dreamState.unresolvedThreads?.length || 0} | Questions: ${dreamState.questionsForNext?.length || 0}`);
     console.log(`[DREAM] Opening: "${dreamState.openingLine || 'none'}"`);
+
+    // === MEMORY CONSOLIDATION — compress old episodic → long-term ===
+    try {
+      console.log('[DREAM] Triggering memory consolidation...');
+      const consolidateRes = await fetch(`${BACKEND_URL}/api/memories/consolidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const consolidateData = await consolidateRes.json();
+      if (consolidateData.consolidated?.length > 0) {
+        const totalArchived = consolidateData.consolidated.reduce((sum, c) => sum + c.archived, 0);
+        const totalCreated = consolidateData.consolidated.reduce((sum, c) => sum + c.consolidated_into, 0);
+        console.log(`[DREAM/CONSOLIDATION] ${totalArchived} episodic → ${totalCreated} long-term (${consolidateData.consolidated.length} categories)`);
+        if (consolidateData.promoted_to_core > 0) {
+          console.log(`[DREAM/CONSOLIDATION] ${consolidateData.promoted_to_core} memories promoted to CORE tier`);
+        }
+      } else {
+        console.log(`[DREAM/CONSOLIDATION] Nothing to consolidate yet: ${consolidateData.reason || 'too few old memories'}`);
+      }
+    } catch (e) {
+      console.error('[DREAM/CONSOLIDATION] Failed:', e.message);
+    }
   } catch (e) { console.error('[DREAM ERROR]', e.message); }
 }
 
