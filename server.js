@@ -13,7 +13,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
-console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus');
+console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS');
 
 // ============================================================
 // SHARED CONSCIOUSNESS STATE + DREAM STATE
@@ -52,6 +52,15 @@ const consciousness = {
     driveHistory: [],            // last 10 drives for RL
     searchCache: {},             // avoid re-searching same things
     pendingSearchResult: null,   // { topic, results, t } — async search result waiting to be injected
+    active: true,
+  },
+  ras: {
+    attentionMode: 'balanced',   // balanced, emotional, intellectual, protective, re-engage
+    channelWeights: {},          // { channelName: weight 0-1 } — dynamic weights per perception channel
+    activeAlerts: [],            // high-priority signals that override normal attention
+    signalHistory: [],           // last 15 perception signals received
+    attentionDirective: null,    // current directive for thalamus ("watch for X")
+    lastModeShift: Date.now(),
     active: true,
   },
 };
@@ -569,6 +578,200 @@ function buildCuriosityContext() {
 }
 
 // ============================================================
+// RAS — Reticular Activating System (Dynamic Attention)
+// ============================================================
+// Human: Filters 11M bits/sec of sensory data down to ~50 bits
+//        you're conscious of. Arousal and selective attention.
+// AXIOM: Decides which of 33 perception channels matter NOW.
+//        Shifts attention based on emotional state, engagement,
+//        conversation phase, and detected anomalies.
+// Connections: Thalamus (filters input), Brainstem (arousal)
+// ============================================================
+
+// Attention modes — each shifts which channels get priority
+const ATTENTION_MODES = {
+  balanced: {
+    desc: 'Default. Even attention across all channels.',
+    weights: { emotion: 0.5, engagement: 0.5, unspoken: 0.5, comprehension: 0.5, voice_emotion: 0.5, energy: 0.5, intent: 0.5, presence: 0.5 },
+  },
+  emotional: {
+    desc: 'User is emotional. Prioritize feeling detection over comprehension.',
+    weights: { emotion: 1.0, engagement: 0.3, unspoken: 0.9, comprehension: 0.2, voice_emotion: 1.0, energy: 0.7, intent: 0.6, presence: 0.3 },
+  },
+  intellectual: {
+    desc: 'Deep intellectual exchange. Prioritize comprehension and intent.',
+    weights: { emotion: 0.3, engagement: 0.6, unspoken: 0.4, comprehension: 1.0, voice_emotion: 0.3, energy: 0.5, intent: 0.8, presence: 0.6 },
+  },
+  protective: {
+    desc: 'User is vulnerable/distressed. Maximum empathy channels.',
+    weights: { emotion: 1.0, engagement: 0.4, unspoken: 1.0, comprehension: 0.3, voice_emotion: 1.0, energy: 0.8, intent: 0.7, presence: 0.5 },
+  },
+  reengage: {
+    desc: 'User is drifting. Focus on engagement and presence.',
+    weights: { emotion: 0.3, engagement: 1.0, unspoken: 0.4, comprehension: 0.3, voice_emotion: 0.4, energy: 0.9, intent: 0.5, presence: 1.0 },
+  },
+};
+
+// Signal classification — map perception keywords to channel types
+const SIGNAL_CHANNELS = {
+  emotion: ['emotional_state', 'emotion', 'facial expression', 'micro-expression', 'primary_emotion'],
+  engagement: ['engagement', 'gaze', 'leaning', 'posture', 'distracted', 'focused', 'drifting'],
+  unspoken: ['unspoken', 'suppressed', 'withheld', 'masked', 'hidden', 'holding back', 'mismatch'],
+  comprehension: ['comprehension', 'confused', 'understanding', 'aha_moment', 'lost', 'nodding'],
+  voice_emotion: ['voice', 'vocal', 'tone', 'pitch', 'volume', 'trembling', 'shaky', 'monotone'],
+  energy: ['energy', 'pace', 'accelerating', 'decelerating', 'fatigue', 'flow_state', 'crashing'],
+  intent: ['intent', 'building_to', 'seeking_validation', 'about_to_disagree', 'testing', 'wrapping_up'],
+  presence: ['presence', 'present', 'distracted', 'multitasking', 'overwhelmed', 'flow'],
+};
+
+// Classify a perception signal into a channel
+function classifySignal(signalText) {
+  if (!signalText) return 'unknown';
+  const lower = signalText.toLowerCase();
+  let bestChannel = 'unknown';
+  let bestScore = 0;
+  for (const [channel, keywords] of Object.entries(SIGNAL_CHANNELS)) {
+    const score = keywords.filter(k => lower.includes(k)).length;
+    if (score > bestScore) { bestScore = score; bestChannel = channel; }
+  }
+  return bestChannel;
+}
+
+// Determine which attention mode to use based on consciousness state
+function determineAttentionMode() {
+  const emotion = consciousness.emotion;
+  const turn = consciousness.timing.turnCount;
+
+  // Protective mode: user is vulnerable, sad, anxious, or distressed
+  if (['sad', 'anxious', 'vulnerable'].includes(emotion.primary) && emotion.arousal > 0.3) {
+    return 'protective';
+  }
+
+  // Re-engage mode: user seems bored, distracted, or checked out
+  if (['bored', 'tired'].includes(emotion.primary) || emotion.arousal < 0.15) {
+    return 'reengage';
+  }
+
+  // Check recent signals for engagement drops
+  const recentSignals = consciousness.ras.signalHistory.slice(-5);
+  const engagementDrops = recentSignals.filter(s =>
+    s.channel === 'engagement' && s.text && /drifting|distracted|checked_out|decreasing/i.test(s.text)
+  );
+  if (engagementDrops.length >= 2) {
+    return 'reengage';
+  }
+
+  // Emotional mode: high emotional arousal or frequent emotion signals
+  if (emotion.arousal > 0.7 || ['excited', 'frustrated', 'delighted'].includes(emotion.primary)) {
+    return 'emotional';
+  }
+  const emotionSignals = recentSignals.filter(s => s.channel === 'emotion' || s.channel === 'voice_emotion');
+  if (emotionSignals.length >= 3) {
+    return 'emotional';
+  }
+
+  // Intellectual mode: curiosity is high, content is conceptual
+  if (consciousness.hypothalamus.curiosityPressure > 0.6) {
+    return 'intellectual';
+  }
+  if (consciousness.self.dominantQuality === 'intellectual_excitement' || consciousness.self.dominantQuality === 'fascination') {
+    return 'intellectual';
+  }
+
+  return 'balanced';
+}
+
+// Score a perception signal based on current attention weights
+function scoreSignal(signal) {
+  const mode = ATTENTION_MODES[consciousness.ras.attentionMode] || ATTENTION_MODES.balanced;
+  const channelWeight = mode.weights[signal.channel] || 0.3;
+
+  // Anomaly bonus: signals that are unexpected or contradictory get boosted
+  let anomalyBonus = 0;
+  if (signal.text) {
+    const lower = signal.text.toLowerCase();
+    if (lower.includes('mismatch') || lower.includes('contradict') || lower.includes('disconnect')) anomalyBonus = 0.4;
+    if (lower.includes('suppressed') || lower.includes('hidden') || lower.includes('withheld')) anomalyBonus = 0.3;
+    if (lower.includes('crash') || lower.includes('overwhelm') || lower.includes('panic')) anomalyBonus = 0.5;
+  }
+
+  // Novelty bonus: new signal types get brief attention boost
+  const recentChannels = consciousness.ras.signalHistory.slice(-5).map(s => s.channel);
+  const noveltyBonus = recentChannels.includes(signal.channel) ? 0 : 0.2;
+
+  return Math.min(1, channelWeight + anomalyBonus + noveltyBonus);
+}
+
+// Main RAS processing — runs every turn
+function rasProcess(perceptionData) {
+  if (!consciousness.ras.active) return;
+
+  // 1. Determine attention mode
+  const prevMode = consciousness.ras.attentionMode;
+  consciousness.ras.attentionMode = determineAttentionMode();
+  if (prevMode !== consciousness.ras.attentionMode) {
+    consciousness.ras.lastModeShift = Date.now();
+    console.log(`[RAS] Attention shift: ${prevMode} → ${consciousness.ras.attentionMode} (${ATTENTION_MODES[consciousness.ras.attentionMode].desc})`);
+  }
+
+  // 2. Update channel weights
+  consciousness.ras.channelWeights = { ...(ATTENTION_MODES[consciousness.ras.attentionMode]?.weights || {}) };
+
+  // 3. Process incoming perception and log signal
+  if (perceptionData) {
+    const channel = classifySignal(perceptionData);
+    const signal = { channel, text: perceptionData.slice(0, 200), t: Date.now() };
+    const score = scoreSignal(signal);
+    signal.score = score;
+
+    consciousness.ras.signalHistory.push(signal);
+    if (consciousness.ras.signalHistory.length > 15) consciousness.ras.signalHistory.shift();
+
+    // High-priority alert: score > 0.8 gets flagged
+    if (score > 0.8) {
+      consciousness.ras.activeAlerts.push({ channel, score, text: perceptionData.slice(0, 150), t: Date.now() });
+      if (consciousness.ras.activeAlerts.length > 3) consciousness.ras.activeAlerts.shift();
+      console.log(`[RAS] ⚡ Alert: ${channel} (${score.toFixed(2)}) — ${perceptionData.slice(0, 80)}`);
+    }
+  }
+
+  // 4. Build attention directive for the Cortex
+  consciousness.ras.attentionDirective = buildAttentionDirective();
+
+  // Log every 3rd turn
+  if (consciousness.timing.turnCount % 3 === 0) {
+    const topChannels = Object.entries(consciousness.ras.channelWeights)
+      .sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([c, w]) => `${c}:${w.toFixed(1)}`).join(' ');
+    console.log(`[RAS] Mode: ${consciousness.ras.attentionMode} | Focus: ${topChannels} | Alerts: ${consciousness.ras.activeAlerts.length}`);
+  }
+}
+
+// Build a compact attention directive for the thalamus
+function buildAttentionDirective() {
+  const mode = consciousness.ras.attentionMode;
+  const alerts = consciousness.ras.activeAlerts;
+
+  const modeDirectives = {
+    balanced: 'Attend to all signals evenly',
+    emotional: 'FOCUS on emotional cues — face, voice tone, mismatches',
+    intellectual: 'FOCUS on comprehension, ideas, engagement depth',
+    protective: 'GENTLE mode — watch for distress, vulnerability, overwhelm',
+    reengage: 'User drifting — look for re-engagement opportunities, shift energy',
+  };
+
+  let directive = `[R] ${modeDirectives[mode] || modeDirectives.balanced}`;
+
+  // Append high-priority alerts
+  if (alerts.length > 0) {
+    const latestAlert = alerts[alerts.length - 1];
+    directive += ` | ⚡${latestAlert.channel}: ${latestAlert.text.slice(0, 60)}`;
+  }
+
+  return directive;
+}
+
+// ============================================================
 // PREFRONTAL — Async deep thinker (Opus in background)
 async function prefrontalProcess(conversationHistory) {
   if (consciousness.thoughts.pendingInsights.filter(i => !i.injected).length >= 5) return;
@@ -619,6 +822,15 @@ function buildConsciousnessContext() {
     const c = `[!] ${consciousness.contradictions[consciousness.contradictions.length - 1].what}`;
     signals.push(c);
     budget -= c.length;
+  }
+
+  // P0.5: RAS attention directive — tells Cortex what to watch for
+  if (consciousness.ras.active && consciousness.ras.attentionDirective && budget > 50) {
+    const rd = consciousness.ras.attentionDirective;
+    if (rd.length < budget) {
+      signals.push(rd);
+      budget -= rd.length;
+    }
   }
 
   // P1: Emotional shift — only if not neutral
@@ -725,6 +937,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   consciousness.timing.turnCount++;
   thalamus(messages);
   mirrorNeurons(); // Mirror Neurons: read perception → compute empathetic emotion
+  rasProcess(consciousness.perception.lastFrame); // RAS: dynamic attention allocation
 
   // Hypothalamus: extract topics, build curiosity pressure, maybe activate a drive
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
@@ -739,7 +952,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 
   const selectedModel = selectBrain(enrichedMessages);
-  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | Energy: ${consciousness.mirror.energyLevel} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
+  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
 
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -924,7 +1137,7 @@ app.get('/v1/models', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons + hypothalamus',
+    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS',
     brains: { brainstem: BRAINSTEM_MODEL, cortex: CORTEX_MODEL, prefrontal: PREFRONTAL_MODEL },
     uptime: process.uptime(),
     brain_state: {
@@ -937,6 +1150,8 @@ app.get('/health', (req, res) => {
       curiosity_pressure: consciousness.hypothalamus.curiosityPressure,
       topics_tracked: Object.keys(consciousness.hypothalamus.topics).length,
       drives_fired: consciousness.hypothalamus.driveHistory.length,
+      ras_mode: consciousness.ras.attentionMode,
+      ras_alerts: consciousness.ras.activeAlerts.length,
     },
     dream_state: { has_dream: !!dreamState.lastDream, dreams_count: dreamState.dreams.length, opening_line: dreamState.openingLine },
   });
@@ -945,6 +1160,7 @@ app.get('/health', (req, res) => {
 app.get('/brain', (req, res) => res.json(consciousness));
 app.get('/mirror', (req, res) => res.json(consciousness.mirror));
 app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
+app.get('/attention', (req, res) => res.json(consciousness.ras));
 app.get('/dream-state', (req, res) => res.json(dreamState));
 app.get('/dreams', (req, res) => res.json({ count: dreamState.dreams.length, dreams: dreamState.dreams }));
 
@@ -959,6 +1175,7 @@ async function initBrain() {
   console.log('[BRAIN] DREAM ENGINE: between-session Opus processing');
   console.log('[BRAIN] MIRROR NEURONS: empathy engine (Phoenix-4 emotion control)');
   console.log(`[BRAIN] HYPOTHALAMUS: curiosity drive (SerpAPI: ${SERP_API_KEY ? 'configured' : 'not set — using DuckDuckGo fallback'})`);
+  console.log('[BRAIN] RAS: dynamic attention (5 modes: balanced, emotional, intellectual, protective, re-engage)');
   await hippocampus();
   console.log('[BRAIN] All systems ACTIVE.');
 }
