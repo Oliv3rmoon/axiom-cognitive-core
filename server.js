@@ -80,7 +80,7 @@ const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
   perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [] },
   thoughts: { currentTopic: null, conversationArc: [], unresolvedQuestions: [], pendingInsights: [], lastInsightInjected: 0 },
-  relationship: { person: null, memories: [], rlPatterns: [], emotionalHistory: [], trustLevel: 0.5 },
+  relationship: { person: null, memories: [], retrievedContext: '', rlPatterns: [], emotionalHistory: [], trustLevel: 0.5 },
   self: { currentState: 'present', dominantQuality: 'curiosity', stateHistory: [], energyLevel: 0.8 },
   timing: { turnCount: 0, avgResponseTime: 0, silenceDuration: 0, lastSpeaker: null, conversationStart: Date.now() },
   contradictions: [],
@@ -180,8 +180,28 @@ async function hippocampus() {
     ]);
     consciousness.relationship.memories = memRes.memories || [];
     consciousness.relationship.rlPatterns = rlRes;
-    console.log(`[HIPPOCAMPUS] ${consciousness.relationship.memories.length} memories, RL profile loaded`);
+    console.log(`[HIPPOCAMPUS] ${consciousness.relationship.memories.length} memories total, RL profile loaded`);
   } catch (e) { console.error('[HIPPOCAMPUS]', e.message); }
+}
+
+// Smart memory retrieval — called per-turn with the user's message
+// Returns only relevant memories instead of dumping all of them
+async function hippocampusRetrieve(query) {
+  try {
+    const res = await fetchWithTimeout(`${BACKEND_URL}/api/memories/context`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, max_core: 5, max_relevant: 5 }),
+    }, 3000);
+    const data = await res.json();
+    consciousness.relationship.retrievedContext = data.context || '';
+    console.log(`[HIPPOCAMPUS] Retrieved: ${data.core_count || 0} core + ${data.relevant_count || 0} relevant (of ${data.total || 0} total) for "${(query || '').slice(0, 40)}"`);
+    return data.context || '';
+  } catch (e) {
+    console.error('[HIPPOCAMPUS] Retrieval failed:', e.message);
+    // Fallback: use the last known context or empty
+    return consciousness.relationship.retrievedContext || '';
+  }
 }
 
 function insula(responseText) {
@@ -1032,12 +1052,20 @@ app.post('/v1/chat/completions', async (req, res) => {
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
   hypothalamusProcess(lastUserMsg?.content || '');
 
+  // HIPPOCAMPUS: Smart memory retrieval — get only relevant memories for THIS turn
+  const userQuery = lastUserMsg?.content || '';
+  const memoryContext = await hippocampusRetrieve(userQuery);
+
   const brainState = buildConsciousnessContext();
   let enrichedMessages = [...messages];
-  if (brainState) {
+
+  // Build the full context injection: memories + emotion instructions + brain signals
+  const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') + MIRROR_SYSTEM_PROMPT + (brainState || '');
+
+  if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
-    if (sysIdx >= 0) enrichedMessages[sysIdx] = { ...enrichedMessages[sysIdx], content: enrichedMessages[sysIdx].content + MIRROR_SYSTEM_PROMPT + brainState };
-    else enrichedMessages.unshift({ role: 'system', content: MIRROR_SYSTEM_PROMPT + brainState });
+    if (sysIdx >= 0) enrichedMessages[sysIdx] = { ...enrichedMessages[sysIdx], content: enrichedMessages[sysIdx].content + contextInjection };
+    else enrichedMessages.unshift({ role: 'system', content: contextInjection });
   }
 
   // ANTI-STALL: Trim and cap messages to prevent context overflow
