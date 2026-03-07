@@ -8,7 +8,7 @@ app.use(express.json({ limit: '10mb' }));
 // ============================================================
 // MESSAGE SAFETY (keep context from exploding, not timeouts)
 // ============================================================
-const MAX_MESSAGES = 40;  // Generous — keep last 40 messages
+const MAX_MESSAGES = 60;  // Keep last 60 messages
 function trimMessages(messages) {
   if (messages.length <= MAX_MESSAGES) return messages;
   const system = messages.filter(m => m.role === 'system');
@@ -17,8 +17,8 @@ function trimMessages(messages) {
   return [...system, ...kept];
 }
 
-const MAX_MSG_CHARS = 6000;
-const MAX_SYSTEM_MSG_CHARS = 20000;  // System msgs hold persona + memories
+const MAX_MSG_CHARS = 10000;
+const MAX_SYSTEM_MSG_CHARS = 30000;  // System msgs hold persona + memories
 function capMessageSize(messages) {
   return messages.map(m => {
     if (!m.content) return m;
