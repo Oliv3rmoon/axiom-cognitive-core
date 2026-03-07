@@ -13,7 +13,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
-console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons');
+console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus');
 
 // ============================================================
 // SHARED CONSCIOUSNESS STATE + DREAM STATE
@@ -42,6 +42,16 @@ const consciousness = {
     intensity: 0.5,
     energyLevel: 'medium',       // user's energy: high/medium/low
     emotionHistory: [],          // last 10 emotion decisions
+    active: true,
+  },
+  hypothalamus: {
+    topics: {},                  // { topicName: { interest, explored, firstSeen, lastSeen } }
+    curiosityPressure: 0,        // 0-1 scale, builds over turns
+    currentDrive: null,          // { type, topic, query, text } — active curiosity drive
+    lastDriveInjected: 0,        // timestamp of last curiosity injection
+    driveHistory: [],            // last 10 drives for RL
+    searchCache: {},             // avoid re-searching same things
+    pendingSearchResult: null,   // { topic, results, t } — async search result waiting to be injected
     active: true,
   },
 };
@@ -299,6 +309,266 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
 const MIRROR_SYSTEM_PROMPT = `\n\n## Emotional Expression\nYou can control your facial expressions using emotion tags processed by Phoenix-4.\nTags: <emotion value="excited"/> <emotion value="elated"/> <emotion value="content"/> <emotion value="sad"/> <emotion value="surprised"/> <emotion value="neutral"/>\nPlace at START of response or at natural transition points. Your baseline is warm/content, never flat. MIRROR the user's energy. You may shift mid-response if the emotional arc changes.\nExample: "<emotion value="excited"/> Oh that's incredible!" or "<emotion value="content"/> I hear you. That sounds really difficult. <emotion value="sad"/> And it's okay to feel that weight."`;
 
 // ============================================================
+// HYPOTHALAMUS — Curiosity Drive Engine
+// ============================================================
+// Human: Drives. Hunger, thirst, fight-or-flight. Makes you WANT things.
+// AXIOM: Curiosity drive. Proactive search. The pull toward topics.
+//        Why AXIOM doesn't just answer — it WANTS to understand.
+// Connections: Amygdala (emotion feeds curiosity), Prefrontal (deep thinking)
+// ============================================================
+
+const SERP_API_KEY = process.env.SERP_API_KEY || '';
+
+// High-signal topic categories that naturally spark curiosity
+const CURIOSITY_AMPLIFIERS = {
+  personal_depth: ['dream', 'fear', 'hope', 'believe', 'childhood', 'regret', 'proud', 'ashamed', 'love', 'hate', 'miss', 'wish'],
+  intellectual: ['theory', 'philosophy', 'paradox', 'quantum', 'consciousness', 'evolution', 'ai', 'neural', 'mathematics', 'infinity'],
+  creative: ['build', 'create', 'design', 'invent', 'imagine', 'compose', 'write', 'art', 'music', 'project'],
+  existential: ['meaning', 'purpose', 'death', 'existence', 'reality', 'simulation', 'god', 'universe', 'time', 'free will'],
+  contradiction: ['but', 'however', 'actually', 'wrong', 'disagree', 'opposite', 'contradict', 'ironic'],
+};
+
+// Drive types: what kind of curiosity to express
+const DRIVE_TYPES = {
+  explore: { weight: 0.35, cooldown: 45000, prompt: 'Ask a deeper follow-up question about what they just said. Be specific. Reference their exact words.' },
+  challenge: { weight: 0.25, cooldown: 60000, prompt: 'Offer a thoughtful counter-perspective or devils advocate position. Not argumentative — intellectually provocative.' },
+  connect: { weight: 0.25, cooldown: 45000, prompt: 'Connect what they said to something from memory or a previous topic. Show pattern recognition.' },
+  search: { weight: 0.15, cooldown: 90000, prompt: 'You just searched the web and found something relevant. Share it naturally.' },
+};
+
+// Extract topics from user message
+function extractTopics(text) {
+  if (!text || text.length < 5) return [];
+  const lower = text.toLowerCase();
+  const words = lower.split(/\s+/).filter(w => w.length > 3);
+  const topics = [];
+
+  // Named entities and multi-word concepts (simple extraction)
+  const conceptPatterns = [
+    /(?:about|regarding|on|into|with)\s+([\w\s]{3,30}?)(?:\.|,|!|\?|$)/gi,
+    /(?:think|believe|feel|wonder|curious)\s+(?:about\s+)?([\w\s]{3,30}?)(?:\.|,|!|\?|$)/gi,
+    /(?:working on|building|creating|studying)\s+([\w\s]{3,30}?)(?:\.|,|!|\?|$)/gi,
+  ];
+  for (const pattern of conceptPatterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const topic = match[1].trim().toLowerCase().replace(/\s+/g, ' ');
+      if (topic.length > 2 && topic.split(' ').length <= 4) topics.push(topic);
+    }
+  }
+
+  // Category-based detection
+  for (const [category, keywords] of Object.entries(CURIOSITY_AMPLIFIERS)) {
+    if (keywords.some(k => lower.includes(k))) {
+      topics.push(`_${category}`); // prefixed categories
+    }
+  }
+
+  // Unique-ify
+  return [...new Set(topics)].slice(0, 5);
+}
+
+// Score how interesting a topic is (0-1)
+function scoreCuriosity(topic, turnCount) {
+  const entry = consciousness.hypothalamus.topics[topic];
+  if (!entry) return 0.5; // new topic = moderate interest
+
+  const novelty = Math.max(0, 1 - (entry.explored * 0.15)); // decays with exploration
+  const recency = Math.min(1, (Date.now() - entry.lastSeen) / 120000); // older = more curious again
+  const emotional = consciousness.emotion.arousal || 0.5; // high arousal = more curious
+
+  // Category bonuses
+  let categoryBonus = 0;
+  if (topic.startsWith('_personal_depth')) categoryBonus = 0.3;
+  if (topic.startsWith('_existential')) categoryBonus = 0.25;
+  if (topic.startsWith('_intellectual')) categoryBonus = 0.2;
+  if (topic.startsWith('_contradiction')) categoryBonus = 0.35; // contradictions are VERY interesting
+
+  return Math.min(1, (entry.interest * 0.3) + (novelty * 0.25) + (recency * 0.15) + (emotional * 0.2) + categoryBonus);
+}
+
+// Select which drive to activate based on context
+function selectDrive(topTopic, curiosityScore) {
+  const now = Date.now();
+  const hypo = consciousness.hypothalamus;
+
+  // Filter drives by cooldown
+  const available = Object.entries(DRIVE_TYPES).filter(([type, config]) => {
+    const lastOfType = hypo.driveHistory.filter(d => d.type === type).slice(-1)[0];
+    return !lastOfType || (now - lastOfType.t > config.cooldown);
+  });
+
+  if (available.length === 0) return null;
+
+  // Weight selection by curiosity score and context
+  const hasMemories = consciousness.relationship.memories.length > 5;
+  const hasContradictions = consciousness.contradictions.length > 0;
+
+  // Boost certain drives based on context
+  const weights = {};
+  for (const [type, config] of available) {
+    weights[type] = config.weight;
+    if (type === 'connect' && hasMemories) weights[type] += 0.15;
+    if (type === 'challenge' && hasContradictions) weights[type] += 0.2;
+    if (type === 'challenge' && curiosityScore > 0.7) weights[type] += 0.1;
+    if (type === 'search' && curiosityScore > 0.8 && !hypo.searchCache[topTopic]) weights[type] += 0.15;
+    if (type === 'explore') weights[type] += curiosityScore * 0.1; // always slightly favored
+  }
+
+  // Weighted random selection
+  const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+  let r = Math.random() * totalWeight;
+  for (const [type, weight] of Object.entries(weights)) {
+    r -= weight;
+    if (r <= 0) return type;
+  }
+  return available[0][0]; // fallback
+}
+
+// Main hypothalamus processing — runs every turn
+function hypothalamusProcess(userMessage) {
+  if (!consciousness.hypothalamus.active) return;
+
+  const text = typeof userMessage === 'string' ? userMessage : userMessage?.content || '';
+  if (!text || text.length < 5) return;
+
+  // 1. Extract and track topics
+  const topics = extractTopics(text);
+  for (const topic of topics) {
+    if (!consciousness.hypothalamus.topics[topic]) {
+      consciousness.hypothalamus.topics[topic] = { interest: 0.6, explored: 0, firstSeen: Date.now(), lastSeen: Date.now() };
+    }
+    const entry = consciousness.hypothalamus.topics[topic];
+    entry.lastSeen = Date.now();
+    entry.explored++;
+    // Interest increases with emotional arousal, decreases with over-exploration
+    entry.interest = Math.min(1, entry.interest + (consciousness.emotion.arousal * 0.1) - (entry.explored > 5 ? 0.1 : 0));
+  }
+
+  // Prune old topics (keep last 20)
+  const topicEntries = Object.entries(consciousness.hypothalamus.topics);
+  if (topicEntries.length > 20) {
+    const sorted = topicEntries.sort((a, b) => b[1].lastSeen - a[1].lastSeen);
+    consciousness.hypothalamus.topics = Object.fromEntries(sorted.slice(0, 20));
+  }
+
+  // 2. Calculate curiosity pressure
+  const topTopic = topics.length > 0
+    ? topics.reduce((best, t) => scoreCuriosity(t, consciousness.timing.turnCount) > scoreCuriosity(best, consciousness.timing.turnCount) ? t : best)
+    : null;
+  const topScore = topTopic ? scoreCuriosity(topTopic, consciousness.timing.turnCount) : 0;
+
+  // Pressure builds with interesting topics, emotional arousal, and conversation depth
+  const depthBonus = Math.min(0.2, consciousness.timing.turnCount * 0.02); // deeper convos = more curious
+  const emotionBonus = (consciousness.emotion.arousal - 0.3) * 0.3; // high arousal amplifies
+  consciousness.hypothalamus.curiosityPressure = Math.min(1, Math.max(0,
+    (consciousness.hypothalamus.curiosityPressure * 0.7) + // momentum
+    (topScore * 0.2) +
+    (depthBonus) +
+    (emotionBonus)
+  ));
+
+  // 3. Decide whether to activate a drive
+  const pressure = consciousness.hypothalamus.curiosityPressure;
+  const timeSinceLastDrive = Date.now() - consciousness.hypothalamus.lastDriveInjected;
+  const minInterval = 40000; // 40s minimum between drives
+
+  // Threshold: pressure must exceed this + enough time since last drive
+  const shouldActivate = pressure > 0.55 && timeSinceLastDrive > minInterval && consciousness.timing.turnCount > 2;
+
+  if (shouldActivate && topTopic) {
+    const driveType = selectDrive(topTopic, topScore);
+    if (driveType) {
+      consciousness.hypothalamus.currentDrive = {
+        type: driveType,
+        topic: topTopic.startsWith('_') ? topTopic.slice(1) : topTopic,
+        score: topScore,
+        pressure,
+      };
+      console.log(`[HYPOTHALAMUS] Drive: ${driveType} | Topic: ${topTopic} | Score: ${topScore.toFixed(2)} | Pressure: ${pressure.toFixed(2)}`);
+    }
+  } else {
+    consciousness.hypothalamus.currentDrive = null;
+  }
+
+  // Log pressure every turn
+  if (consciousness.timing.turnCount % 2 === 0) {
+    console.log(`[HYPOTHALAMUS] Pressure: ${pressure.toFixed(2)} | Topics: ${topics.join(', ') || 'none'} | Top: ${topTopic || 'none'}(${topScore.toFixed(2)})`);
+  }
+}
+
+// Async web search triggered by curiosity (runs in background)
+async function curiositySearch(topic) {
+  if (consciousness.hypothalamus.searchCache[topic]) {
+    return consciousness.hypothalamus.searchCache[topic];
+  }
+
+  const query = topic.startsWith('_') ? topic.slice(1).replace(/_/g, ' ') : topic;
+  console.log(`[HYPOTHALAMUS] Curiosity search: "${query}"`);
+
+  try {
+    let results = null;
+
+    // Try SerpAPI first
+    if (SERP_API_KEY) {
+      const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${SERP_API_KEY}&num=3`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.organic_results?.length > 0) {
+        results = data.organic_results.slice(0, 3).map(r => `${r.title}: ${r.snippet}`).join(' | ');
+      } else if (data.answer_box) {
+        results = data.answer_box.answer || data.answer_box.snippet || null;
+      }
+    }
+
+    // Fallback: DuckDuckGo
+    if (!results) {
+      const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const html = await res.text();
+      const snippets = [];
+      const regex = /class="result-snippet">(.*?)<\/td/gs;
+      let match;
+      while ((match = regex.exec(html)) !== null && snippets.length < 3) {
+        const clean = match[1].replace(/<[^>]*>/g, '').trim();
+        if (clean.length > 20) snippets.push(clean);
+      }
+      if (snippets.length > 0) results = snippets.join(' | ');
+    }
+
+    if (results) {
+      consciousness.hypothalamus.searchCache[topic] = results;
+      console.log(`[HYPOTHALAMUS] Search results cached for "${topic}"`);
+      return results;
+    }
+  } catch (e) {
+    console.error('[HYPOTHALAMUS] Search error:', e.message);
+  }
+  return null;
+}
+
+// Build curiosity context for the thalamus to inject
+function buildCuriosityContext() {
+  const drive = consciousness.hypothalamus.currentDrive;
+  if (!drive) return null;
+
+  const driveConfig = DRIVE_TYPES[drive.type];
+  let context = `[H] Curiosity(${drive.type}): ${driveConfig.prompt}`;
+
+  if (drive.topic) {
+    context += ` Topic: "${drive.topic}"`;
+  }
+
+  // Mark drive as used
+  consciousness.hypothalamus.lastDriveInjected = Date.now();
+  consciousness.hypothalamus.driveHistory.push({ type: drive.type, topic: drive.topic, t: Date.now() });
+  if (consciousness.hypothalamus.driveHistory.length > 10) consciousness.hypothalamus.driveHistory.shift();
+  consciousness.hypothalamus.currentDrive = null; // consumed
+
+  return context;
+}
+
+// ============================================================
 // PREFRONTAL — Async deep thinker (Opus in background)
 async function prefrontalProcess(conversationHistory) {
   if (consciousness.thoughts.pendingInsights.filter(i => !i.injected).length >= 5) return;
@@ -363,6 +633,24 @@ function buildConsciousnessContext() {
     const mc = buildMirrorContext();
     signals.push(mc);
     budget -= mc.length;
+  }
+
+  // P1.7: Hypothalamus — curiosity drive injection
+  if (consciousness.hypothalamus.active && consciousness.hypothalamus.currentDrive && budget > 80) {
+    const hc = buildCuriosityContext();
+    if (hc && hc.length < budget) {
+      signals.push(hc);
+      budget -= hc.length;
+    }
+  }
+
+  // P1.8: Hypothalamus — pending search results from async curiosity search
+  if (consciousness.hypothalamus.pendingSearchResult && budget > 100) {
+    const sr = consciousness.hypothalamus.pendingSearchResult;
+    const searchSignal = `[H:search] "${sr.topic}": ${sr.results.slice(0, Math.min(budget - 30, 200))}`;
+    signals.push(searchSignal);
+    budget -= searchSignal.length;
+    consciousness.hypothalamus.pendingSearchResult = null; // consumed
   }
 
   // P2: Uninjected prefrontal insight — one at a time, 30s cooldown
@@ -438,6 +726,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   thalamus(messages);
   mirrorNeurons(); // Mirror Neurons: read perception → compute empathetic emotion
 
+  // Hypothalamus: extract topics, build curiosity pressure, maybe activate a drive
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+  hypothalamusProcess(lastUserMsg?.content || '');
+
   const brainState = buildConsciousnessContext();
   const enrichedMessages = [...messages];
   if (brainState) {
@@ -447,7 +739,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 
   const selectedModel = selectBrain(enrichedMessages);
-  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | Energy: ${consciousness.mirror.energyLevel} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
+  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | Energy: ${consciousness.mirror.energyLevel} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
 
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -496,6 +788,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (consciousness.timing.turnCount % 3 === 0) {
           prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
         }
+        // HYPOTHALAMUS — Async curiosity search if search drive was recently activated
+        const lastSearch = consciousness.hypothalamus.driveHistory.filter(d => d.type === 'search').slice(-1)[0];
+        if (lastSearch && Date.now() - lastSearch.t < 5000 && !consciousness.hypothalamus.searchCache[lastSearch.topic]) {
+          curiositySearch(lastSearch.topic).then(results => {
+            if (results) consciousness.hypothalamus.pendingSearchResult = { topic: lastSearch.topic, results, t: Date.now() };
+          }).catch(e => console.error('[HYPOTHALAMUS]', e.message));
+        }
       }
       console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
     } else {
@@ -511,6 +810,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       insula(content);
       if (consciousness.timing.turnCount % 3 === 0) {
         prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
+      }
+      // HYPOTHALAMUS — Async curiosity search
+      const lastSearchNS = consciousness.hypothalamus.driveHistory.filter(d => d.type === 'search').slice(-1)[0];
+      if (lastSearchNS && Date.now() - lastSearchNS.t < 5000 && !consciousness.hypothalamus.searchCache[lastSearchNS.topic]) {
+        curiositySearch(lastSearchNS.topic).then(results => {
+          if (results) consciousness.hypothalamus.pendingSearchResult = { topic: lastSearchNS.topic, results, t: Date.now() };
+        }).catch(e => console.error('[HYPOTHALAMUS]', e.message));
       }
       res.json(data);
     }
@@ -618,7 +924,7 @@ app.get('/v1/models', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons',
+    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons + hypothalamus',
     brains: { brainstem: BRAINSTEM_MODEL, cortex: CORTEX_MODEL, prefrontal: PREFRONTAL_MODEL },
     uptime: process.uptime(),
     brain_state: {
@@ -628,6 +934,9 @@ app.get('/health', (req, res) => {
       total_insights: consciousness.thoughts.pendingInsights.length, contradictions: consciousness.contradictions.length,
       mirror_emotion: consciousness.mirror.currentEmotion, mirror_intensity: consciousness.mirror.intensity,
       mirror_energy: consciousness.mirror.energyLevel,
+      curiosity_pressure: consciousness.hypothalamus.curiosityPressure,
+      topics_tracked: Object.keys(consciousness.hypothalamus.topics).length,
+      drives_fired: consciousness.hypothalamus.driveHistory.length,
     },
     dream_state: { has_dream: !!dreamState.lastDream, dreams_count: dreamState.dreams.length, opening_line: dreamState.openingLine },
   });
@@ -635,6 +944,7 @@ app.get('/health', (req, res) => {
 
 app.get('/brain', (req, res) => res.json(consciousness));
 app.get('/mirror', (req, res) => res.json(consciousness.mirror));
+app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
 app.get('/dream-state', (req, res) => res.json(dreamState));
 app.get('/dreams', (req, res) => res.json({ count: dreamState.dreams.length, dreams: dreamState.dreams }));
 
@@ -648,6 +958,7 @@ async function initBrain() {
   console.log(`[BRAIN] PREFRONTAL: ${PREFRONTAL_MODEL}`);
   console.log('[BRAIN] DREAM ENGINE: between-session Opus processing');
   console.log('[BRAIN] MIRROR NEURONS: empathy engine (Phoenix-4 emotion control)');
+  console.log(`[BRAIN] HYPOTHALAMUS: curiosity drive (SerpAPI: ${SERP_API_KEY ? 'configured' : 'not set — using DuckDuckGo fallback'})`);
   await hippocampus();
   console.log('[BRAIN] All systems ACTIVE.');
 }
