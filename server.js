@@ -1979,7 +1979,8 @@ let sleepState = {
 
 // Conversation detection
 let lastRequestTime = 0;
-const CONVERSATION_TIMEOUT = 120000; // 2 min without request = session over
+const CONVERSATION_TIMEOUT = 300000; // 5 min without request = session over (was 2min — too aggressive, caused false timeouts mid-conversation when user pauses to think)
+let dreamInProgress = false; // prevent dream from interfering with active conversation
 
 function markConversationActive() {
   const wasInactive = !sleepState.isInConversation;
@@ -1987,6 +1988,10 @@ function markConversationActive() {
   sleepState.isInConversation = true;
   if (wasInactive) {
     sleepState.currentStage = 'awake';
+    // If a dream was running from a false timeout, log it
+    if (dreamInProgress) {
+      console.log('[SLEEP] ⚠️ Conversation resumed while dream was running — dream will complete in background');
+    }
     console.log('[SLEEP] Waking up — conversation started');
   }
 }
@@ -1997,11 +2002,14 @@ function checkConversationState() {
     sleepState.lastConversationEnd = Date.now();
     consciousness.psyche.presence.lastSeen = Date.now();
     sleepState.currentStage = 'light';
-    console.log('[SLEEP] Session ended — entering sleep cycle');
+    console.log('[SLEEP] Session ended (5min timeout) — entering sleep cycle');
 
     // Post-session REM: immediate dream when conversation ends
     sleepState.lastREM = Date.now();
-    dreamProcess('auto-' + Date.now()).catch(e => console.error('[SLEEP/REM]', e.message));
+    dreamInProgress = true;
+    dreamProcess('auto-' + Date.now())
+      .catch(e => console.error('[SLEEP/REM]', e.message))
+      .finally(() => { dreamInProgress = false; });
   }
 }
 
@@ -2165,6 +2173,9 @@ async function sleepCycle() {
   // Don't sleep during conversations
   if (sleepState.isInConversation) return;
 
+  // Don't run if a dream is already in progress (prevents rate limit conflicts)
+  if (dreamInProgress) return;
+
   // Need a conversation to have ended first
   if (!sleepState.lastConversationEnd) return;
 
@@ -2183,7 +2194,9 @@ async function sleepCycle() {
 
   // REM: every 3 hours (10800000ms) — full Opus dream
   if (timeSinceREM > 10800000) {
+    dreamInProgress = true;
     await sleepREM(gapHours);
+    dreamInProgress = false;
     return; // REM is heavy — don't stack with other stages
   }
 
