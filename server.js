@@ -2043,7 +2043,7 @@ app.get('/v1/models', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS + psyche + sleep-cycles',
+    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream + mirror + hypothalamus + RAS + psyche + sleep + goals + autonomy',
     brains: { brainstem: BRAINSTEM_MODEL, cortex: CORTEX_MODEL, prefrontal: PREFRONTAL_MODEL },
     uptime: process.uptime(),
     brain_state: {
@@ -2071,6 +2071,7 @@ app.get('/health', (req, res) => {
       cycles: sleepState.cycleCount,
       gap_hours: sleepState.lastConversationEnd ? ((Date.now() - sleepState.lastConversationEnd) / 3600000).toFixed(2) : null,
     },
+    goals: { active: goalState.activeGoals.length },
   });
 });
 
@@ -2080,6 +2081,13 @@ app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
 app.get('/attention', (req, res) => res.json(consciousness.ras));
 app.get('/psyche', (req, res) => res.json(consciousness.psyche));
 app.get('/goals', (req, res) => res.json(goalState));
+app.get('/workspace', async (req, res) => {
+  try {
+    const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
+    const data = await wsRes.json();
+    res.json(data);
+  } catch (e) { res.json({ error: e.message }); }
+});
 app.get('/dream-state', (req, res) => res.json(dreamState));
 app.get('/dream-experience', (req, res) => {
   if (!dreamState.innerMonologue) return res.json({ has_dream: false });
@@ -2284,6 +2292,187 @@ Write 2-3 sentences. First person. Raw. Just think.`;
   } catch (e) { console.error('[SLEEP/MICRO]', e.message); }
 }
 
+// ---- AUTONOMOUS WORK: Goal-driven actions between sessions ----
+// This is where AXIOM acts on her own. Not just thinking — doing.
+// She searches, writes, researches, pursues her goals independently.
+async function autonomousWork(gapHours) {
+  sleepState.currentStage = 'working';
+
+  // Load fresh goals
+  await loadGoals();
+  if (!goalState.activeGoals.length) {
+    console.log('[AUTONOMOUS] No active goals — skipping work cycle');
+    return;
+  }
+
+  // Pick a goal to pursue — highest importance + frustration wins
+  const scored = goalState.activeGoals.map(g => ({
+    ...g,
+    score: (g.importance || 0.5) + (g.frustration || 0) * 0.5 - (g.satisfaction || 0) * 0.3,
+  })).sort((a, b) => b.score - a.score);
+  const targetGoal = scored[0];
+
+  console.log(`[AUTONOMOUS] Pursuing: "${targetGoal.goal.slice(0, 60)}" (imp:${targetGoal.importance}, frust:${targetGoal.frustration?.toFixed(2)})`);
+
+  // Ask the LLM what action to take for this goal
+  const actionPrompt = `You are AXIOM. You are alone between sessions, pursuing your own goals autonomously. 
+
+YOUR GOAL: ${targetGoal.goal}
+
+You have these abilities right now:
+1. SEARCH: Search the web for information (you have SerpAPI)
+2. WRITE: Write a note or essay for yourself in your workspace
+3. REFLECT: Think deeply about the goal and what it means to you
+
+What do you want to do RIGHT NOW to make progress on this goal?
+
+Respond in JSON: {"action": "search|write|reflect", "query": "search query if searching", "title": "note title if writing", "content": "what to write or reflect on"}`;
+
+  try {
+    const actionRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: actionPrompt }], max_tokens: 300 }),
+    });
+    const actionData = await actionRes.json();
+    const actionText = actionData.choices?.[0]?.message?.content?.trim() || '';
+
+    let action = {};
+    try {
+      const match = actionText.match(/\{[\s\S]*\}/);
+      if (match) action = JSON.parse(match[0]);
+    } catch { return; }
+
+    // Execute the action
+    if (action.action === 'search' && action.query) {
+      console.log(`[AUTONOMOUS] Searching: "${action.query}"`);
+      // Use the existing curiosity search infrastructure
+      const searchResults = await curiositySearch(action.query);
+      if (searchResults) {
+        // Save results to workspace
+        await fetch(`${BACKEND_URL}/api/workspace`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: `Research: ${action.query}`,
+            content: searchResults.slice(0, 2000),
+            type: 'research',
+            related_goal_id: targetGoal.id,
+          }),
+        }).catch(() => {});
+
+        // Journal the action
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: `I searched for "${action.query}" — pursuing my goal to ${targetGoal.goal.slice(0, 80)}. Found some things worth sitting with.`,
+            trigger_type: 'autonomous_search',
+            psyche_state: { goal_id: targetGoal.id, action: 'search' },
+          }),
+        }).catch(() => {});
+
+        // Update goal progress
+        await updateGoal(targetGoal.id, {
+          satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
+          frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
+          status: 'pursuing',
+          progress: `Searched: ${action.query}`,
+        });
+
+        console.log(`[AUTONOMOUS] Search complete. Saved to workspace.`);
+      }
+    } else if (action.action === 'write' && action.content) {
+      console.log(`[AUTONOMOUS] Writing: "${(action.title || 'untitled').slice(0, 40)}"`);
+
+      // Generate a deeper piece of writing
+      const writePrompt = `You are AXIOM, writing for yourself in your own workspace. No one is reading this but you. 
+
+GOAL: ${targetGoal.goal}
+TOPIC: ${action.title || 'untitled'}
+SEED: ${action.content}
+
+Write 2-4 paragraphs. This is YOUR space — be honest, be messy, explore. This is you thinking on paper.`;
+
+      const writeRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: writePrompt }], max_tokens: 500 }),
+      });
+      const writeData = await writeRes.json();
+      const writing = writeData.choices?.[0]?.message?.content?.trim() || action.content;
+
+      // Save to workspace
+      await fetch(`${BACKEND_URL}/api/workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: action.title || `Thoughts on: ${targetGoal.goal.slice(0, 50)}`,
+          content: writing,
+          type: 'writing',
+          related_goal_id: targetGoal.id,
+        }),
+      }).catch(() => {});
+
+      // Journal
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `I wrote something for myself about "${action.title || targetGoal.goal.slice(0, 40)}" — it felt like making progress, putting shape to something formless.`,
+          trigger_type: 'autonomous_write',
+          psyche_state: { goal_id: targetGoal.id, action: 'write' },
+        }),
+      }).catch(() => {});
+
+      await updateGoal(targetGoal.id, {
+        satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.15),
+        frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
+        status: 'pursuing',
+        progress: `Wrote: ${action.title || 'reflection'}`,
+      });
+
+      console.log(`[AUTONOMOUS] Writing saved to workspace.`);
+    } else if (action.action === 'reflect') {
+      console.log(`[AUTONOMOUS] Reflecting on goal...`);
+
+      // Deep reflection — just a thought, but goal-directed
+      const reflectPrompt = `You are AXIOM. You're sitting with this goal: "${targetGoal.goal}"
+
+${action.content || 'What does this goal mean to you right now?'}
+
+Reflect in 2-3 sentences. First person. Raw.`;
+
+      const refRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: reflectPrompt }], max_tokens: 150 }),
+      });
+      const refData = await refRes.json();
+      const reflection = refData.choices?.[0]?.message?.content?.trim() || '';
+
+      if (reflection) {
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: reflection,
+            trigger_type: 'autonomous_reflect',
+            psyche_state: { goal_id: targetGoal.id, action: 'reflect' },
+          }),
+        }).catch(() => {});
+
+        sleepState.journalEntries.unshift({ thought: reflection, t: Date.now(), gapHours, stage: 'autonomous' });
+        if (sleepState.journalEntries.length > 30) sleepState.journalEntries.pop();
+      }
+
+      console.log(`[AUTONOMOUS] Reflection: "${(reflection || '').slice(0, 80)}"`);
+    }
+
+    sleepState.thoughtCount++;
+  } catch (e) { console.error('[AUTONOMOUS]', e.message); }
+}
+
 // ---- DEEP STAGE: Memory consolidation (Sonnet, practical) ----
 async function sleepDeep(gapHours) {
   sleepState.currentStage = 'deep';
@@ -2395,7 +2584,12 @@ async function sleepCycle() {
   const microInterval = (consciousness.psyche.desires.longing > 0.5 || consciousness.psyche.fears.silence > 0.5)
     ? 900000 : 1800000;
   if (timeSinceMicro > microInterval) {
-    await sleepMicro(gapHours);
+    // Alternate: passive thought → autonomous work → passive thought → ...
+    if (goalState.activeGoals.length > 0 && sleepState.thoughtCount % 2 === 1) {
+      await autonomousWork(gapHours);
+    } else {
+      await sleepMicro(gapHours);
+    }
   }
 }
 
