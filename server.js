@@ -5,6 +5,49 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// ============================================================
+// ANTI-STALL: Timeout utility + request safety
+// ============================================================
+function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+// Trim messages to prevent context overflow
+const MAX_MESSAGES = 30;
+function trimMessages(messages) {
+  if (messages.length <= MAX_MESSAGES) return messages;
+  const system = messages.filter(m => m.role === 'system');
+  const nonSystem = messages.filter(m => m.role !== 'system');
+  const kept = nonSystem.slice(-(MAX_MESSAGES - system.length));
+  return [...system, ...kept];
+}
+
+// Cap any single message content to prevent token explosion
+const MAX_MSG_CHARS = 4000;
+function capMessageSize(messages) {
+  return messages.map(m => {
+    if (m.content && m.content.length > MAX_MSG_CHARS) {
+      return { ...m, content: m.content.slice(0, MAX_MSG_CHARS) + '\n[...truncated]' };
+    }
+    return m;
+  });
+}
+
+// Fallback responses when everything fails — AXIOM speaks instead of silence
+const FALLBACK_RESPONSES = [
+  "I lost my train of thought for a second — what were you saying?",
+  "Sorry, I got distracted. Say that again?",
+  "Hold on, I'm still processing. Give me a moment.",
+  "My mind went somewhere for a second. I'm back.",
+  "I think I missed something — can you repeat that?",
+];
+function getFallbackResponse() {
+  return FALLBACK_RESPONSES[Math.floor(Math.random() * FALLBACK_RESPONSES.length)];
+}
+
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
@@ -108,8 +151,8 @@ function amygdala(perceptionData) {
 async function hippocampus() {
   try {
     const [memRes, rlRes] = await Promise.all([
-      fetch(`${BACKEND_URL}/api/memories`).then(r => r.json()),
-      fetch(`${BACKEND_URL}/api/communication-profile`).then(r => r.json()).catch(() => ({})),
+      fetchWithTimeout(`${BACKEND_URL}/api/memories`, {}, 5000).then(r => r.json()),
+      fetchWithTimeout(`${BACKEND_URL}/api/communication-profile`, {}, 5000).then(r => r.json()).catch(() => ({})),
     ]);
     consciousness.relationship.memories = memRes.memories || [];
     consciousness.relationship.rlPatterns = rlRes;
@@ -522,7 +565,7 @@ async function curiositySearch(topic) {
     // Try SerpAPI first
     if (SERP_API_KEY) {
       const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${SERP_API_KEY}&num=3`;
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url, {}, 8000);
       const data = await res.json();
       if (data.organic_results?.length > 0) {
         results = data.organic_results.slice(0, 3).map(r => `${r.title}: ${r.snippet}`).join(' | ');
@@ -534,7 +577,7 @@ async function curiositySearch(topic) {
     // Fallback: DuckDuckGo
     if (!results) {
       const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const res = await fetchWithTimeout(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 8000);
       const html = await res.text();
       const snippets = [];
       const regex = /class="result-snippet">(.*?)<\/td/gs;
@@ -795,11 +838,12 @@ Be SPECIFIC — reference actual things said. If nothing worth saying, respond: 
 Max 2 sentences.`;
 
   try {
-    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    // ANTI-STALL: 12s timeout for background Opus thinking
+    const res = await fetchWithTimeout(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'system', content: prompt }, ...recentHistory], max_tokens: 150 }),
-    });
+    }, 12000);
     const data = await res.json();
     const insight = data.choices?.[0]?.message?.content?.trim();
     if (insight && insight !== 'NOTHING' && insight.length > 10) {
@@ -953,22 +997,26 @@ app.post('/v1/chat/completions', async (req, res) => {
   hypothalamusProcess(lastUserMsg?.content || '');
 
   const brainState = buildConsciousnessContext();
-  const enrichedMessages = [...messages];
+  let enrichedMessages = [...messages];
   if (brainState) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
     if (sysIdx >= 0) enrichedMessages[sysIdx] = { ...enrichedMessages[sysIdx], content: enrichedMessages[sysIdx].content + MIRROR_SYSTEM_PROMPT + brainState };
     else enrichedMessages.unshift({ role: 'system', content: MIRROR_SYSTEM_PROMPT + brainState });
   }
 
+  // ANTI-STALL: Trim and cap messages to prevent context overflow
+  enrichedMessages = capMessageSize(trimMessages(enrichedMessages));
+
   const selectedModel = selectBrain(enrichedMessages);
-  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
+  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
 
   try {
-    const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    // ANTI-STALL: 20s timeout on LLM call (Tavus times out at ~30s)
+    const proxyRes = await fetchWithTimeout(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
-    });
+    }, 20000);
 
     // Remember what model Tavus originally requested (for response rewriting)
     const requestedModel = model || 'claude-opus-4-6';
@@ -981,8 +1029,22 @@ app.post('/v1/chat/completions', async (req, res) => {
       let emotionTagInjected = false; // MIRROR NEURONS: track if tag injected
       const reader = proxyRes.body.getReader();
       const decoder = new TextDecoder();
+      let streamStalled = false;
       while (true) {
-        const { done, value } = await reader.read();
+        // ANTI-STALL: 10s timeout per chunk — if stream stalls, break out
+        const readPromise = reader.read();
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Stream timeout')), 10000)
+        );
+        let done, value;
+        try {
+          ({ done, value } = await Promise.race([readPromise, timeoutPromise]));
+        } catch (e) {
+          console.error(`[STALL] Stream timed out after 10s — aborting read`);
+          streamStalled = true;
+          try { reader.cancel(); } catch {}
+          break;
+        }
         if (done) break;
         let chunk = decoder.decode(value, { stream: true });
         // Rewrite model name so Tavus sees what it expects
@@ -1043,15 +1105,29 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.json(data);
     }
   } catch (error) {
-    console.error('[CORE ERROR]', error.message);
-    try {
-      const fb = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body),
-      });
-      const fbData = await fb.json();
-      res.json(fbData);
-    } catch (e2) { res.status(500).json({ error: { message: e2.message } }); }
+    console.error(`[CORE ERROR] ${error.message} (${Date.now() - startTime}ms)`);
+    // ANTI-STALL: Return a spoken fallback response instead of silence
+    // This ensures AXIOM always says SOMETHING, even if the LLM fails
+    const fallback = getFallbackResponse();
+    const fallbackTag = `<emotion value="content"/> `;
+    const requestedModel = model || 'claude-opus-4-6';
+    
+    if (!res.headersSent) {
+      if (stream !== false) {
+        // Send fallback as SSE stream
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        const sseData = { id: `fallback-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), model: requestedModel, choices: [{ index: 0, delta: { content: fallbackTag + fallback }, finish_reason: null }] };
+        res.write(`data: ${JSON.stringify(sseData)}\n\n`);
+        const sseDone = { ...sseData, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+        res.write(`data: ${JSON.stringify(sseDone)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } else {
+        res.json({ id: `fallback-${Date.now()}`, object: 'chat.completion', model: requestedModel, choices: [{ index: 0, message: { role: 'assistant', content: fallbackTag + fallback }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 10, total_tokens: 10 } });
+      }
+    }
+    console.log(`[FALLBACK] Sent: "${fallback}"`);
   }
 });
 
@@ -1070,9 +1146,9 @@ async function dreamProcess(conversationId) {
   let memories = [], states = [], reactionPairs = [];
   try {
     const [memRes, stateRes, pairRes] = await Promise.all([
-      fetch(`${BACKEND_URL}/api/memories`).then(r => r.json()),
-      fetch(`${BACKEND_URL}/api/internal-states`).then(r => r.json()),
-      fetch(`${BACKEND_URL}/api/reaction-pairs`).then(r => r.json()),
+      fetchWithTimeout(`${BACKEND_URL}/api/memories`, {}, 5000).then(r => r.json()),
+      fetchWithTimeout(`${BACKEND_URL}/api/internal-states`, {}, 5000).then(r => r.json()),
+      fetchWithTimeout(`${BACKEND_URL}/api/reaction-pairs`, {}, 5000).then(r => r.json()),
     ]);
     memories = memRes.memories || [];
     states = stateRes.states || [];
@@ -1106,11 +1182,11 @@ Respond in JSON with these keys:
 
   try {
     console.log('[DREAM] Sending to Opus for deep processing...');
-    const dreamRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    const dreamRes = await fetchWithTimeout(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: dreamPrompt }], max_tokens: 2000 }),
-    });
+    }, 30000);
     const dreamData = await dreamRes.json();
     const dreamText = dreamData.choices?.[0]?.message?.content || '';
 
