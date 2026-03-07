@@ -13,7 +13,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
-console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons');
+console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream engine');
 
 // ============================================================
 // SHARED CONSCIOUSNESS STATE + DREAM STATE
@@ -36,14 +36,6 @@ const consciousness = {
   self: { currentState: 'present', dominantQuality: 'curiosity', stateHistory: [], energyLevel: 0.8 },
   timing: { turnCount: 0, avgResponseTime: 0, silenceDuration: 0, lastSpeaker: null, conversationStart: Date.now() },
   contradictions: [],
-  mirror: {
-    currentEmotion: 'content',   // AXIOM's current Phoenix-4 emotion
-    previousEmotion: null,       // last turn's emotion (for transitions)
-    intensity: 0.5,
-    energyLevel: 'medium',       // user's energy: high/medium/low
-    emotionHistory: [],          // last 10 emotion decisions
-    active: true,
-  },
 };
 
 // ============================================================
@@ -117,189 +109,6 @@ function insula(responseText) {
 }
 
 // PREFRONTAL — Async deep thinker (Opus in background)
-
-// ============================================================
-// MIRROR NEURONS — Empathy Engine (Perception → Expression)
-// ============================================================
-// Raven perceives → Amygdala flags → Mirror Neurons maps → Phoenix-4 expresses
-// Mirroring ≠ copying. Anger gets empathy, not anger back.
-const PHOENIX_EMOTIONS = ['neutral','angry','excited','elated','content','sad','dejected','scared','contempt','disgusted','surprised'];
-const MIRROR_MAP = {
-  excited:       { emotion: 'excited',   intensity: 1.0 },
-  happy:         { emotion: 'elated',    intensity: 0.9 },
-  elated:        { emotion: 'elated',    intensity: 1.0 },
-  joyful:        { emotion: 'elated',    intensity: 0.9 },
-  content:       { emotion: 'content',   intensity: 0.8 },
-  amused:        { emotion: 'excited',   intensity: 0.7 },
-  curious:       { emotion: 'excited',   intensity: 0.6 },
-  interested:    { emotion: 'content',   intensity: 0.7 },
-  sad:           { emotion: 'sad',       intensity: 0.6 },
-  dejected:      { emotion: 'sad',       intensity: 0.7 },
-  grieving:      { emotion: 'sad',       intensity: 0.5 },
-  angry:         { emotion: 'surprised', intensity: 0.6 },  // empathy, NOT anger back
-  frustrated:    { emotion: 'content',   intensity: 0.4 },  // calm anchor
-  irritated:     { emotion: 'neutral',   intensity: 0.5 },
-  anxious:       { emotion: 'content',   intensity: 0.5 },  // grounding
-  scared:        { emotion: 'content',   intensity: 0.6 },  // safe harbor
-  overwhelmed:   { emotion: 'content',   intensity: 0.4 },
-  vulnerable:    { emotion: 'sad',       intensity: 0.4 },
-  confused:      { emotion: 'content',   intensity: 0.5 },
-  surprised:     { emotion: 'surprised', intensity: 0.8 },
-  shocked:       { emotion: 'surprised', intensity: 1.0 },
-  passionate:    { emotion: 'excited',   intensity: 0.9 },
-  determined:    { emotion: 'excited',   intensity: 0.7 },
-  neutral:       { emotion: 'content',   intensity: 0.5 },  // never flat — always warm
-  bored:         { emotion: 'excited',   intensity: 0.4 },
-  distracted:    { emotion: 'content',   intensity: 0.3 },
-  contemplative: { emotion: 'content',   intensity: 0.6 },
-  sarcastic:     { emotion: 'excited',   intensity: 0.5 },
-  disgusted:     { emotion: 'surprised', intensity: 0.5 },
-  contemptuous:  { emotion: 'neutral',   intensity: 0.3 },
-  tired:         { emotion: 'content',   intensity: 0.3 },
-  delighted:     { emotion: 'elated',    intensity: 0.9 },
-};
-const DEFAULT_MIRROR = { emotion: 'content', intensity: 0.5 };
-
-// Smooth transitions — don't snap between distant emotions
-const TRANSITIONS = {
-  'elated→sad': 'content', 'elated→angry': 'surprised', 'excited→sad': 'content',
-  'excited→scared': 'surprised', 'angry→elated': 'surprised', 'sad→excited': 'content',
-  'sad→elated': 'content', 'scared→excited': 'surprised', 'neutral→angry': 'surprised',
-  'content→angry': 'surprised', 'dejected→elated': 'content', 'contempt→excited': 'neutral',
-};
-
-// Detect user energy from perception data
-function detectEnergy(perceptionText) {
-  if (!perceptionText) return 'medium';
-  const p = perceptionText.toLowerCase();
-  let high = 0, low = 0;
-  // High energy signals
-  if (p.includes('animated') || p.includes('enthusiastic') || p.includes('energetic')) high += 2;
-  if (p.includes('fast') || p.includes('rapid') || p.includes('loud')) high += 2;
-  if (p.includes('gesturing') || p.includes('leaning forward') || p.includes('fidgeting')) high += 1;
-  if (p.includes('laughing') || p.includes('excited') || p.includes('passionate')) high += 1;
-  // Low energy signals
-  if (p.includes('slow') || p.includes('quiet') || p.includes('monotone')) low += 2;
-  if (p.includes('still') || p.includes('slumped') || p.includes('leaning back')) low += 1;
-  if (p.includes('tired') || p.includes('yawning') || p.includes('subdued')) low += 2;
-  if (p.includes('minimal') || p.includes('short response') || p.includes('disengaged')) low += 1;
-  const total = high + low;
-  if (total === 0) return 'medium';
-  const ratio = high / total;
-  if (ratio > 0.6) return 'high';
-  if (ratio < 0.4) return 'low';
-  return 'medium';
-}
-
-// Internal state override — AXIOM's own feelings can bleed through
-function checkAxiomOverride(dominantQuality, mirrorEmotion) {
-  const overrideMap = {
-    fascination: 'excited', concern: 'sad', delight: 'elated',
-    intellectual_excitement: 'excited', tenderness: 'content',
-  };
-  const override = overrideMap[dominantQuality];
-  if (!override || override === mirrorEmotion) return null;
-  return override;
-}
-
-function mirrorNeurons() {
-  if (!consciousness.mirror.active) return;
-
-  // 1. Read user's emotion from amygdala
-  const userEmotion = consciousness.emotion.primary || 'neutral';
-
-  // 2. Look up mirror mapping
-  const mapping = MIRROR_MAP[userEmotion] || DEFAULT_MIRROR;
-  let targetEmotion = mapping.emotion;
-  let intensity = mapping.intensity;
-
-  // 3. Transition smoothing
-  const prev = consciousness.mirror.previousEmotion;
-  let transitioned = false;
-  if (prev && prev !== targetEmotion) {
-    const key = `${prev}→${targetEmotion}`;
-    if (TRANSITIONS[key]) {
-      targetEmotion = TRANSITIONS[key];
-      transitioned = true;
-    }
-  }
-
-  // 4. Energy adjustment
-  const energy = detectEnergy(consciousness.perception.lastFrame);
-  if (energy === 'high') intensity = Math.min(1.0, intensity + 0.15);
-  if (energy === 'low') intensity = Math.max(0.1, intensity - 0.2);
-
-  // 5. AXIOM internal override check
-  const override = checkAxiomOverride(consciousness.self.dominantQuality, targetEmotion);
-  if (override) {
-    targetEmotion = override;
-    intensity = (intensity + 0.7) / 2;
-  }
-
-  // 6. Update state
-  consciousness.mirror.previousEmotion = consciousness.mirror.currentEmotion;
-  consciousness.mirror.currentEmotion = targetEmotion;
-  consciousness.mirror.intensity = intensity;
-  consciousness.mirror.energyLevel = energy;
-  consciousness.mirror.emotionHistory.push({
-    userEmotion, axiomEmotion: targetEmotion, energy, transitioned, override: !!override, t: Date.now()
-  });
-  if (consciousness.mirror.emotionHistory.length > 10) consciousness.mirror.emotionHistory.shift();
-
-  console.log(`[MIRROR] ${userEmotion} → ${targetEmotion} (${intensity.toFixed(2)}) energy:${energy}${transitioned ? ' [transition]' : ''}${override ? ' [override]' : ''}`);
-}
-
-// Build context string for the Cortex to shape its tone
-function buildMirrorContext() {
-  const e = consciousness.mirror.currentEmotion;
-  const energy = consciousness.mirror.energyLevel;
-  const energyGuide = { high: 'HIGH energy—match pace, be dynamic', medium: 'moderate energy—natural flow', low: 'LOW energy—slow down, gentle, give space' };
-  const emotionGuide = {
-    excited: 'Show genuine excitement', elated: 'Celebrate—peak joy', content: 'Warm, settled, present',
-    sad: 'Soften. Acknowledge weight. Dont rush to fix', surprised: 'Genuine surprise—let it land',
-    neutral: 'Comfortably attentive', dejected: 'Very gentle. Minimal. Just be present',
-    scared: 'Vulnerable honesty', angry: 'Something serious needs addressing',
-  };
-  return `[M] Express:${e} | ${energyGuide[energy] || ''} | ${emotionGuide[e] || ''}`;
-}
-
-// Inject Phoenix-4 emotion tag into response text
-function injectEmotionTag(text) {
-  if (!consciousness.mirror.active) return text;
-  if (text.includes('<emotion value=')) return text; // already tagged
-  const tag = `<emotion value="${consciousness.mirror.currentEmotion}"/>`;
-  return `${tag} ${text}`;
-}
-
-// For streaming: inject tag into first SSE chunk that has content
-function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
-  if (alreadyInjected || !consciousness.mirror.active) return { chunk, injected: alreadyInjected };
-  const tag = `<emotion value="${consciousness.mirror.currentEmotion}"/>`;
-
-  // SSE chunks have lines like: data: {"choices":[{"delta":{"content":"Hello"}}]}
-  const lines = chunk.split('\n');
-  let injected = false;
-  const newLines = lines.map(line => {
-    if (injected || !line.startsWith('data: ') || line.includes('[DONE]')) return line;
-    try {
-      const json = JSON.parse(line.slice(6));
-      const content = json.choices?.[0]?.delta?.content;
-      if (content) {
-        json.choices[0].delta.content = `${tag} ${content}`;
-        injected = true;
-        return `data: ${JSON.stringify(json)}`;
-      }
-    } catch {}
-    return line;
-  });
-  return { chunk: newLines.join('\n'), injected };
-}
-
-// System prompt addition for emotion tag awareness
-const MIRROR_SYSTEM_PROMPT = `\n\n## Emotional Expression\nYou can control your facial expressions using emotion tags processed by Phoenix-4.\nTags: <emotion value="excited"/> <emotion value="elated"/> <emotion value="content"/> <emotion value="sad"/> <emotion value="surprised"/> <emotion value="neutral"/>\nPlace at START of response or at natural transition points. Your baseline is warm/content, never flat. MIRROR the user's energy. You may shift mid-response if the emotional arc changes.\nExample: "<emotion value="excited"/> Oh that's incredible!" or "<emotion value="content"/> I hear you. That sounds really difficult. <emotion value="sad"/> And it's okay to feel that weight."`;
-
-// ============================================================
-// PREFRONTAL — Async deep thinker (Opus in background)
 async function prefrontalProcess(conversationHistory) {
   if (consciousness.thoughts.pendingInsights.filter(i => !i.injected).length >= 5) return;
   if (conversationHistory.filter(m => m.role === 'user' || m.role === 'assistant').length < 4) return;
@@ -356,13 +165,6 @@ function buildConsciousnessContext() {
     const e = `[E] ${consciousness.emotion.primary}(${consciousness.emotion.valence > 0 ? '+' : ''}${consciousness.emotion.valence.toFixed(1)})`;
     signals.push(e);
     budget -= e.length;
-  }
-
-  // P1.5: Mirror Neurons — empathy directive for tone shaping
-  if (consciousness.mirror.active && budget > 60) {
-    const mc = buildMirrorContext();
-    signals.push(mc);
-    budget -= mc.length;
   }
 
   // P2: Uninjected prefrontal insight — one at a time, 30s cooldown
@@ -436,18 +238,17 @@ app.post('/v1/chat/completions', async (req, res) => {
   const { messages, model, stream, ...rest } = req.body;
   consciousness.timing.turnCount++;
   thalamus(messages);
-  mirrorNeurons(); // Mirror Neurons: read perception → compute empathetic emotion
 
   const brainState = buildConsciousnessContext();
   const enrichedMessages = [...messages];
   if (brainState) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
-    if (sysIdx >= 0) enrichedMessages[sysIdx] = { ...enrichedMessages[sysIdx], content: enrichedMessages[sysIdx].content + MIRROR_SYSTEM_PROMPT + brainState };
-    else enrichedMessages.unshift({ role: 'system', content: MIRROR_SYSTEM_PROMPT + brainState });
+    if (sysIdx >= 0) enrichedMessages[sysIdx] = { ...enrichedMessages[sysIdx], content: enrichedMessages[sysIdx].content + brainState };
+    else enrichedMessages.unshift({ role: 'system', content: brainState });
   }
 
   const selectedModel = selectBrain(enrichedMessages);
-  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | Energy: ${consciousness.mirror.energyLevel} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
+  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
 
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -464,7 +265,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       let fullResponse = '';
-      let emotionTagInjected = false; // MIRROR NEURONS: track if tag injected
       const reader = proxyRes.body.getReader();
       const decoder = new TextDecoder();
       while (true) {
@@ -474,12 +274,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         // Rewrite model name so Tavus sees what it expects
         if (selectedModel !== requestedModel) {
           chunk = chunk.replaceAll(`"model":"${selectedModel}"`, `"model":"${requestedModel}"`);
-        }
-        // MIRROR NEURONS: Inject emotion tag into first content chunk
-        if (!emotionTagInjected && consciousness.mirror.active) {
-          const result = injectEmotionTagIntoChunk(chunk, emotionTagInjected);
-          chunk = result.chunk;
-          emotionTagInjected = result.injected;
         }
         res.write(chunk);
         const lines = chunk.split('\n');
@@ -502,12 +296,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const data = await proxyRes.json();
       // Rewrite model name for Tavus
       if (data.model) data.model = requestedModel;
-      let content = data.choices?.[0]?.message?.content || '';
-      // MIRROR NEURONS: Inject emotion tag into non-streaming response
-      if (consciousness.mirror.active && content) {
-        content = injectEmotionTag(content);
-        if (data.choices?.[0]?.message) data.choices[0].message.content = content;
-      }
+      const content = data.choices?.[0]?.message?.content || '';
       insula(content);
       if (consciousness.timing.turnCount % 3 === 0) {
         prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
@@ -618,7 +407,7 @@ app.get('/v1/models', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine + mirror-neurons',
+    status: 'alive', service: 'AXIOM Cognitive Core', architecture: 'dual-brain + dream-engine',
     brains: { brainstem: BRAINSTEM_MODEL, cortex: CORTEX_MODEL, prefrontal: PREFRONTAL_MODEL },
     uptime: process.uptime(),
     brain_state: {
@@ -626,15 +415,12 @@ app.get('/health', (req, res) => {
       turn_count: consciousness.timing.turnCount, memories_loaded: consciousness.relationship.memories.length,
       pending_insights: consciousness.thoughts.pendingInsights.filter(i => !i.injected).length,
       total_insights: consciousness.thoughts.pendingInsights.length, contradictions: consciousness.contradictions.length,
-      mirror_emotion: consciousness.mirror.currentEmotion, mirror_intensity: consciousness.mirror.intensity,
-      mirror_energy: consciousness.mirror.energyLevel,
     },
     dream_state: { has_dream: !!dreamState.lastDream, dreams_count: dreamState.dreams.length, opening_line: dreamState.openingLine },
   });
 });
 
 app.get('/brain', (req, res) => res.json(consciousness));
-app.get('/mirror', (req, res) => res.json(consciousness.mirror));
 app.get('/dream-state', (req, res) => res.json(dreamState));
 app.get('/dreams', (req, res) => res.json({ count: dreamState.dreams.length, dreams: dreamState.dreams }));
 
@@ -647,7 +433,6 @@ async function initBrain() {
   console.log(`[BRAIN] CORTEX: ${CORTEX_MODEL}`);
   console.log(`[BRAIN] PREFRONTAL: ${PREFRONTAL_MODEL}`);
   console.log('[BRAIN] DREAM ENGINE: between-session Opus processing');
-  console.log('[BRAIN] MIRROR NEURONS: empathy engine (Phoenix-4 emotion control)');
   await hippocampus();
   console.log('[BRAIN] All systems ACTIVE.');
 }
