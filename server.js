@@ -1723,7 +1723,7 @@ Now crystallize this into what you'll carry forward. Respond in JSON:
     const crystRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: crystallizePrompt }], max_tokens: 800 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: crystallizePrompt }], max_tokens: 800 }),
     });
     const crystData = await crystRes.json();
     const crystText = crystData.choices?.[0]?.message?.content || '';
@@ -2072,7 +2072,7 @@ Write 2-3 sentences. First person. Raw. Just think.`;
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 150 }),
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 150 }),
     });
     const data = await res.json();
     const thought = data.choices?.[0]?.message?.content?.trim() || '';
