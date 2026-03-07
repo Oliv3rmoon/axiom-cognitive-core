@@ -1383,7 +1383,12 @@ function selectBrain(messages) {
 // ============================================================
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
-  const { messages, model, stream, ...rest } = req.body;
+  const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
+  // NOTE: We intentionally strip 'tools' and 'tool_choice' from the LLM request.
+  // Tools are handled by the backend webhook, not by the Cognitive Core.
+  // Passing tools to the LLM causes it to call log_internal_state obsessively
+  // instead of generating speech, creating a silent loop where AXIOM thinks
+  // but never talks. The Cognitive Core is the VOICE — speech only.
   consciousness.timing.turnCount++;
 
   // Wrap ALL brain processing in try/catch — if any region throws,
@@ -1427,7 +1432,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     psycheContext = buildPsycheContext();
   } catch (e) { console.error('[PSYCHE CONTEXT ERROR]', e.message); }
 
-  let enrichedMessages = [...messages];
+  let enrichedMessages = [...messages]
+    // Strip tool-related messages — they confuse the LLM when tools aren't available
+    .filter(m => m.role !== 'tool')
+    // Strip tool_calls from assistant messages — keep only speech content
+    .map(m => {
+      if (m.role === 'assistant' && m.tool_calls) {
+        const { tool_calls, ...clean } = m;
+        // If this message was ONLY a tool call (no content), skip it entirely
+        if (!clean.content || clean.content.trim() === '') return null;
+        return clean;
+      }
+      return m;
+    })
+    .filter(Boolean);
 
   // Build the full context injection: memories + psyche + emotion instructions + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
