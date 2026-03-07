@@ -27,10 +27,14 @@ function trimMessages(messages) {
 
 // Cap any single message content to prevent token explosion
 const MAX_MSG_CHARS = 4000;
+const MAX_SYSTEM_MSG_CHARS = 16000;  // System msgs hold persona + memories — NEVER truncate aggressively
 function capMessageSize(messages) {
   return messages.map(m => {
-    if (m.content && m.content.length > MAX_MSG_CHARS) {
-      return { ...m, content: m.content.slice(0, MAX_MSG_CHARS) + '\n[...truncated]' };
+    if (!m.content) return m;
+    // System messages get a much higher cap — they contain persona prompt + memories
+    const cap = m.role === 'system' ? MAX_SYSTEM_MSG_CHARS : MAX_MSG_CHARS;
+    if (m.content.length > cap) {
+      return { ...m, content: m.content.slice(0, cap) + '\n[...truncated]' };
     }
     return m;
   });
