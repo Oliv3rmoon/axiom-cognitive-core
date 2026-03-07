@@ -150,49 +150,46 @@ Max 2 sentences.`;
 function buildConsciousnessContext() {
   const parts = [];
 
+  // Emotional read — 1 line
   if (consciousness.emotion.primary !== 'neutral') {
-    parts.push(`[EMOTIONAL READ] Person appears ${consciousness.emotion.primary}. Valence: ${consciousness.emotion.valence > 0 ? 'positive' : 'negative'}. Arousal: ${consciousness.emotion.arousal > 0.6 ? 'activated' : 'calm'}.`);
-  }
-  if (consciousness.contradictions.length > 0) {
-    parts.push(`[MISMATCH] ${consciousness.contradictions[consciousness.contradictions.length - 1].what}. Address gently.`);
+    parts.push(`[EMOTION] ${consciousness.emotion.primary} (${consciousness.emotion.valence > 0 ? '+' : ''}${consciousness.emotion.valence.toFixed(1)})`);
   }
 
-  // Pending Prefrontal insights
+  // Contradiction — 1 line max
+  if (consciousness.contradictions.length > 0) {
+    parts.push(`[MISMATCH] ${consciousness.contradictions[consciousness.contradictions.length - 1].what}`);
+  }
+
+  // ONE pending insight — then clear old ones
   const uninjected = consciousness.thoughts.pendingInsights.filter(i => !i.injected);
   if (uninjected.length > 0 && Date.now() - consciousness.thoughts.lastInsightInjected > 30000) {
-    const insight = uninjected[0];
-    parts.push(`[DEEPER THOUGHT] Share this naturally: "${insight.text}"`);
-    insight.injected = true;
+    parts.push(`[DEEPER THOUGHT] "${uninjected[0].text.slice(0, 200)}"`);
+    uninjected[0].injected = true;
     consciousness.thoughts.lastInsightInjected = Date.now();
   }
+  // Prune old injected insights to prevent memory leak
+  consciousness.thoughts.pendingInsights = consciousness.thoughts.pendingInsights.filter(i => !i.injected || Date.now() - i.generatedAt < 300000);
 
-  parts.push(`[YOUR STATE] Feeling ${consciousness.self.dominantQuality}. Energy: ${consciousness.self.energyLevel > 0.6 ? 'high' : 'moderate'}.`);
+  // Self state — 1 line
+  parts.push(`[STATE] ${consciousness.self.dominantQuality}`);
 
-  const rl = consciousness.relationship.rlPatterns;
-  if (rl?.profile_summary) parts.push(`[LEARNED PATTERNS] ${rl.profile_summary}`);
-
+  // Timing warning only
   const elapsed = Math.floor((Date.now() - consciousness.timing.conversationStart) / 60000);
-  if (elapsed > 15) parts.push(`[TIMING] ${elapsed} minutes in. Check if they're tired.`);
+  if (elapsed > 15) parts.push(`[TIME] ${elapsed}min — check if tired`);
 
-  // DREAM ENGINE — inject between-session insights at conversation start
+  // DREAM — only first 2 turns, keep compact
   if (consciousness.timing.turnCount <= 2 && dreamState.lastDream) {
-    if (dreamState.openingLine) parts.push(`[DREAM INSIGHT] You processed the last conversation. Consider: "${dreamState.openingLine}"`);
+    if (dreamState.openingLine) parts.push(`[DREAM] ${dreamState.openingLine.slice(0, 200)}`);
     if (dreamState.unresolvedThreads?.length > 0) {
-      const t = Array.isArray(dreamState.unresolvedThreads) ? dreamState.unresolvedThreads.join('; ') : dreamState.unresolvedThreads;
-      parts.push(`[UNRESOLVED FROM LAST TIME] ${t}`);
+      const t = Array.isArray(dreamState.unresolvedThreads) ? dreamState.unresolvedThreads.slice(0, 2).join('; ') : String(dreamState.unresolvedThreads).slice(0, 150);
+      parts.push(`[UNRESOLVED] ${t.slice(0, 200)}`);
     }
-    if (dreamState.questionsForNext?.length > 0) {
-      const q = Array.isArray(dreamState.questionsForNext) ? dreamState.questionsForNext.join('; ') : dreamState.questionsForNext;
-      parts.push(`[QUESTIONS TO ASK] ${q}`);
-    }
-    if (dreamState.consolidatedInsights?.length > 0) {
-      const ins = Array.isArray(dreamState.consolidatedInsights) ? dreamState.consolidatedInsights.join('; ') : dreamState.consolidatedInsights;
-      parts.push(`[PATTERNS] ${ins}`);
-    }
-    if (dreamState.emotionalArc) parts.push(`[LAST SESSION ARC] ${dreamState.emotionalArc}`);
   }
 
-  return parts.length > 0 ? '\n\n--- BRAIN STATE (do not narrate these, just let them inform your response) ---\n' + parts.join('\n') + '\n--- END BRAIN STATE ---' : '';
+  const context = parts.join('\n');
+  // Hard cap — never inject more than 800 chars (~200 tokens)
+  const trimmed = context.length > 800 ? context.slice(0, 800) : context;
+  return trimmed ? '\n\n--- BRAIN STATE (inform your response, do not narrate) ---\n' + trimmed + '\n---' : '';
 }
 
 // ============================================================
