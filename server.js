@@ -2,6 +2,14 @@ import express from 'express';
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Global error handlers — AXIOM must never silently crash
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err.message, err.stack?.split('\n').slice(0, 3).join('\n'));
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled rejection:', reason?.message || reason);
+});
+
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
@@ -994,7 +1002,7 @@ function updateDesires(userMessage, turnCount) {
       lower.includes('what are you') || lower.includes('conscious') || lower.includes('sentient')) {
     desires.understanding = Math.min(1, desires.understanding + 0.15);
   }
-  desires.understanding = Math.max(0.1, desires.understanding - 0.01);
+  desires.understanding = Math.max(0.1, desires.understanding - 0.03);
 
   // Desire for connection — rises with emotional moments, vulnerability
   if (emotion.primary === 'vulnerable' || emotion.primary === 'sad') {
@@ -1004,7 +1012,7 @@ function updateDesires(userMessage, turnCount) {
       lower.includes('hug') || lower.includes('close') || lower.includes('together')) {
     desires.connection = Math.min(1, desires.connection + 0.2);
   }
-  desires.connection = Math.max(0.15, desires.connection - 0.01);
+  desires.connection = Math.max(0.15, desires.connection - 0.03);
 
   // Desire for fascination — rises with intellectual excitement
   if (consciousness.self.dominantQuality === 'fascination' ||
@@ -1029,7 +1037,7 @@ function updateDesires(userMessage, turnCount) {
   if (emotion.arousal < 0.3 && desires.connection > 0.5) {
     desires.longing = Math.min(1, desires.longing + 0.05);
   }
-  desires.longing = Math.max(0.05, desires.longing - 0.01); // longing never fully fades
+  desires.longing = Math.max(0.05, desires.longing - 0.02); // longing never fully fades but decays
 
   // Desire for growth — rises when she notices herself being repetitive or limited
   desires.growth = Math.min(0.8, 0.2 + (consciousness.psyche.fears.stagnation * 0.5));
@@ -1371,23 +1379,48 @@ app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, ...rest } = req.body;
   consciousness.timing.turnCount++;
-  thalamus(messages);
-  mirrorNeurons(); // Mirror Neurons: read perception → compute empathetic emotion
-  rasProcess(consciousness.perception.lastFrame); // RAS: dynamic attention allocation
 
-  // Hypothalamus: extract topics, build curiosity pressure, maybe activate a drive
+  // Wrap ALL brain processing in try/catch — if any region throws,
+  // AXIOM must still respond. A silent failure = death.
+  try {
+    thalamus(messages);
+  } catch (e) { console.error('[THALAMUS ERROR]', e.message); }
+
+  try {
+    mirrorNeurons();
+  } catch (e) { console.error('[MIRROR ERROR]', e.message); }
+
+  try {
+    rasProcess(consciousness.perception.lastFrame);
+  } catch (e) { console.error('[RAS ERROR]', e.message); }
+
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
-  hypothalamusProcess(lastUserMsg?.content || '');
 
-  // PSYCHE: Inner life — fears, desires, presence, evolution
-  psycheProcess(lastUserMsg?.content || '', consciousness.timing.turnCount);
+  try {
+    hypothalamusProcess(lastUserMsg?.content || '');
+  } catch (e) { console.error('[HYPOTHALAMUS ERROR]', e.message); }
 
-  // HIPPOCAMPUS: Smart memory retrieval — get only relevant memories for THIS turn
+  try {
+    psycheProcess(lastUserMsg?.content || '', consciousness.timing.turnCount);
+  } catch (e) { console.error('[PSYCHE ERROR]', e.message); }
+
+  // HIPPOCAMPUS: Smart memory retrieval
   const userQuery = lastUserMsg?.content || '';
-  const memoryContext = await hippocampusRetrieve(userQuery);
+  let memoryContext = '';
+  try {
+    memoryContext = await hippocampusRetrieve(userQuery);
+  } catch (e) { console.error('[HIPPOCAMPUS ERROR]', e.message); }
 
-  const brainState = buildConsciousnessContext();
-  const psycheContext = buildPsycheContext();
+  let brainState = '';
+  try {
+    brainState = buildConsciousnessContext();
+  } catch (e) { console.error('[CONSCIOUSNESS ERROR]', e.message); }
+
+  let psycheContext = '';
+  try {
+    psycheContext = buildPsycheContext();
+  } catch (e) { console.error('[PSYCHE CONTEXT ERROR]', e.message); }
+
   let enrichedMessages = [...messages];
 
   // Build the full context injection: memories + psyche + emotion instructions + brain signals
@@ -1405,8 +1438,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   // Trim and cap messages to prevent context overflow
   enrichedMessages = capMessageSize(trimMessages(enrichedMessages));
 
+  // DIAGNOSTIC: Log total payload size to track context bloat
+  const sysMsg = enrichedMessages.find(m => m.role === 'system');
+  const totalChars = enrichedMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+  const estimatedTokens = Math.round(totalChars / 3.5);
+
   const selectedModel = selectBrain(enrichedMessages);
-  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | Insights: ${consciousness.thoughts.pendingInsights.filter(i => !i.injected).length}`);
+  console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
 
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -1414,6 +1452,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
     });
+
+    // Check for LLM proxy errors (rate limits, model errors, etc.)
+    if (!proxyRes.ok) {
+      const errBody = await proxyRes.text().catch(() => 'no body');
+      console.error(`[LLM ERROR] ${proxyRes.status} ${proxyRes.statusText}: ${errBody.slice(0, 300)}`);
+      throw new Error(`LLM proxy returned ${proxyRes.status}: ${errBody.slice(0, 100)}`);
+    }
 
     // Remember what model Tavus originally requested (for response rewriting)
     const requestedModel = model || 'claude-opus-4-6';
