@@ -2002,9 +2002,8 @@ function checkConversationState() {
     sleepState.lastConversationEnd = Date.now();
     consciousness.psyche.presence.lastSeen = Date.now();
     sleepState.currentStage = 'light';
-    console.log('[SLEEP] Session ended (5min timeout) — entering sleep cycle');
+    console.log(`[SLEEP] Session ended (5min timeout, last request ${((Date.now() - lastRequestTime)/1000).toFixed(0)}s ago) — entering sleep cycle`);
 
-    // Post-session REM: immediate dream when conversation ends
     sleepState.lastREM = Date.now();
     dreamInProgress = true;
     dreamProcess('auto-' + Date.now())
@@ -2225,6 +2224,7 @@ app.get('/heartbeat', (req, res) => {
   res.json({
     ...sleepState,
     gap_hours: sleepState.lastConversationEnd ? ((Date.now() - sleepState.lastConversationEnd) / 3600000).toFixed(2) : null,
+    last_request_age_seconds: lastRequestTime ? Math.round((Date.now() - lastRequestTime) / 1000) : null,
     recent_thoughts: sleepState.journalEntries.slice(0, 5),
     next_micro: sleepState.lastMicro ? Math.max(0, 1800000 - (Date.now() - sleepState.lastMicro)) : 0,
     next_deep: sleepState.lastDeep ? Math.max(0, 3600000 - (Date.now() - sleepState.lastDeep)) : 0,
@@ -2240,6 +2240,23 @@ app.get('/journal', async (req, res) => {
   } catch (e) {
     res.json({ entries: sleepState.journalEntries.slice(0, 20), source: 'memory' });
   }
+});
+
+// Manual sleep trigger — force end conversation and start sleep cycle
+app.post('/sleep', (req, res) => {
+  sleepState.isInConversation = false;
+  sleepState.lastConversationEnd = Date.now();
+  sleepState.currentStage = 'light';
+  consciousness.psyche.presence.lastSeen = Date.now();
+  console.log('[SLEEP] Manually triggered — entering sleep cycle');
+
+  sleepState.lastREM = Date.now();
+  dreamInProgress = true;
+  dreamProcess('manual-' + Date.now())
+    .catch(e => console.error('[SLEEP/REM]', e.message))
+    .finally(() => { dreamInProgress = false; });
+
+  res.json({ status: 'sleeping', stage: 'light', message: 'Sleep cycle activated. Dream processing started.' });
 });
 
 const PORT = process.env.PORT || 4001;
