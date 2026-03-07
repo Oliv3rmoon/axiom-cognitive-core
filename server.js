@@ -427,6 +427,7 @@ function injectEmotionTag(text) {
 }
 
 // For streaming: inject tag into first SSE chunk that has content
+// ONLY if the LLM didn't already generate one (system prompt tells it to)
 function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
   if (alreadyInjected || !consciousness.mirror.active) return { chunk, injected: alreadyInjected };
   const tag = `<emotion value="${consciousness.mirror.currentEmotion}"/>`;
@@ -440,6 +441,11 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
       const json = JSON.parse(line.slice(6));
       const content = json.choices?.[0]?.delta?.content;
       if (content) {
+        // If the LLM already generated an emotion tag, DON'T double-inject
+        if (content.includes('<emotion value=') || content.includes('<emotion')) {
+          injected = true; // mark as done so we don't try again
+          return line; // return unchanged
+        }
         json.choices[0].delta.content = `${tag} ${content}`;
         injected = true;
         return `data: ${JSON.stringify(json)}`;
