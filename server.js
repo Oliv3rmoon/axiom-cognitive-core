@@ -113,9 +113,29 @@ const consciousness = {
 // BRAIN REGIONS
 // ============================================================
 function thalamus(messages) {
-  const perceptionMsgs = messages.filter(m =>
-    m.role === 'system' && m.content && (m.content.includes('user_appearance') || m.content.includes('emotion') || m.content.includes('engaged') || m.content.includes('voice'))
-  );
+  // BUGFIX: Only process RAVEN PERCEPTION messages, NOT the persona system prompt.
+  // The persona prompt contains words like 'emotion', 'voice', 'engaged' which
+  // were causing false matches. Real Raven perception messages are:
+  // - Short (under 500 chars typically)
+  // - NOT the first system message (that's always the persona prompt)
+  // - Contain specific Raven patterns like "The user sounded/appeared/seems"
+  const systemMsgs = messages.filter(m => m.role === 'system' && m.content);
+  // Skip the first system message (persona prompt) — it's always index 0
+  const perceptionCandidates = systemMsgs.slice(1);
+  
+  const perceptionMsgs = perceptionCandidates.filter(m => {
+    const c = m.content;
+    // Must be reasonably short (Raven perception is compact, persona prompt is long)
+    if (c.length > 800) return false;
+    // Must contain actual perception indicators
+    return c.includes('user_appearance') || c.includes('The user sounded') ||
+           c.includes('The user appear') || c.includes('The user seem') ||
+           c.includes('The user look') || c.includes('emotional_state') ||
+           c.includes('engagement') || c.includes('User emotional') ||
+           c.includes('voice_emotion') || c.includes('energy_shift') ||
+           c.includes('presence_level') || c.includes('comprehension');
+  });
+  
   if (perceptionMsgs.length > 0) {
     const latest = perceptionMsgs[perceptionMsgs.length - 1].content;
     consciousness.perception.lastFrame = latest;
@@ -406,7 +426,11 @@ function extractTopics(text) {
     let match;
     while ((match = pattern.exec(text)) !== null) {
       const topic = match[1].trim().toLowerCase().replace(/\s+/g, ' ');
-      if (topic.length > 2 && topic.split(' ').length <= 4) topics.push(topic);
+      // BUGFIX: Filter noise — minimum 5 chars, max 4 words, no common filler phrases
+      const NOISE_TOPICS = ['i did', 'i do', 'i am', 'it is', 'that is', 'this is', 'you are', 'we are', 'they are', 'i was', 'it was', 'you know', 'i think', 'i mean', 'i just', 'the thing'];
+      if (topic.length >= 5 && topic.split(' ').length <= 4 && !NOISE_TOPICS.includes(topic)) {
+        topics.push(topic);
+      }
     }
   }
 
@@ -511,14 +535,21 @@ function hypothalamusProcess(userMessage) {
     : null;
   const topScore = topTopic ? scoreCuriosity(topTopic, consciousness.timing.turnCount) : 0;
 
-  // Pressure builds with interesting topics, emotional arousal, and conversation depth
-  const depthBonus = Math.min(0.2, consciousness.timing.turnCount * 0.02); // deeper convos = more curious
-  const emotionBonus = (consciousness.emotion.arousal - 0.3) * 0.3; // high arousal amplifies
+  // BUGFIX: Pressure was getting stuck at 1.0 because momentum (0.7x) + bonuses always exceeded 1.0
+  // Fix: Stronger decay (0.5x), capped bonuses, satiation after drive fires
+  const depthBonus = Math.min(0.1, consciousness.timing.turnCount * 0.005); // much gentler depth scaling
+  const emotionBonus = Math.max(0, (consciousness.emotion.arousal - 0.4) * 0.15); // only kicks in above 0.4 arousal
+  const topicBonus = topScore * 0.15;
+  // Satiation: if a drive fired recently, pressure drops faster
+  const recentDrive = consciousness.hypothalamus.driveHistory.slice(-1)[0];
+  const satiationPenalty = (recentDrive && Date.now() - recentDrive.t < 60000) ? 0.15 : 0;
+  
   consciousness.hypothalamus.curiosityPressure = Math.min(1, Math.max(0,
-    (consciousness.hypothalamus.curiosityPressure * 0.7) + // momentum
-    (topScore * 0.2) +
-    (depthBonus) +
-    (emotionBonus)
+    (consciousness.hypothalamus.curiosityPressure * 0.5) + // 0.5x decay (was 0.7x)
+    topicBonus +
+    depthBonus +
+    emotionBonus -
+    satiationPenalty
   ));
 
   // 3. Decide whether to activate a drive
@@ -762,7 +793,8 @@ function rasProcess(perceptionData) {
   consciousness.ras.channelWeights = { ...(ATTENTION_MODES[consciousness.ras.attentionMode]?.weights || {}) };
 
   // 3. Process incoming perception and log signal
-  if (perceptionData) {
+  // BUGFIX: Guard against system prompt leaking in as perception
+  if (perceptionData && perceptionData.length < 800 && !perceptionData.startsWith('You are')) {
     const channel = classifySignal(perceptionData);
     const signal = { channel, text: perceptionData.slice(0, 200), t: Date.now() };
     const score = scoreSignal(signal);
