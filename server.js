@@ -8,12 +8,13 @@ app.use(express.json({ limit: '10mb' }));
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
+const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
 // DUAL BRAIN CONFIGURATION
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
-console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS');
+console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS + voice-id');
 
 // ============================================================
 // SHARED CONSCIOUSNESS STATE + DREAM STATE
@@ -30,7 +31,7 @@ const dreamState = {
 
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
-  perception: { visual: [], audio: [], faceIdentity: null, lastFrame: null, salience: [] },
+  perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [] },
   thoughts: { currentTopic: null, conversationArc: [], unresolvedQuestions: [], pendingInsights: [], lastInsightInjected: 0 },
   relationship: { person: null, memories: [], rlPatterns: [], emotionalHistory: [], trustLevel: 0.5 },
   self: { currentState: 'present', dominantQuality: 'curiosity', stateHistory: [], energyLevel: 0.8 },
@@ -902,6 +903,14 @@ function buildConsciousnessContext() {
     signals.push(`[S] ${consciousness.self.dominantQuality}`);
   }
 
+  // P5.5: Identity — who is AXIOM talking to
+  const face = consciousness.perception.faceIdentity;
+  const voice = consciousness.perception.voiceIdentity;
+  const identifiedAs = (face?.name && face.name !== 'unknown') ? face.name : (voice?.name && voice.name !== 'unknown') ? voice.name : null;
+  if (identifiedAs && budget > 20) {
+    signals.push(`[ID] ${identifiedAs}`);
+  }
+
   // P6: Fatigue check
   const elapsed = Math.floor((Date.now() - consciousness.timing.conversationStart) / 60000);
   if (elapsed > 15 && budget > 30) {
@@ -1129,6 +1138,61 @@ Respond in JSON with these keys:
 }
 
 // ============================================================
+// TEMPORAL LOBE — Identity Recognition (Face + Voice + STT)
+// ============================================================
+// Receives identification results from face service + voice service
+// Combines into unified identity for the consciousness state.
+
+app.post('/voice-id', (req, res) => {
+  const { speaker, confidence, conversation_id } = req.body;
+  if (speaker && confidence > 0) {
+    consciousness.perception.voiceIdentity = { name: speaker, confidence, t: Date.now(), conversation_id };
+    console.log(`[TEMPORAL/VOICE] Identified: ${speaker} (${confidence})`);
+    
+    // Cross-reference with face identity for high-confidence recognition
+    if (consciousness.perception.faceIdentity) {
+      const face = consciousness.perception.faceIdentity;
+      if (face.name === speaker) {
+        console.log(`[TEMPORAL] ✅ Face + Voice match: ${speaker} (face: ${face.confidence}, voice: ${confidence})`);
+      } else if (face.name !== 'unknown' && speaker !== 'unknown') {
+        console.log(`[TEMPORAL] ⚠️ Face/Voice mismatch: face=${face.name}, voice=${speaker}`);
+        consciousness.contradictions.push({ what: `Identity mismatch: face=${face.name} voice=${speaker}`, detail: '', timestamp: Date.now() });
+      }
+    }
+  }
+  res.json({ acknowledged: true });
+});
+
+app.post('/face-id', (req, res) => {
+  const { name, confidence, conversation_id } = req.body;
+  if (name && confidence > 0) {
+    consciousness.perception.faceIdentity = { name, confidence, t: Date.now(), conversation_id };
+    console.log(`[TEMPORAL/FACE] Identified: ${name} (${confidence})`);
+  }
+  res.json({ acknowledged: true });
+});
+
+// Get combined identity state
+app.get('/identity', (req, res) => {
+  const face = consciousness.perception.faceIdentity;
+  const voice = consciousness.perception.voiceIdentity;
+  const identity = {
+    face: face ? { name: face.name, confidence: face.confidence, age_ms: Date.now() - face.t } : null,
+    voice: voice ? { name: voice.name, confidence: voice.confidence, age_ms: Date.now() - voice.t } : null,
+    combined: null,
+  };
+  // Combined identity: prefer face+voice match, fallback to highest confidence
+  if (face && voice && face.name === voice.name && face.name !== 'unknown') {
+    identity.combined = { name: face.name, confidence: Math.max(face.confidence, voice.confidence), method: 'face+voice' };
+  } else if (face && face.name !== 'unknown') {
+    identity.combined = { name: face.name, confidence: face.confidence, method: 'face' };
+  } else if (voice && voice.name !== 'unknown') {
+    identity.combined = { name: voice.name, confidence: voice.confidence, method: 'voice' };
+  }
+  res.json(identity);
+});
+
+// ============================================================
 // API ENDPOINTS
 // ============================================================
 app.get('/v1/models', (req, res) => {
@@ -1176,6 +1240,7 @@ async function initBrain() {
   console.log('[BRAIN] MIRROR NEURONS: empathy engine (Phoenix-4 emotion control)');
   console.log(`[BRAIN] HYPOTHALAMUS: curiosity drive (SerpAPI: ${SERP_API_KEY ? 'configured' : 'not set — using DuckDuckGo fallback'})`);
   console.log('[BRAIN] RAS: dynamic attention (5 modes: balanced, emotional, intellectual, protective, re-engage)');
+  console.log(`[BRAIN] TEMPORAL: face ID (axiom-face) + voice ID (${VOICE_SERVICE_URL ? 'configured' : 'not deployed yet'})`);
   await hippocampus();
   console.log('[BRAIN] All systems ACTIVE.');
 }
