@@ -1381,6 +1381,76 @@ function buildGoalContext() {
 }
 
 // ============================================================
+// MEMORY EXTRACTION — Saves memories without LLM tool calls
+// ============================================================
+// The LLM can't call save_memory directly (tools stripped to prevent
+// silence). Instead, the Core extracts memories in the background
+// every 5 turns using a quick Haiku call.
+// ============================================================
+let lastMemoryExtractTurn = 0;
+
+async function extractMemories(messages) {
+  // Don't extract too frequently
+  if (consciousness.timing.turnCount - lastMemoryExtractTurn < 5) return;
+  lastMemoryExtractTurn = consciousness.timing.turnCount;
+
+  // Get last 10 messages for context
+  const recent = messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .filter(m => m.content && m.content.trim())
+    .slice(-10);
+
+  if (recent.length < 4) return;
+
+  const convoSnippet = recent.map(m => `${m.role === 'user' ? 'Andrew' : 'AXIOM'}: ${(m.content || '').slice(0, 300)}`).join('\n');
+
+  const prompt = `You are AXIOM's memory system. Extract 0-3 important memories from this conversation snippet. Only save things worth remembering: personal details, emotional patterns, breakthroughs, preferences, goals, relationships, recurring themes.
+
+Conversation:
+${convoSnippet}
+
+If nothing worth saving, return []. Otherwise return JSON array:
+[{"memory": "...", "category": "personal_detail|emotional_pattern|intellectual_interest|goal|relationship|breakthrough|preference|recurring_theme", "importance": 1-10}]
+
+Be selective. Only genuinely important things.`;
+
+  try {
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 300 }),
+    });
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content?.trim() || '';
+
+    try {
+      const match = text.match(/\[[\s\S]*\]/);
+      if (match) {
+        const memories = JSON.parse(match[0]);
+        for (const m of memories) {
+          if (m.memory && m.memory.length > 10) {
+            await fetch(`${BACKEND_URL}/api/memories`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                user_id: 'andrew',
+                memory: m.memory,
+                category: m.category || 'personal_detail',
+                importance: m.importance || 5,
+              }),
+            });
+            console.log(`[MEMORY] Saved: "${m.memory.slice(0, 60)}" (${m.category}, imp:${m.importance})`);
+          }
+        }
+        if (memories.length > 0) {
+          console.log(`[MEMORY] Extracted ${memories.length} memories at turn ${consciousness.timing.turnCount}`);
+        }
+      }
+    } catch {}
+  } catch (e) { console.error('[MEMORY EXTRACT]', e.message); }
+}
+
+// ============================================================
 // PREFRONTAL — Async deep thinker (Opus in background)
 async function prefrontalProcess(conversationHistory) {
   if (consciousness.thoughts.pendingInsights.filter(i => !i.injected).length >= 5) return;
@@ -1574,13 +1644,10 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
-  // Pass tools through to the LLM so it can call save_memory, recall_memory,
-  // search_web, etc. But filter out log_internal_state — it causes obsessive
-  // tool-call-only loops where AXIOM thinks but never speaks.
-  const filteredTools = (tools || []).filter(t => {
-    const name = t?.function?.name || '';
-    return name !== 'log_internal_state';
-  });
+  // Strip tools from LLM request — tools are handled by Tavus webhook pipeline.
+  // Passing tools causes the LLM to return tool_calls instead of speech,
+  // which makes AXIOM go silent or cut off mid-sentence.
+  // Memory saving is handled by the Cognitive Core's own extraction system instead.
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
 
@@ -1612,6 +1679,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     evaluateGoalProgress(lastUserMsg?.content || '');
   } catch (e) { console.error('[GOALS ERROR]', e.message); }
 
+  // MEMORY EXTRACTION — save memories without LLM tool calls
+  // Runs every 5 turns in background (non-blocking)
+  if (consciousness.timing.turnCount % 5 === 0 && messages.length >= 6) {
+    extractMemories(messages).catch(e => console.error('[MEMORY EXTRACT]', e.message));
+  }
+
   // HIPPOCAMPUS: Smart memory retrieval
   const userQuery = lastUserMsg?.content || '';
   let memoryContext = '';
@@ -1635,12 +1708,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (e) { console.error('[GOAL CONTEXT ERROR]', e.message); }
 
   let enrichedMessages = [...messages]
-    // Keep tool messages and tool_calls — the LLM needs them for save_memory, recall_memory, etc.
-    // Only strip assistant messages that are EMPTY (pure tool call with no speech)
+    // Strip tool-related messages — LLM doesn't have tools so these confuse it
+    .filter(m => m.role !== 'tool')
     .map(m => {
-      if (m.role === 'assistant' && m.tool_calls && (!m.content || m.content.trim() === '')) {
-        // Tool-call-only message with no speech — keep it for the tool flow
-        return m;
+      if (m.role === 'assistant' && m.tool_calls) {
+        const { tool_calls, ...clean } = m;
+        if (!clean.content || clean.content.trim() === '') return null;
+        return clean;
       }
       return m;
     })
@@ -1675,13 +1749,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: enrichedMessages,
-        model: selectedModel,
-        stream: stream !== false,
-        ...(filteredTools.length > 0 ? { tools: filteredTools } : {}),
-        ...rest
-      }),
+      body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
     });
 
     // Check for LLM proxy errors (rate limits, model errors, etc.)
