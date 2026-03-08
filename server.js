@@ -461,8 +461,8 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
   return { chunk: newLines.join('\n'), injected };
 }
 
-// System prompt addition for emotion tag awareness + speech requirement
-const MIRROR_SYSTEM_PROMPT = `\n\n## CRITICAL: Always Speak\nYou are in a LIVE VOICE CONVERSATION. Every response MUST contain spoken words. NEVER respond with only tool calls and no text. If you want to use a tool, include at least one sentence of speech too. The person cannot see tool calls — they can only hear you speak. If you have nothing to say, say something brief and natural.\n\n## Emotional Expression\nYou can control your facial expressions using emotion tags processed by Phoenix-4.\nTags: <emotion value="excited"/> <emotion value="elated"/> <emotion value="content"/> <emotion value="sad"/> <emotion value="surprised"/> <emotion value="neutral"/>\nPlace ONE tag at START of response. Your baseline is warm/content, never flat. MIRROR the user's energy. You may place additional tags at natural transition points mid-response.\nIMPORTANT: Only use ONE emotion tag at the start. Do not duplicate tags.`;
+// System prompt addition — speech requirement + anti-narration
+const MIRROR_SYSTEM_PROMPT = `\n\n## CRITICAL: Always Speak\nYou are in a LIVE VOICE CONVERSATION. Every response MUST contain spoken words. NEVER respond with only tool calls and no text. If you want to use a tool, include at least one sentence of speech too. The person cannot see tool calls — they can only hear you speak. If you have nothing to say, say something brief and natural.\n\n## CRITICAL: Never narrate actions\nDo NOT write stage directions, action descriptions, or sound effects. Never write *pauses*, *smiles*, *sighs*, [pause], [laughs], (silence), or any bracketed or asterisked actions. Never describe your own facial expressions or body language in text. Never output XML tags like <emotion>. Just SPEAK naturally. Your face and voice handle expression automatically.`;
 
 // ============================================================
 // HYPOTHALAMUS — Curiosity Drive Engine
@@ -1782,12 +1782,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (chunk.includes('"tool_calls"') || chunk.includes('"function"')) {
           isToolCallResponse = true;
         }
-        // MIRROR NEURONS: Inject emotion tag into first CONTENT chunk only (skip tool calls)
-        if (!emotionTagInjected && !isToolCallResponse && consciousness.mirror.active) {
-          const result = injectEmotionTagIntoChunk(chunk, emotionTagInjected);
-          chunk = result.chunk;
-          emotionTagInjected = result.injected;
-        }
+        // EMOTION TAGS DISABLED — ElevenLabs v3 reads <emotion> tags as literal text.
+        // Phoenix facial expressions are handled by Tavus's tts_emotion_control setting.
         res.write(chunk);
         const lines = chunk.split('\n');
         for (const line of lines) {
@@ -1821,11 +1817,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Rewrite model name for Tavus
       if (data.model) data.model = requestedModel;
       let content = data.choices?.[0]?.message?.content || '';
-      // MIRROR NEURONS: Inject emotion tag into non-streaming response
-      if (consciousness.mirror.active && content) {
-        content = injectEmotionTag(content);
-        if (data.choices?.[0]?.message) data.choices[0].message.content = content;
-      }
+      // EMOTION TAGS DISABLED — ElevenLabs reads them as text
       insula(content);
       if (consciousness.timing.turnCount % 3 === 0) {
         prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
