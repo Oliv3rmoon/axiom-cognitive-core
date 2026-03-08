@@ -1652,6 +1652,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (psycheContext ? '\n\n' + psycheContext : '') +
     (goalContext ? '\n\n' + goalContext : '') +
     MIRROR_SYSTEM_PROMPT +
+    '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.' +
     (brainState || '');
 
   if (contextInjection) {
