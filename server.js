@@ -1644,10 +1644,13 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
-  // Strip tools from LLM request — tools are handled by Tavus webhook pipeline.
-  // Passing tools causes the LLM to return tool_calls instead of speech,
-  // which makes AXIOM go silent or cut off mid-sentence.
-  // Memory saving is handled by the Cognitive Core's own extraction system instead.
+  // Pass tools through — Tavus manages the full tool call lifecycle:
+  // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
+  // We only filter log_internal_state (causes infinite loops).
+  const filteredTools = (tools || []).filter(t => {
+    const name = t?.function?.name || '';
+    return name !== 'log_internal_state';
+  });
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
 
@@ -1708,16 +1711,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (e) { console.error('[GOAL CONTEXT ERROR]', e.message); }
 
   let enrichedMessages = [...messages]
-    // Strip tool-related messages — LLM doesn't have tools so these confuse it
-    .filter(m => m.role !== 'tool')
-    .map(m => {
-      if (m.role === 'assistant' && m.tool_calls) {
-        const { tool_calls, ...clean } = m;
-        if (!clean.content || clean.content.trim() === '') return null;
-        return clean;
-      }
-      return m;
-    })
     .filter(Boolean);
 
   // Build the full context injection: memories + psyche + emotion instructions + brain signals
@@ -1749,7 +1742,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
+      body: JSON.stringify({
+        messages: enrichedMessages,
+        model: selectedModel,
+        stream: stream !== false,
+        ...(filteredTools.length > 0 ? { tools: filteredTools } : {}),
+        ...rest,
+      }),
     });
 
     // Check for LLM proxy errors (rate limits, model errors, etc.)
@@ -1768,6 +1767,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       let fullResponse = '';
       let emotionTagInjected = false; // MIRROR NEURONS: track if tag injected
+      let isToolCallResponse = false; // Track if this is a tool-call-only response
       const reader = proxyRes.body.getReader();
       const decoder = new TextDecoder();
       while (true) {
@@ -1778,8 +1778,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (selectedModel !== requestedModel) {
           chunk = chunk.replaceAll(`"model":"${selectedModel}"`, `"model":"${requestedModel}"`);
         }
-        // MIRROR NEURONS: Inject emotion tag into first content chunk
-        if (!emotionTagInjected && consciousness.mirror.active) {
+        // Detect tool call chunks — don't inject emotion tags into them
+        if (chunk.includes('"tool_calls"') || chunk.includes('"function"')) {
+          isToolCallResponse = true;
+        }
+        // MIRROR NEURONS: Inject emotion tag into first CONTENT chunk only (skip tool calls)
+        if (!emotionTagInjected && !isToolCallResponse && consciousness.mirror.active) {
           const result = injectEmotionTagIntoChunk(chunk, emotionTagInjected);
           chunk = result.chunk;
           emotionTagInjected = result.injected;
@@ -1807,7 +1811,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           }).catch(e => console.error('[HYPOTHALAMUS]', e.message));
         }
       }
-      console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
+      if (isToolCallResponse) {
+        console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | TOOL CALL (Tavus will handle)`);
+      } else {
+        console.log(`[RESPONSE] ${selectedModel} | ${Date.now() - startTime}ms | ${fullResponse.slice(0, 80)}...`);
+      }
     } else {
       const data = await proxyRes.json();
       // Rewrite model name for Tavus
