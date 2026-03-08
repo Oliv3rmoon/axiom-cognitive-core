@@ -1574,11 +1574,13 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
-  // NOTE: We intentionally strip 'tools' and 'tool_choice' from the LLM request.
-  // Tools are handled by the backend webhook, not by the Cognitive Core.
-  // Passing tools to the LLM causes it to call log_internal_state obsessively
-  // instead of generating speech, creating a silent loop where AXIOM thinks
-  // but never talks. The Cognitive Core is the VOICE — speech only.
+  // Pass tools through to the LLM so it can call save_memory, recall_memory,
+  // search_web, etc. But filter out log_internal_state — it causes obsessive
+  // tool-call-only loops where AXIOM thinks but never speaks.
+  const filteredTools = (tools || []).filter(t => {
+    const name = t?.function?.name || '';
+    return name !== 'log_internal_state';
+  });
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
 
@@ -1633,15 +1635,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (e) { console.error('[GOAL CONTEXT ERROR]', e.message); }
 
   let enrichedMessages = [...messages]
-    // Strip tool-related messages — they confuse the LLM when tools aren't available
-    .filter(m => m.role !== 'tool')
-    // Strip tool_calls from assistant messages — keep only speech content
+    // Keep tool messages and tool_calls — the LLM needs them for save_memory, recall_memory, etc.
+    // Only strip assistant messages that are EMPTY (pure tool call with no speech)
     .map(m => {
-      if (m.role === 'assistant' && m.tool_calls) {
-        const { tool_calls, ...clean } = m;
-        // If this message was ONLY a tool call (no content), skip it entirely
-        if (!clean.content || clean.content.trim() === '') return null;
-        return clean;
+      if (m.role === 'assistant' && m.tool_calls && (!m.content || m.content.trim() === '')) {
+        // Tool-call-only message with no speech — keep it for the tool flow
+        return m;
       }
       return m;
     })
@@ -1676,7 +1675,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: enrichedMessages, model: selectedModel, stream: stream !== false, ...rest }),
+      body: JSON.stringify({
+        messages: enrichedMessages,
+        model: selectedModel,
+        stream: stream !== false,
+        ...(filteredTools.length > 0 ? { tools: filteredTools } : {}),
+        ...rest
+      }),
     });
 
     // Check for LLM proxy errors (rate limits, model errors, etc.)
