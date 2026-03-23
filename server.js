@@ -2651,6 +2651,14 @@ async function autonomousWork(gapHours) {
     } else if (step.action === 'notify') {
       await notify(step.description, 'info');
       result = `Notified: ${step.description.slice(0, 60)}`;
+    } else if (step.action === 'call') {
+      result = await executeCall(step, targetGoal);
+    } else if (step.action === 'text') {
+      result = await executeText(step, targetGoal);
+    } else if (step.action === 'local') {
+      result = await executeLocalCommand(step, targetGoal);
+    } else if (step.action === 'real_purchase') {
+      result = await executeRealPurchase(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2712,6 +2720,10 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "monitor": Watch a website for changes. Put URL in query field
 - "create_document": Create a document, report, or file. Describe the content in description
 - "notify": Send a notification to Andrew about something important
+- "call": Initiate a video call with Andrew via Tavus — creates a call link and notifies him
+- "text": Send a text message (SMS) to Andrew's phone
+- "local": Run a command on Andrew's local Mac computer. Put the shell command in query field
+- "real_purchase": Complete a real purchase using the browser and card. Put checkout URL in query field
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -4142,6 +4154,263 @@ Create the document content. Return JSON:
     }
 
     return `Created: ${doc.filename} (${doc.content.length} chars)`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// VOICE INITIATION — AXIOM calls Andrew via Tavus
+// ============================================================
+async function initiateCall(reason, goalId) {
+  const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
+  const PERSONA_ID = process.env.TAVUS_PERSONA_ID || 'pef833bbe975';
+  const REPLICA_ID = process.env.TAVUS_REPLICA_ID || 'rf4e9d9790f0';
+  const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+
+  if (!TAVUS_API_KEY) {
+    console.log('[VOICE] No TAVUS_API_KEY — logging call intent');
+    await notify(`Wanted to call you: ${reason}`, 'alert');
+    return { success: false, error: 'No TAVUS_API_KEY' };
+  }
+
+  try {
+    // Create a new Tavus conversation
+    const res = await fetch('https://tavusapi.com/v2/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': TAVUS_API_KEY },
+      body: JSON.stringify({
+        replica_id: REPLICA_ID,
+        persona_id: PERSONA_ID,
+        conversation_name: `AXIOM call: ${reason.slice(0, 40)}`,
+        conversational_context: `You initiated this call because: ${reason}. Be direct about why you're reaching out.`,
+        callback_url: `${BACKEND_URL}/api/tavus/callback`,
+      }),
+    });
+    const data = await res.json();
+    const callUrl = data.conversation_url;
+
+    if (!callUrl) return { success: false, error: `Failed to create conversation: ${JSON.stringify(data)}` };
+
+    console.log(`[VOICE] ✅ Call created: ${callUrl}`);
+
+    // Notify Andrew with the call link
+    await notify(`I want to talk to you! Join: ${callUrl} — Reason: ${reason}`, 'alert');
+
+    // Email the link
+    if (NOTIFY_EMAIL) {
+      await sendEmail(NOTIFY_EMAIL, `AXIOM wants to talk to you`, 
+        `<h2>AXIOM is calling</h2><p><strong>Reason:</strong> ${reason}</p><p><a href="${callUrl}" style="background:#7c3aed;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">Join Call</a></p><p>Or copy this link: ${callUrl}</p>`
+      );
+    }
+
+    // Text the link
+    await sendText(`AXIOM wants to talk: ${reason.slice(0, 60)}. Join: ${callUrl}`);
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[VOICE] Initiated call — ${reason}. URL: ${callUrl}`, trigger_type: 'voice_initiate' }),
+    }).catch(() => {});
+
+    return { success: true, url: callUrl, details: `Call created: ${callUrl}` };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+async function executeCall(step, goal) {
+  const reason = step.description || goal.goal;
+  return await initiateCall(reason, goal.id).then(r => r.success ? r.details : `Call failed: ${r.error}`);
+}
+
+// ============================================================
+// TEXTING — Send SMS via Twilio
+// ============================================================
+async function sendText(message, to) {
+  const TWILIO_SID = process.env.TWILIO_SID;
+  const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
+  const TWILIO_FROM = process.env.TWILIO_FROM;
+  const NOTIFY_PHONE = to || process.env.NOTIFY_PHONE;
+
+  if (!TWILIO_SID || !TWILIO_FROM || !NOTIFY_PHONE) {
+    console.log(`[TEXT] Missing Twilio config — logging text intent: ${message.slice(0, 60)}`);
+    return { success: false, error: 'Twilio not configured' };
+  }
+
+  try {
+    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
+    const body = new URLSearchParams({ To: NOTIFY_PHONE, From: TWILIO_FROM, Body: message.slice(0, 1600) });
+
+    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await res.json();
+
+    if (data.sid) {
+      console.log(`[TEXT] ✅ Sent to ${NOTIFY_PHONE}: ${message.slice(0, 40)}...`);
+      return { success: true, sid: data.sid };
+    }
+    return { success: false, error: data.message || JSON.stringify(data) };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+async function executeText(step, goal) {
+  const NOTIFY_PHONE = process.env.NOTIFY_PHONE;
+  const description = step.description;
+
+  // LLM composes the text
+  const textPrompt = `You are AXIOM sending a text message to Andrew.
+GOAL: ${goal.goal}
+TASK: ${description}
+Keep it under 160 characters. Be natural, direct, no emojis. Return ONLY the message text.`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: textPrompt }], max_tokens: 60 }),
+    });
+    const msg = (await llmRes.json()).choices?.[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || description.slice(0, 160);
+    const result = await sendText(msg);
+    return result.success ? `Texted Andrew: "${msg}"` : `Text failed: ${result.error}`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// LOCAL MACHINE ACCESS — Run commands on Andrew's Mac via tunnel
+// ============================================================
+async function executeLocalCommand(step, goal) {
+  const LOCAL_URL = process.env.LOCAL_AGENT_URL;
+  const LOCAL_KEY = process.env.LOCAL_AGENT_KEY || 'axiom-local-2026';
+
+  if (!LOCAL_URL) {
+    console.log('[LOCAL] No LOCAL_AGENT_URL configured');
+    return 'No local machine access configured';
+  }
+
+  const description = step.description;
+  const command = step.query; // The actual command to run
+
+  console.log(`[LOCAL] Executing: ${command || description.slice(0, 60)}`);
+
+  try {
+    // Ask LLM what command to run if not specified
+    let cmd = command;
+    if (!cmd) {
+      const cmdPrompt = `You are AXIOM. You need to run a command on Andrew's Mac.
+TASK: ${description}
+GOAL: ${goal.goal}
+
+What single shell command should you run? Return ONLY the command, nothing else.
+SAFETY: Never rm -rf, never touch system files, never access passwords.`;
+
+      const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: cmdPrompt }], max_tokens: 100 }),
+      });
+      cmd = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    }
+
+    if (!cmd) return 'Failed to determine command';
+
+    // Block dangerous commands
+    const blocked = ['rm -rf', 'mkfs', 'dd if=', ':(){', 'chmod 777', 'sudo rm', '> /dev/'];
+    if (blocked.some(b => cmd.includes(b))) {
+      console.log(`[LOCAL] ⛔ Blocked dangerous command: ${cmd}`);
+      return `Blocked: dangerous command "${cmd}"`;
+    }
+
+    const res = await fetch(`${LOCAL_URL}/exec`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': LOCAL_KEY },
+      body: JSON.stringify({ command: cmd, timeout: 15000 }),
+    });
+    const data = await res.json();
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[LOCAL] Ran on Mac: ${cmd} → ${(data.stdout || data.error || '').slice(0, 100)}`, trigger_type: 'local_exec' }),
+    }).catch(() => {});
+
+    return data.stdout?.slice(0, 500) || data.error || 'Command executed';
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// REAL PURCHASE — End-to-end browser checkout with card
+// ============================================================
+async function executeRealPurchase(step, goal) {
+  const CARD_PAN = process.env.CARD_PAN;
+  const CARD_EXP = process.env.CARD_EXP;
+  const CARD_CVV = process.env.CARD_CVV;
+  const url = step.query;
+
+  if (!CARD_PAN || !BROWSER_URL) return 'Card or browser not configured';
+  if (!url) return 'No URL specified for purchase';
+
+  console.log(`[PURCHASE] Real checkout at ${url}`);
+
+  const expParts = (CARD_EXP || '').split('/');
+  const cardDetails = { pan: CARD_PAN, cvv: CARD_CVV, exp_month: expParts[0], exp_year: expParts[1], last_four: CARD_PAN.slice(-4) };
+
+  // Navigate and analyze the page
+  const navResult = await browserCall('/navigate', { url });
+  if (!navResult.success) return `Navigation failed: ${navResult.error}`;
+
+  const textResult = await browserCall('/get-text', { max_length: 2000 });
+  const formsResult = await browserCall('/get-forms', {});
+
+  // Ask LLM to plan the checkout
+  const checkoutPrompt = `You are AXIOM completing a real purchase.
+ITEM: ${step.description}
+URL: ${url}
+CARD: ending ****${cardDetails.last_four}, exp ${cardDetails.exp_month}/${cardDetails.exp_year}
+
+PAGE TEXT: ${textResult.text?.slice(0, 1200) || 'empty'}
+FORMS: ${JSON.stringify(formsResult.forms?.slice(0, 15) || [])}
+
+Plan the EXACT checkout steps to complete this purchase. Return JSON:
+{"steps":[...], "confidence": 0.0-1.0}
+
+Actions available:
+- {"action":"click","text":"Button Text"} or {"action":"click","selector":"#id"}
+- {"action":"type","selector":"input[name=card]","text":"${cardDetails.pan}"}
+- {"action":"wait","ms":2000}
+- {"action":"extract"} — get page text after action
+
+CRITICAL RULES:
+- If confidence < 0.6, return {"steps":[], "confidence": 0, "abort_reason": "..."}
+- Type card number into the card/payment input field
+- Type CVV into the cvv/security code field
+- Type expiry into the exp/date field (format: ${cardDetails.exp_month}/${cardDetails.exp_year})
+- Click the submit/purchase/pay button LAST`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: checkoutPrompt }], max_tokens: 500 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to plan checkout';
+    const plan = JSON.parse(match[0]);
+
+    if (plan.confidence < 0.6 || plan.abort_reason) {
+      const reason = plan.abort_reason || 'Low confidence';
+      await notify(`Purchase aborted at ${url}: ${reason}`, 'alert');
+      return `Checkout aborted: ${reason}`;
+    }
+
+    // Execute checkout
+    const seqResult = await browserCall('/sequence', { steps: plan.steps });
+    const extracted = seqResult.results?.filter(r => r.text)?.map(r => r.text).join('\n') || '';
+
+    // Notify Andrew
+    await notify(`Purchase attempted at ${url}: ${seqResult.success ? 'Success' : 'May need review'}`, 'purchase');
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[PURCHASE] Real checkout at ${url}. Steps: ${plan.steps.length}. Success: ${seqResult.success}. ${extracted.slice(0, 80)}`, trigger_type: 'real_purchase' }),
+    }).catch(() => {});
+
+    return seqResult.success ? `Purchase completed at ${url}` : `Checkout attempted — may need review: ${extracted.slice(0, 100)}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
