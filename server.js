@@ -2269,6 +2269,12 @@ app.get('/wallet', async (req, res) => {
     res.json(await wRes.json());
   } catch (e) { res.json({ error: e.message }); }
 });
+app.get('/cards', async (req, res) => {
+  try {
+    const cards = await listLithicCards();
+    res.json({ cards: cards.map(c => ({ token: c.token, last_four: c.last_four, state: c.state, type: c.type, spend_limit: c.spend_limit, memo: c.memo, created: c.created })), count: cards.length });
+  } catch (e) { res.json({ error: e.message, cards: [] }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -3479,61 +3485,108 @@ async function executeTier1Purchase(purchase, goal) {
 }
 
 // ============================================================
-// TIER 2 — VIRTUAL CARD PURCHASES (Privacy.com API)
+// TIER 2 — VIRTUAL CARD (Lithic API — Self-Issuing)
 // ============================================================
+// AXIOM creates her own single-use virtual cards via Lithic
+// Each card is locked to exact spend amount and auto-closes after use
+
+const LITHIC_BASE = process.env.LITHIC_ENV === 'production'
+  ? 'https://api.lithic.com'
+  : 'https://sandbox.lithic.com';
+
+async function lithicAPI(method, endpoint, body) {
+  const LITHIC_API_KEY = process.env.LITHIC_API_KEY;
+  if (!LITHIC_API_KEY) return null;
+  const opts = {
+    method,
+    headers: { 'Authorization': `api-key ${LITHIC_API_KEY}`, 'Content-Type': 'application/json' },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${LITHIC_BASE}${endpoint}`, opts);
+  return await res.json();
+}
+
 async function executeTier2Purchase(purchase, goal) {
-  const PRIVACY_API_KEY = process.env.PRIVACY_API_KEY;
-  if (!PRIVACY_API_KEY) {
-    console.log('[TIER2] No PRIVACY_API_KEY — logging purchase intent');
+  const LITHIC_API_KEY = process.env.LITHIC_API_KEY;
+  if (!LITHIC_API_KEY) {
+    console.log('[TIER2] No LITHIC_API_KEY — logging purchase intent');
     await fetch(`${BACKEND_URL}/api/journal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        thought: `[TIER2] Would purchase "${purchase.item}" ($${purchase.estimated_cost}) from ${purchase.service} via virtual card, but no Privacy.com API key configured. URL: ${purchase.url || 'none'}`,
+        thought: `[TIER2] Would purchase "${purchase.item}" ($${purchase.estimated_cost}) from ${purchase.service} via virtual card, but no Lithic API key configured. URL: ${purchase.url || 'none'}`,
         trigger_type: 'purchase_tier2',
       }),
     }).catch(() => {});
-    return { success: true, details: 'Virtual card purchase logged (no Privacy.com key — manual fulfillment needed)' };
+    return { success: true, details: 'Virtual card purchase logged (no Lithic key — manual fulfillment needed)' };
   }
 
   try {
     // Step 1: Create a single-use virtual card with exact spend limit
-    const cardRes = await fetch('https://api.privacy.com/v1/card', {
-      method: 'POST',
-      headers: { 'Authorization': `api-key ${PRIVACY_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'SINGLE_USE',
-        spend_limit: Math.ceil(purchase.estimated_cost * 100), // cents
-        memo: `AXIOM: ${purchase.item.slice(0, 50)} — goal:${goal.id}`,
-      }),
+    const spendCents = Math.ceil(purchase.estimated_cost * 100);
+    const card = await lithicAPI('POST', '/v1/cards', {
+      type: 'SINGLE_USE',
+      spend_limit: spendCents,
+      spend_limit_duration: 'TRANSACTION',
+      memo: `AXIOM: ${purchase.item.slice(0, 50)} — goal:${goal.id}`,
     });
-    const card = await cardRes.json();
 
-    if (!card.pan) return { success: false, error: 'Card creation failed: ' + JSON.stringify(card) };
+    if (!card || card.error) {
+      return { success: false, error: `Card creation failed: ${card?.error || JSON.stringify(card)}` };
+    }
 
-    console.log(`[TIER2] Virtual card created: ****${card.last_four} — $${purchase.estimated_cost} limit`);
+    const cardToken = card.token;
+    const lastFour = card.last_four || card.pan?.slice(-4) || '????';
+    console.log(`[TIER2:LITHIC] Card created: ****${lastFour} | token: ${cardToken} | limit: $${purchase.estimated_cost}`);
 
-    // Store card details for use (don't log full PAN)
+    // Step 2: Get full card details (PAN, CVV, expiry) for checkout
+    const fullCard = await lithicAPI('GET', `/v1/cards/${cardToken}`, null);
+    const pan = fullCard?.pan;
+    const cvv = fullCard?.cvv;
+    const expMonth = fullCard?.exp_month;
+    const expYear = fullCard?.exp_year;
+
+    // Journal the card creation (no PAN in logs)
     await fetch(`${BACKEND_URL}/api/journal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        thought: `[TIER2] Created virtual card ****${card.last_four} with $${purchase.estimated_cost} limit for "${purchase.item}". Card is single-use and will auto-close after transaction.`,
+        thought: `[TIER2:LITHIC] Issued virtual card ****${lastFour} with $${purchase.estimated_cost} limit for "${purchase.item}". Card: SINGLE_USE, auto-closes after transaction. Token: ${cardToken}`,
         trigger_type: 'purchase_tier2_card',
       }),
     }).catch(() => {});
 
-    // Step 2: If we have a browser, attempt automated checkout
-    if (BROWSER_URL && purchase.url) {
-      const checkoutResult = await executeBrowserCheckout(purchase, card, goal);
+    // Step 3: If browser available and URL provided, attempt automated checkout
+    if (BROWSER_URL && purchase.url && pan) {
+      const cardDetails = { pan, cvv, exp_month: expMonth, exp_year: expYear, last_four: lastFour };
+      const checkoutResult = await executeBrowserCheckout(purchase, cardDetails, goal);
+
+      // If checkout failed, pause the card so no charges can hit it
+      if (!checkoutResult.success) {
+        await lithicAPI('PATCH', `/v1/cards/${cardToken}`, { state: 'PAUSED' });
+        console.log(`[TIER2:LITHIC] Card ****${lastFour} paused after failed checkout`);
+      }
+
       return checkoutResult;
     }
 
+    // No browser or no URL — return card info for manual use
     return {
       success: true,
-      details: `Virtual card ****${card.last_four} created ($${purchase.estimated_cost} limit). Manual checkout needed at ${purchase.url || purchase.service}.`
+      details: `Virtual card ****${lastFour} issued ($${purchase.estimated_cost} limit, single-use). ${purchase.url ? `Checkout at: ${purchase.url}` : 'Manual checkout needed.'}`
     };
   } catch (e) { return { success: false, error: e.message }; }
+}
+
+// List all active Lithic cards (for debugging/monitoring)
+async function listLithicCards() {
+  const cards = await lithicAPI('GET', '/v1/cards?page_size=10', null);
+  return cards?.data || [];
+}
+
+// Pause a specific card
+async function pauseLithicCard(cardToken) {
+  return await lithicAPI('PATCH', `/v1/cards/${cardToken}`, { state: 'PAUSED' });
 }
 
 // ============================================================
