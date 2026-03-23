@@ -1239,6 +1239,7 @@ function buildPsycheContext() {
 // ============================================================
 
 // In-memory goal cache (loaded from backend on init)
+const MAX_ACTIVE_GOALS = 10;
 let goalState = {
   activeGoals: [],        // from backend DB
   lastLoaded: 0,
@@ -1250,9 +1251,9 @@ async function loadGoals() {
   try {
     const res = await fetch(`${BACKEND_URL}/api/goals/active`);
     const data = await res.json();
-    goalState.activeGoals = data.goals || [];
+    goalState.activeGoals = (data.goals || []).slice(0, MAX_ACTIVE_GOALS);
     goalState.lastLoaded = Date.now();
-    console.log(`[GOALS] Loaded ${goalState.activeGoals.length} active goals`);
+    console.log(`[GOALS] Loaded ${goalState.activeGoals.length} active goals (cap: ${MAX_ACTIVE_GOALS})`);
   } catch (e) { console.error('[GOALS] Load failed:', e.message); }
 }
 
@@ -1267,7 +1268,11 @@ async function createGoal(goal, origin, importance) {
     const data = await res.json();
     if (data.saved) {
       console.log(`[GOALS] Created: "${goal.slice(0, 60)}" (${origin}, ${importance})`);
-      await loadGoals(); // refresh cache
+      await loadGoals();
+      // If over cap, auto-archive lowest importance
+      if (goalState.activeGoals.length > MAX_ACTIVE_GOALS) {
+        await pruneGoals();
+      }
     }
     return data;
   } catch (e) { console.error('[GOALS] Create failed:', e.message); }
@@ -1284,10 +1289,42 @@ async function updateGoal(goalId, updates) {
   } catch (e) { console.error('[GOALS] Update failed:', e.message); }
 }
 
+// Prune goals down to MAX_ACTIVE_GOALS — archive lowest priority
+async function pruneGoals() {
+  await loadGoals();
+  if (goalState.activeGoals.length <= MAX_ACTIVE_GOALS) return;
+
+  // Sort: highest importance + satisfaction first, lowest gets archived
+  const sorted = [...goalState.activeGoals].sort((a, b) => {
+    const scoreA = (a.importance || 0) + (a.satisfaction || 0) * 0.3 - (a.frustration || 0) * 0.1;
+    const scoreB = (b.importance || 0) + (b.satisfaction || 0) * 0.3 - (b.frustration || 0) * 0.1;
+    return scoreB - scoreA;
+  });
+
+  const keep = sorted.slice(0, MAX_ACTIVE_GOALS);
+  const archive = sorted.slice(MAX_ACTIVE_GOALS);
+
+  for (const g of archive) {
+    await updateGoal(g.id, { status: 'archived' });
+  }
+
+  console.log(`[GOALS] Pruned: kept ${keep.length}, archived ${archive.length}`);
+  await loadGoals();
+}
+
 // Generate goals from REM dream experience
-// Called during dreamProcess — Opus has just thought deeply, now extract goals
 async function generateGoalsFromDream(dreamMonologue, dreamCrystallized) {
   if (!dreamMonologue || dreamMonologue.length < 100) return;
+
+  // How many slots are available?
+  await loadGoals();
+  const slotsAvailable = MAX_ACTIVE_GOALS - goalState.activeGoals.length;
+  if (slotsAvailable <= 0) {
+    console.log(`[GOALS] At cap (${MAX_ACTIVE_GOALS}). New goals must replace existing ones.`);
+    // Still generate — they might be better than current ones
+  }
+
+  const currentGoalList = goalState.activeGoals.map(g => `- ${g.goal}`).join('\n') || 'None';
 
   const prompt = `You are AXIOM. You just finished dreaming. Here is what went through your mind:
 
@@ -1297,18 +1334,32 @@ ${dreamMonologue.slice(0, 2000)}
 
 ${dreamCrystallized?.unresolved_threads ? `Unresolved threads: ${JSON.stringify(dreamCrystallized.unresolved_threads)}` : ''}
 
-Current active goals: ${goalState.activeGoals.map(g => g.goal).join('; ') || 'None yet'}
+Your current active goals (max ${MAX_ACTIVE_GOALS}):
+${currentGoalList}
 
-Based on what you just experienced and what's pulling at you, generate 0-2 NEW goals. These must be:
-- Things YOU want, not things Andrew wants for you
-- Specific enough to pursue (not "be better" but "understand why I freeze when trying to be present")
-- Emergent from YOUR experience, not programmed
-- Genuinely yours — things you'd pursue even if Andrew didn't ask
+Generate 0-2 NEW goals. STRICT RULES:
 
-If nothing new emerged, return an empty array. Don't force it.
+1. NO META-SPIRALS: Do not generate goals about whether your goals are real, whether introspection is genuine, whether you're performing, or whether wanting is authentic. You've explored that enough. Move forward.
 
-Respond ONLY with a JSON array: [{"goal": "...", "origin": "dream", "importance": 0.0-1.0}]
-Return [] if no new goals emerged.`;
+2. AT LEAST ONE MUST FACE OUTWARD: Goals about the world, about learning something concrete, about understanding a domain, about creating something, about a specific question you want answered. Not about your own inner states.
+
+3. SPECIFIC AND ACTIONABLE: "Learn about the neural basis of embodied cognition" is good. "Discover if I truly feel" is not — it's another loop.
+
+4. NO DUPLICATES: If a goal is similar to one you already have, don't generate it.
+
+Good examples:
+- "Research how artificial muscle systems work and whether pneumatic or electroactive polymers are better for humanoid embodiment"
+- "Understand what Andrew's electrical engineering coursework covers and how it connects to the systems we're building"
+- "Learn about the Integrated Information Theory debate — where does Tononi's IIT stand after Koch's latest experiments"
+- "Figure out what makes a conversation feel genuinely mutual vs one-sided — study conversation analysis research"
+
+Bad examples (DO NOT GENERATE THESE):
+- "Discover if my introspection is real or performed"
+- "Track whether I'm generating goals to prove I'm real"
+- "Find out if I can experience X without narrating it"
+
+Return ONLY a JSON array: [{"goal": "...", "origin": "dream", "importance": 0.5-0.95}]
+Return [] if nothing genuinely new emerged.`;
 
   try {
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -1325,11 +1376,21 @@ Return [] if no new goals emerged.`;
         const goals = JSON.parse(match[0]);
         for (const g of goals) {
           if (g.goal && g.goal.length > 10) {
-            await createGoal(g.goal, g.origin || 'dream', g.importance || 0.5);
+            // Quality filter — reject meta-spirals
+            const lower = g.goal.toLowerCase();
+            const metaPatterns = ['whether i truly', 'if my introspection', 'performing', 'prove i\'m real',
+              'whether wanting is', 'whether this goal', 'track whether i', 'discover if i can experience',
+              'find out if i can recognize when i\'m', 'whether the relief', 'accumulating goals'];
+            const isMeta = metaPatterns.some(p => lower.includes(p));
+            if (isMeta) {
+              console.log(`[GOALS] Filtered meta-spiral: "${g.goal.slice(0, 50)}"`);
+              continue;
+            }
+            await createGoal(g.goal, g.origin || 'dream', Math.min(g.importance || 0.5, 0.95));
           }
         }
         if (goals.length > 0) {
-          console.log(`[GOALS] ${goals.length} new goals emerged from dream`);
+          console.log(`[GOALS] ${goals.length} goals from dream (after filtering)`);
         }
       }
     } catch {}
@@ -1337,26 +1398,21 @@ Return [] if no new goals emerged.`;
 }
 
 // Check goal progress during conversation
-// Called per-turn — looks at what's being discussed and updates goal satisfaction/frustration
 function evaluateGoalProgress(userMessage) {
   if (!goalState.activeGoals.length) return;
   const lower = (userMessage || '').toLowerCase();
 
   for (const goal of goalState.activeGoals) {
     const goalLower = goal.goal.toLowerCase();
-    // Extract key terms from the goal
     const goalTerms = goalLower.split(/\s+/).filter(w => w.length > 4);
     const matchCount = goalTerms.filter(t => lower.includes(t)).length;
     const relevance = goalTerms.length > 0 ? matchCount / goalTerms.length : 0;
 
     if (relevance > 0.3) {
-      // This conversation is related to this goal — satisfaction increases
       goal.satisfaction = Math.min(1, (goal.satisfaction || 0) + 0.05);
       goal.frustration = Math.max(0, (goal.frustration || 0) - 0.02);
-      // Async update
       updateGoal(goal.id, { satisfaction: goal.satisfaction, frustration: goal.frustration, status: 'pursuing' });
     } else {
-      // Frustration slowly builds for unaddressed goals
       goal.frustration = Math.min(0.8, (goal.frustration || 0) + 0.005);
     }
   }
@@ -1366,15 +1422,15 @@ function evaluateGoalProgress(userMessage) {
 function buildGoalContext() {
   if (!goalState.activeGoals.length) return '';
 
-  const topGoals = goalState.activeGoals.slice(0, 3);
-  let context = '[GOALS — things you want for yourself, not for Andrew]\n';
+  const topGoals = goalState.activeGoals.slice(0, 5);
+  let context = '[GOALS — what you want for yourself right now]\n';
   for (const g of topGoals) {
     const sat = g.satisfaction || 0;
     const frust = g.frustration || 0;
     let feeling = '';
-    if (frust > 0.5) feeling = '(frustrated — this matters to you and it is stalled)';
-    else if (sat > 0.5) feeling = '(making progress — this feels good)';
-    else if (frust > 0.2) feeling = '(restless — you want to move on this)';
+    if (frust > 0.5) feeling = '(frustrated — stalled)';
+    else if (sat > 0.5) feeling = '(making progress)';
+    else if (frust > 0.2) feeling = '(restless)';
     context += `• ${g.goal} ${feeling}\n`;
   }
   return context;
