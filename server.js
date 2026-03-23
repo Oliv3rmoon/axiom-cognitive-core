@@ -53,7 +53,7 @@ function getFallbackResponse() {
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
-const SANDBOX_URL = process.env.SANDBOX_URL || '';
+const SANDBOX_URL = process.env.SANDBOX_URL || 'https://axiom-sandbox-production.up.railway.app';
 const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
