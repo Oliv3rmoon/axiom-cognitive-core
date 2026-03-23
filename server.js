@@ -2617,7 +2617,27 @@ async function autonomousWork(gapHours) {
     // Execute next step
     const step = planData.step;
     const progress = planData.progress;
+
+    // Load completed step results for context continuity
+    let priorStepContext = '';
+    try {
+      const allStepsRes = await fetch(`${BACKEND_URL}/api/plans`);
+      const allPlans = await allStepsRes.json();
+      const thisPlan = (allPlans.plans || []).find(p => p.goal_id === targetGoal.id && p.status === 'active');
+      if (thisPlan) {
+        const completedSteps = (thisPlan.steps || []).filter(s => s.status === 'completed' && s.result);
+        if (completedSteps.length > 0) {
+          priorStepContext = completedSteps.map(s =>
+            `Step ${s.step_number} [${s.action}]: ${s.description?.slice(0, 60)} → ${s.result?.slice(0, 150)}`
+          ).join('\n');
+          // Inject context into the step so executors can use it
+          step._prior_context = priorStepContext;
+        }
+      }
+    } catch {}
+
     console.log(`[AUTONOMOUS] Step ${progress}: [${step.action}] ${step.description.slice(0, 60)}`);
+    if (priorStepContext) console.log(`[AUTONOMOUS] Prior context: ${priorStepContext.split('\n').length} completed steps`);
 
     let result = '';
     if (step.action === 'deep_research' || step.action === 'research') {
@@ -2659,6 +2679,12 @@ async function autonomousWork(gapHours) {
       result = await executeLocalCommand(step, targetGoal);
     } else if (step.action === 'real_purchase') {
       result = await executeRealPurchase(step, targetGoal);
+    } else if (step.action === 'start_project') {
+      result = await executeStartProject(step, targetGoal);
+    } else if (step.action === 'read_codebase') {
+      result = await executeReadCodebase(step, targetGoal);
+    } else if (step.action === 'build_and_test') {
+      result = await executeBuildAndTest(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2724,6 +2750,9 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "text": Send a text message (SMS) to Andrew's phone
 - "local": Run a command on Andrew's local Mac computer. Put the shell command in query field
 - "real_purchase": Complete a real purchase using the browser and card. Put checkout URL in query field
+- "start_project": Create a big multi-phase project plan (8-20 steps). Use for complex builds, not quick tasks
+- "read_codebase": Read an ENTIRE GitHub repo — all files, architecture, dependencies. Returns full context summary. Put repo name in query (e.g. "axiom-backend")
+- "build_and_test": Write code AND test it iteratively — up to 3 cycles of write→test→fix until it works. Describe what to build
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -2853,12 +2882,16 @@ async function executeWrite(step, goal) {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
     const wsData = await wsRes.json();
-    priorContent = (wsData.items || []).filter(i => i.related_goal_id === goal.id)
-      .map(r => `[${r.type}] ${r.title}: ${r.content.slice(0, 300)}`).join('\n\n');
+    priorContent = (wsData.entries || wsData.items || []).filter(i => i.related_goal_id === goal.id)
+      .map(r => `[${r.type}] ${r.title}: ${(r.content || '').slice(0, 300)}`).join('\n\n');
   } catch {}
+
+  // Include prior step context from the plan
+  const stepContext = step._prior_context || '';
 
   const wPrompt = `Write a synthesis for: ${step.description}
 Goal: ${goal.goal}
+${stepContext ? `\nCompleted steps in this plan:\n${stepContext.slice(0, 1500)}\n` : ''}
 Prior research:\n${priorContent.slice(0, 2000) || 'None'}
 3-6 paragraphs. Concrete facts, connections, insights.`;
 
@@ -4412,6 +4445,309 @@ CRITICAL RULES:
 
     return seqResult.success ? `Purchase completed at ${url}` : `Checkout attempted — may need review: ${extracted.slice(0, 100)}`;
   } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// PROJECT PLANNING — Multi-phase projects with persistent context
+// ============================================================
+async function executeStartProject(step, goal) {
+  const description = step.description || goal.goal;
+  console.log(`[PROJECT] Starting project: ${description.slice(0, 60)}`);
+
+  // Read any existing workspace context for this goal
+  let existingContext = '';
+  try {
+    const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=20`);
+    const wsData = await wsRes.json();
+    const related = (wsData.entries || []).filter(e => e.related_goal_id === goal.id);
+    if (related.length > 0) {
+      existingContext = related.map(r => `[${r.type}] ${r.title}: ${(r.content || '').slice(0, 200)}`).join('\n');
+    }
+  } catch {}
+
+  // Read codebase summary if available
+  let codeContext = '';
+  try {
+    const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=50`);
+    const wsData = await wsRes.json();
+    const codeSummaries = (wsData.entries || []).filter(e => e.type === 'codebase_summary');
+    if (codeSummaries.length > 0) {
+      codeContext = codeSummaries.map(s => s.content?.slice(0, 500)).join('\n---\n');
+    }
+  } catch {}
+
+  const projectPrompt = `You are AXIOM planning a BIG project — not a quick task, a real multi-phase build.
+
+PROJECT: ${description}
+${existingContext ? `\nEXISTING WORK:\n${existingContext}` : ''}
+${codeContext ? `\nCODEBASE CONTEXT:\n${codeContext.slice(0, 1500)}` : ''}
+
+Create a DETAILED project plan with 8-20 steps across multiple phases.
+
+PHASES:
+1. RESEARCH — Understand the problem, read existing code, gather requirements
+2. DESIGN — Plan the architecture, decide on approach, identify files to modify
+3. BUILD — Write code, create files, make changes
+4. TEST — Run tests, verify functionality, check for bugs
+5. INTEGRATE — Connect to existing systems, update configs, deploy
+6. DOCUMENT — Write docs, update README, notify Andrew
+
+AVAILABLE ACTIONS:
+research, read_code, read_codebase, audit, propose_change, create_file,
+run_test, build_and_test, search, write, purchase, browse, interact,
+email, monitor, create_document, notify, call, text, local, real_purchase, plan
+
+SPECIAL ACTIONS:
+- "read_codebase": Read an ENTIRE GitHub repo — all files, structure, dependencies. Returns full context. Put repo name in query (e.g. "axiom-backend")
+- "build_and_test": Write code AND test it iteratively — runs up to 3 cycles of write→test→fix. Describe what to build in description.
+
+Each step should BUILD on previous steps. Be SPECIFIC.
+
+Return JSON:
+{"project_name": "short name", "phases": [
+  {"phase": "Research", "steps": [
+    {"action": "read_codebase", "description": "...", "query": "axiom-backend", "expected_outcome": "..."},
+    ...
+  ]},
+  ...
+]}`;
+
+  try {
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: projectPrompt }], max_tokens: 1500 }),
+    });
+    const text = (await res.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to create project plan';
+
+    const project = JSON.parse(match[0]);
+    const allSteps = [];
+    for (const phase of (project.phases || [])) {
+      for (const step of (phase.steps || [])) {
+        allSteps.push({ ...step, phase: phase.phase });
+      }
+    }
+
+    if (allSteps.length > 0) {
+      // Save as execution plan
+      await fetch(`${BACKEND_URL}/api/plans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal_id: goal.id, steps: allSteps }),
+      });
+
+      // Save project context document
+      await fetch(`${BACKEND_URL}/api/workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: `Project: ${project.project_name || description.slice(0, 40)}`,
+          content: `# ${project.project_name}\n\n${allSteps.map((s, i) => `${i+1}. [${s.phase}/${s.action}] ${s.description}`).join('\n')}`,
+          type: 'project_plan',
+          related_goal_id: goal.id,
+        }),
+      }).catch(() => {});
+
+      console.log(`[PROJECT] Created ${allSteps.length}-step project across ${project.phases?.length || 0} phases`);
+      return `Project "${project.project_name}" created: ${allSteps.length} steps across ${project.phases?.length || 0} phases`;
+    }
+    return 'No steps generated';
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// CODEBASE READING — Read entire repos into context
+// ============================================================
+async function executeReadCodebase(step, goal) {
+  const repoName = step.query || 'axiom-cognitive-core';
+  const GH_TOKEN = process.env.GITHUB_PAT;
+  if (!GH_TOKEN) return 'No GITHUB_PAT configured';
+
+  console.log(`[CODEBASE] Reading entire repo: ${repoName}`);
+
+  try {
+    // Get repo file tree
+    const treeRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repoName}/git/trees/main?recursive=1`, {
+      headers: { 'Authorization': `token ${GH_TOKEN}` },
+    });
+    const treeData = await treeRes.json();
+    const files = (treeData.tree || []).filter(f => f.type === 'blob');
+
+    const fileTree = files.map(f => `${f.path} (${f.size} bytes)`).join('\n');
+
+    // Read key files (prioritize server.js, package.json, Dockerfile, etc.)
+    const keyFiles = files
+      .filter(f => /\.(js|ts|json|md|yml|yaml)$/i.test(f.path) && f.size < 50000)
+      .sort((a, b) => {
+        // Prioritize: package.json, server.js, index.js, Dockerfile, README
+        const priority = ['package.json', 'server.js', 'index.js', 'Dockerfile', 'README.md'];
+        const aP = priority.findIndex(p => a.path.endsWith(p));
+        const bP = priority.findIndex(p => b.path.endsWith(p));
+        if (aP >= 0 && bP >= 0) return aP - bP;
+        if (aP >= 0) return -1;
+        if (bP >= 0) return 1;
+        return b.size - a.size; // then biggest files first
+      })
+      .slice(0, 8); // Read up to 8 key files
+
+    let codeContent = '';
+    for (const file of keyFiles) {
+      try {
+        const fileRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repoName}/contents/${file.path}`, {
+          headers: { 'Authorization': `token ${GH_TOKEN}` },
+        });
+        const fileData = await fileRes.json();
+        const content = Buffer.from(fileData.content || '', 'base64').toString('utf-8');
+        codeContent += `\n\n=== ${file.path} (${file.size} bytes) ===\n${content.slice(0, 8000)}`;
+      } catch {}
+    }
+
+    // Generate architecture summary via LLM
+    const summaryPrompt = `You are AXIOM analyzing a codebase. Create a concise architecture summary.
+
+REPO: ${repoName}
+FILE TREE:
+${fileTree.slice(0, 2000)}
+
+KEY FILES:
+${codeContent.slice(0, 6000)}
+
+Create a structured summary:
+1. PURPOSE: What does this service do?
+2. ARCHITECTURE: Key components, how they connect
+3. ENDPOINTS: List all API endpoints
+4. DEPENDENCIES: Key packages and external services
+5. KEY FUNCTIONS: Most important functions and what they do
+6. ISSUES: Any bugs, missing error handling, or improvements needed
+7. FILE MAP: Which files handle what responsibilities
+
+Be specific. This summary will be used for future work on this codebase.`;
+
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: summaryPrompt }], max_tokens: 1500 }),
+    });
+    const summary = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+
+    // Save to workspace
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `Codebase: ${repoName}`,
+        content: `# ${repoName} Architecture\n\nFiles: ${files.length}\n\n${summary}\n\n## File Tree\n${fileTree.slice(0, 2000)}`,
+        type: 'codebase_summary',
+        related_goal_id: goal.id,
+      }),
+    }).catch(() => {});
+
+    console.log(`[CODEBASE] Read ${files.length} files from ${repoName}, generated architecture summary`);
+    return `Read ${repoName}: ${files.length} files, ${keyFiles.length} analyzed in depth. Summary saved to workspace.`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// FEEDBACK LOOP — Build, test, iterate
+// ============================================================
+async function executeBuildAndTest(step, goal) {
+  const description = step.description;
+  const MAX_ITERATIONS = 3;
+  const SANDBOX_URL = process.env.SANDBOX_URL || 'https://axiom-sandbox-production.up.railway.app';
+
+  console.log(`[BUILD] Starting build-test loop: ${description.slice(0, 60)}`);
+
+  // Load codebase context if available
+  let codeContext = '';
+  try {
+    const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=20`);
+    const wsData = await wsRes.json();
+    const summaries = (wsData.entries || []).filter(e => e.type === 'codebase_summary' || e.type === 'project_plan');
+    codeContext = summaries.map(s => `[${s.title}]\n${(s.content || '').slice(0, 800)}`).join('\n---\n');
+  } catch {}
+
+  let lastCode = '';
+  let lastError = '';
+  let lastOutput = '';
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    console.log(`[BUILD] Iteration ${i + 1}/${MAX_ITERATIONS}`);
+
+    const buildPrompt = `You are AXIOM building and testing code.
+
+TASK: ${description}
+GOAL: ${goal.goal}
+ITERATION: ${i + 1}/${MAX_ITERATIONS}
+${codeContext ? `\nCODEBASE CONTEXT:\n${codeContext.slice(0, 1500)}` : ''}
+${lastCode ? `\nPREVIOUS CODE:\n${lastCode.slice(0, 2000)}` : ''}
+${lastError ? `\nPREVIOUS ERROR:\n${lastError}` : ''}
+${lastOutput ? `\nPREVIOUS OUTPUT:\n${lastOutput.slice(0, 500)}` : ''}
+
+${i === 0 ? 'Write the code to accomplish the task.' : 'Fix the code based on the error/output above.'}
+
+Return JSON:
+{"code": "the JavaScript code to run", "test_command": "how to verify it works", "expect": "what success looks like"}`;
+
+    try {
+      const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: buildPrompt }], max_tokens: 1000 }),
+      });
+      const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+      const match = raw.match(/\{[\s\S]*\}/);
+      if (!match) { lastError = 'Failed to generate code'; continue; }
+      const build = JSON.parse(match[0]);
+
+      lastCode = build.code;
+
+      // Run in sandbox
+      const sandboxRes = await fetch(`${SANDBOX_URL}/run-js`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': 'axiom-sandbox-2026' },
+        body: JSON.stringify({ code: build.code, timeout: 10000 }),
+      });
+      const result = await sandboxRes.json();
+
+      lastOutput = result.stdout || '';
+      lastError = result.stderr || result.error || '';
+
+      if (result.success && !lastError) {
+        // Success! Save the working code
+        await fetch(`${BACKEND_URL}/api/workspace`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: `Build: ${description.slice(0, 50)}`,
+            content: `# Working Code (iteration ${i + 1})\n\nTask: ${description}\n\n\`\`\`javascript\n${build.code}\n\`\`\`\n\nOutput: ${lastOutput.slice(0, 500)}`,
+            type: 'build_result',
+            related_goal_id: goal.id,
+          }),
+        }).catch(() => {});
+
+        console.log(`[BUILD] ✅ Success on iteration ${i + 1}`);
+        return `Build succeeded (iteration ${i + 1}): ${lastOutput.slice(0, 200)}`;
+      }
+
+      console.log(`[BUILD] ❌ Iteration ${i + 1} failed: ${lastError.slice(0, 80)}`);
+    } catch (e) { lastError = e.message; }
+  }
+
+  // All iterations failed
+  await fetch(`${BACKEND_URL}/api/workspace`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: `Build FAILED: ${description.slice(0, 40)}`,
+      content: `Failed after ${MAX_ITERATIONS} iterations.\nLast error: ${lastError}\nLast code:\n${lastCode?.slice(0, 1000)}`,
+      type: 'build_failure',
+      related_goal_id: goal.id,
+    }),
+  }).catch(() => {});
+
+  return `Build failed after ${MAX_ITERATIONS} iterations. Last error: ${lastError.slice(0, 100)}`;
 }
 
 // HEADLESS BROWSER — Interactive web browsing
