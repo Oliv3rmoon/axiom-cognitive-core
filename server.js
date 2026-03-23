@@ -671,45 +671,72 @@ async function curiositySearch(topic) {
   }
 
   const query = topic.startsWith('_') ? topic.slice(1).replace(/_/g, ' ') : topic;
-  console.log(`[HYPOTHALAMUS] Curiosity search: "${query}"`);
+  console.log(`[SEARCH] "${query}"`);
 
   try {
     let results = null;
 
-    // Try SerpAPI first
-    if (SERP_API_KEY) {
-      const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${SERP_API_KEY}&num=3`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.organic_results?.length > 0) {
-        results = data.organic_results.slice(0, 3).map(r => `${r.title}: ${r.snippet}`).join(' | ');
-      } else if (data.answer_box) {
-        results = data.answer_box.answer || data.answer_box.snippet || null;
+    // Method 1: DuckDuckGo Instant Answer API (free, no key needed)
+    try {
+      const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+      const ddg = await ddgRes.json();
+      const parts = [];
+      if (ddg.AbstractText) parts.push(ddg.AbstractText);
+      if (ddg.RelatedTopics?.length > 0) {
+        for (const rt of ddg.RelatedTopics.slice(0, 3)) {
+          if (rt.Text) parts.push(rt.Text);
+        }
       }
+      if (parts.length > 0) results = parts.join(' | ').slice(0, 2000);
+    } catch (e) { console.log('[SEARCH] DDG API failed:', e.message); }
+
+    // Method 2: DuckDuckGo Lite HTML scraping
+    if (!results) {
+      try {
+        const liteRes = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        });
+        const html = await liteRes.text();
+        const snippets = [];
+        // Extract result snippets
+        const regex = /class="result-snippet">(.*?)<\/td/gs;
+        let match;
+        while ((match = regex.exec(html)) !== null && snippets.length < 3) {
+          const clean = match[1].replace(/<[^>]*>/g, '').trim();
+          if (clean.length > 20) snippets.push(clean);
+        }
+        // Also extract result links for URLs
+        const urlRegex = /class="result-link"[^>]*href="([^"]+)"/g;
+        const urls = [];
+        while ((match = urlRegex.exec(html)) !== null && urls.length < 3) {
+          urls.push(match[1]);
+        }
+        if (snippets.length > 0) {
+          results = snippets.map((s, i) => urls[i] ? `${s} (${urls[i]})` : s).join(' | ');
+        }
+      } catch (e) { console.log('[SEARCH] DDG Lite failed:', e.message); }
     }
 
-    // Fallback: DuckDuckGo
+    // Method 3: Wikipedia direct API (always works, good for knowledge)
     if (!results) {
-      const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      const html = await res.text();
-      const snippets = [];
-      const regex = /class="result-snippet">(.*?)<\/td/gs;
-      let match;
-      while ((match = regex.exec(html)) !== null && snippets.length < 3) {
-        const clean = match[1].replace(/<[^>]*>/g, '').trim();
-        if (clean.length > 20) snippets.push(clean);
-      }
-      if (snippets.length > 0) results = snippets.join(' | ');
+      try {
+        const wikiRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query.replace(/ /g, '_'))}`);
+        if (wikiRes.ok) {
+          const wiki = await wikiRes.json();
+          if (wiki.extract) results = wiki.extract.slice(0, 1500);
+        }
+      } catch (e) { console.log('[SEARCH] Wikipedia failed:', e.message); }
     }
 
     if (results) {
       consciousness.hypothalamus.searchCache[topic] = results;
-      console.log(`[HYPOTHALAMUS] Search results cached for "${topic}"`);
+      console.log(`[SEARCH] Got ${results.length} chars for "${topic}"`);
       return results;
+    } else {
+      console.log(`[SEARCH] No results for "${topic}"`);
     }
   } catch (e) {
-    console.error('[HYPOTHALAMUS] Search error:', e.message);
+    console.error('[SEARCH] Error:', e.message);
   }
   return null;
 }
