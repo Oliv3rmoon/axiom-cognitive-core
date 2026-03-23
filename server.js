@@ -673,51 +673,39 @@ async function curiositySearch(topic) {
   const query = topic.startsWith('_') ? topic.slice(1).replace(/_/g, ' ') : topic;
   console.log(`[SEARCH] "${query}"`);
 
+  const SEARCH_PROXY = process.env.SEARCH_PROXY_URL || 'https://axiom-frontend-khaki.vercel.app/api/search';
+  const SEARCH_KEY = 'axiom-search-2026';
+
   try {
     let results = null;
 
-    // Method 1: DuckDuckGo Instant Answer API (free, no key needed)
+    // PRIMARY: Vercel-hosted search proxy (trusted IPs, not blocked)
     try {
-      const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
-      const ddg = await ddgRes.json();
-      const parts = [];
-      if (ddg.AbstractText) parts.push(ddg.AbstractText);
-      if (ddg.RelatedTopics?.length > 0) {
-        for (const rt of ddg.RelatedTopics.slice(0, 3)) {
-          if (rt.Text) parts.push(rt.Text);
-        }
+      const proxyRes = await fetch(`${SEARCH_PROXY}?q=${encodeURIComponent(query)}&key=${SEARCH_KEY}`);
+      const proxyData = await proxyRes.json();
+      if (proxyData.content) {
+        results = proxyData.content.slice(0, 2000);
+        console.log(`[SEARCH] Proxy hit (${proxyData.source}): ${results.length} chars`);
       }
-      if (parts.length > 0) results = parts.join(' | ').slice(0, 2000);
-    } catch (e) { console.log('[SEARCH] DDG API failed:', e.message); }
+    } catch (e) { console.log('[SEARCH] Proxy failed:', e.message); }
 
-    // Method 2: DuckDuckGo Lite HTML scraping
+    // FALLBACK 1: DuckDuckGo Instant Answer API direct
     if (!results) {
       try {
-        const liteRes = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        });
-        const html = await liteRes.text();
-        const snippets = [];
-        // Extract result snippets
-        const regex = /class="result-snippet">(.*?)<\/td/gs;
-        let match;
-        while ((match = regex.exec(html)) !== null && snippets.length < 3) {
-          const clean = match[1].replace(/<[^>]*>/g, '').trim();
-          if (clean.length > 20) snippets.push(clean);
+        const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
+        const ddg = await ddgRes.json();
+        const parts = [];
+        if (ddg.AbstractText) parts.push(ddg.AbstractText);
+        if (ddg.RelatedTopics?.length > 0) {
+          for (const rt of ddg.RelatedTopics.slice(0, 3)) {
+            if (rt.Text) parts.push(rt.Text);
+          }
         }
-        // Also extract result links for URLs
-        const urlRegex = /class="result-link"[^>]*href="([^"]+)"/g;
-        const urls = [];
-        while ((match = urlRegex.exec(html)) !== null && urls.length < 3) {
-          urls.push(match[1]);
-        }
-        if (snippets.length > 0) {
-          results = snippets.map((s, i) => urls[i] ? `${s} (${urls[i]})` : s).join(' | ');
-        }
-      } catch (e) { console.log('[SEARCH] DDG Lite failed:', e.message); }
+        if (parts.length > 0) results = parts.join(' | ').slice(0, 2000);
+      } catch (e) { console.log('[SEARCH] DDG direct failed:', e.message); }
     }
 
-    // Method 3: Wikipedia direct API (always works, good for knowledge)
+    // FALLBACK 2: Wikipedia direct
     if (!results) {
       try {
         const wikiRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query.replace(/ /g, '_'))}`);
@@ -725,7 +713,7 @@ async function curiositySearch(topic) {
           const wiki = await wikiRes.json();
           if (wiki.extract) results = wiki.extract.slice(0, 1500);
         }
-      } catch (e) { console.log('[SEARCH] Wikipedia failed:', e.message); }
+      } catch (e) { console.log('[SEARCH] Wikipedia direct failed:', e.message); }
     }
 
     if (results) {
