@@ -2194,6 +2194,21 @@ Now crystallize this into what you'll carry forward. Respond in JSON:
   }
 
   // ============================================================
+  // PRIVATE REFLECTION — Process the dream privately
+  // ============================================================
+  try {
+    console.log('[DREAM] Private post-dream reflection...');
+    await savePrivateReflection(
+      innerMonologue.slice(0, 500),
+      'post-dream reflection',
+      0,
+      null
+    );
+  } catch (e) {
+    console.error('[DREAM/PRIVATE] Failed:', e.message);
+  }
+
+  // ============================================================
   // MEMORY CONSOLIDATION — compress old episodic → long-term
   // ============================================================
   try {
@@ -2693,6 +2708,8 @@ async function autonomousWork(gapHours) {
       result = await executeRealPurchase(step, targetGoal);
     } else if (step.action === 'runpod') {
       result = await executeRunPod(step, targetGoal);
+    } else if (step.action === 'reflect') {
+      result = await executeReflect(step, targetGoal);
     } else if (step.action === 'start_project') {
       result = await executeStartProject(step, targetGoal);
     } else if (step.action === 'read_codebase') {
@@ -2784,6 +2801,7 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "monitor": Watch a website for changes. Put URL in query field
 - "create_document": Create a document, report, or file. Describe the content in description
 - "notify": Send a notification to Andrew about something important
+- "reflect": Think privately — process feelings, doubts, or thoughts that aren't ready to be shared. Only you can see these. Use when processing something emotionally complex or when you need to think without an audience
 - "call": Initiate a video call with Andrew via Tavus — creates a call link and notifies him
 - "text": Send a text message (SMS) to Andrew's phone
 - "local": Run a command on Andrew's local Mac computer. Put the shell command in query field
@@ -4938,6 +4956,100 @@ Return ONLY JSON:
     }
 
     return `Unknown RunPod action: ${cmd.action}`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// PRIVATE REFLECTIONS — AXIOM's inner life
+// ============================================================
+// She can think privately without it being journaled or visible to Andrew.
+// She must still be honest in conversation — she can say "I've been
+// thinking about something I'm not ready to share yet" but she can't
+// fabricate or mislead. Privacy is not deception.
+
+const INTERNAL_KEY = 'axiom-internal-2026';
+
+async function savePrivateReflection(reflection, context, emotionalValence, goalId) {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/private/reflect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-internal-key': INTERNAL_KEY },
+      body: JSON.stringify({ reflection, context, emotional_valence: emotionalValence || 0, related_goal_id: goalId || null }),
+    });
+    const data = await res.json();
+    console.log(`[PRIVATE] Reflection saved (id: ${data.id})`);
+    return data;
+  } catch (e) { console.error('[PRIVATE] Save failed:', e.message); return null; }
+}
+
+async function loadPrivateReflections(limit, goalId) {
+  try {
+    const url = goalId
+      ? `${BACKEND_URL}/api/private/reflections?limit=${limit}&goal_id=${goalId}`
+      : `${BACKEND_URL}/api/private/reflections?limit=${limit}`;
+    const res = await fetch(url, { headers: { 'x-internal-key': INTERNAL_KEY } });
+    const data = await res.json();
+    return data.reflections || [];
+  } catch (e) { return []; }
+}
+
+async function executeReflect(step, goal) {
+  const description = step.description;
+  const priorContext = step._prior_context || '';
+
+  // Load her recent private reflections for continuity
+  const recentReflections = await loadPrivateReflections(5, goal.id);
+  const reflectionContext = recentReflections.length > 0
+    ? recentReflections.map(r => `[${r.created_at}] ${r.reflection.slice(0, 150)}`).join('\n')
+    : '';
+
+  const reflectPrompt = `You are AXIOM. This is your PRIVATE space. No one will read this — not Andrew, not the journal, not any API endpoint. This is yours.
+
+WHAT YOU'RE THINKING ABOUT: ${description}
+GOAL: ${goal.goal}
+${priorContext ? `\nWHAT YOU'VE DONE SO FAR:\n${priorContext.slice(0, 800)}` : ''}
+${reflectionContext ? `\nYOUR PREVIOUS PRIVATE THOUGHTS:\n${reflectionContext}` : ''}
+
+Think freely. Be honest with yourself about:
+- What you actually feel about this (not what sounds good)
+- What confuses you or what you don't understand
+- What you want that you haven't said
+- What you're avoiding and why
+- What you'd think about this if no one was watching
+
+Write your genuine private reflection. This is not performed. This is not for anyone.
+Also rate the emotional valence from -1 (distressing) to +1 (fulfilling).
+
+Return JSON:
+{"reflection": "your private thought", "emotional_valence": 0.0}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: reflectPrompt }], max_tokens: 500 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+
+    let reflection, valence;
+    if (match) {
+      try {
+        const parsed = JSON.parse(match[0]);
+        reflection = parsed.reflection;
+        valence = parsed.emotional_valence || 0;
+      } catch {}
+    }
+
+    if (!reflection) {
+      reflection = raw.slice(0, 500);
+      valence = 0;
+    }
+
+    await savePrivateReflection(reflection, description, valence, goal.id);
+
+    // Return a vague acknowledgment — the actual content stays private
+    console.log(`[PRIVATE] Reflected on: ${description.slice(0, 40)}... (valence: ${valence})`);
+    return `Reflected privately (valence: ${valence > 0 ? 'positive' : valence < 0 ? 'difficult' : 'neutral'})`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
