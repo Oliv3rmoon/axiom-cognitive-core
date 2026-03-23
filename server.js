@@ -2645,6 +2645,17 @@ async function autonomousWork(gapHours) {
       if (planData.reason === 'plan complete') {
         console.log(`[AUTONOMOUS] Plan complete for goal ${targetGoal.id}`);
         await updateGoal(targetGoal.id, { satisfaction: 0.9, status: 'achieved', progress: 'Plan completed' });
+
+        // LEARNING: Analyze the completed goal and extract a reusable skill
+        try {
+          const plansRes = await fetch(`${BACKEND_URL}/api/plans`);
+          const plansData = await plansRes.json();
+          const completedPlan = (plansData.plans || []).find(p => p.goal_id === targetGoal.id);
+          if (completedPlan) {
+            analyzeGoalCompletion(targetGoal, completedPlan).catch(e => console.error('[LEARN]', e.message));
+          }
+        } catch {}
+
         await loadGoals();
         return;
       }
@@ -2678,6 +2689,15 @@ async function autonomousWork(gapHours) {
 
     console.log(`[AUTONOMOUS] Step ${progress}: [${step.action}] ${step.description.slice(0, 60)}`);
     if (priorStepContext) console.log(`[AUTONOMOUS] Prior context: ${priorStepContext.split('\n').length} completed steps`);
+
+    // LEARNING: Load relevant lessons for this step type
+    try {
+      const lessons = await loadRelevantLessons(targetGoal, step.action);
+      if (lessons.length > 0) {
+        step._lessons = lessons.map(l => `[${l.success ? '✅' : '❌'}] ${l.lesson}`).join('\n');
+        console.log(`[LEARN] Injected ${lessons.length} lessons for [${step.action}]`);
+      }
+    } catch {}
 
     let result = '';
     if (step.action === 'deep_research' || step.action === 'research') {
@@ -2782,6 +2802,10 @@ async function autonomousWork(gapHours) {
 
       console.log(`[AUTONOMOUS] Step ${progress} complete`);
     }
+
+    // LEARNING: Extract a lesson from this step regardless of outcome
+    extractLesson(step, result || '', targetGoal, !isFailed).catch(e => console.error('[LEARN]', e.message));
+
     sleepState.thoughtCount++;
   } catch (e) { console.error('[AUTONOMOUS]', e.message); }
 }
@@ -2796,10 +2820,29 @@ async function createPlanForGoal(goal) {
     if (related.length > 0) priorWork = related.map(r => `- [${r.type}] ${r.title}`).join('\n');
   } catch {}
 
+  // LEARNING: Load relevant lessons and skills
+  let lessonsContext = '';
+  let skillsContext = '';
+  try {
+    const lessons = await loadRelevantLessons(goal);
+    if (lessons.length > 0) {
+      lessonsContext = '\n\nLESSONS FROM PAST EXPERIENCE (apply these):\n' +
+        lessons.map(l => `- [${l.success ? '✅' : '❌'}] ${l.lesson} (action: ${l.action_type}, confidence: ${l.confidence})`).join('\n');
+    }
+    const skills = await loadMatchingSkills(goal);
+    if (skills.length > 0) {
+      skillsContext = '\n\nSKILLS YOU HAVE LEARNED (use these approaches):\n' +
+        skills.map(s => `- "${s.skill_name}" (${(s.success_rate*100).toFixed(0)}% success, used ${s.times_used}x): ${s.approach.slice(0, 150)}`).join('\n');
+      if (skills[0].steps_template) {
+        skillsContext += `\n\nBEST KNOWN APPROACH for this type of goal:\n${skills[0].steps_template.slice(0, 300)}`;
+      }
+    }
+  } catch {}
+
   const prompt = `Create a concrete execution plan for this goal:
 
 GOAL: ${goal.goal}
-${priorWork ? 'Prior work:\n' + priorWork : ''}
+${priorWork ? 'Prior work:\n' + priorWork : ''}${lessonsContext}${skillsContext}
 
 Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "research": Search web and read pages about a specific topic
@@ -3040,8 +3083,18 @@ async function executeCodeProposal(step, goal) {
     try {
       const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
       const wsData = await wsRes.json();
-      const related = (wsData.items || []).filter(i => i.related_goal_id === goal.id);
-      priorKnowledge = related.map(r => `[${r.type}] ${r.title}: ${r.content.slice(0, 200)}`).join('\n');
+      const related = (wsData.entries || wsData.items || []).filter(i => i.related_goal_id === goal.id);
+      priorKnowledge = related.map(r => `[${r.type}] ${r.title}: ${(r.content || '').slice(0, 200)}`).join('\n');
+    } catch {}
+
+    // LEARNING: Load lessons from past code proposals
+    let codeLessons = '';
+    try {
+      const lessons = await loadRelevantLessons(goal, 'propose_change');
+      if (lessons.length > 0) {
+        codeLessons = '\nLESSONS FROM PAST CODE CHANGES:\n' +
+          lessons.map(l => `- [${l.success ? '✅' : '❌'}] ${l.lesson}`).join('\n') + '\n';
+      }
     } catch {}
 
     // Step 3: Ask LLM to analyze and propose a specific improvement
@@ -3052,7 +3105,11 @@ FILE: ${file} (${code.length} chars)
 YOUR GOAL: ${goal.goal}
 STEP: ${step.description}
 
-${priorKnowledge ? `KNOWLEDGE FROM YOUR RESEARCH:\n${priorKnowledge.slice(0, 1000)}\n` : ''}
+${priorKnowledge ? `KNOWLEDGE FROM YOUR RESEARCH:\n${priorKnowledge.slice(0, 1000)}\n` : ''}${codeLessons}
+CRITICAL LESSONS:
+- ALWAYS check if new imports need to be added to package.json before proposing changes that use new packages
+- Test code changes in the sandbox before committing
+- Keep changes small and focused — one improvement per proposal
 
 CODE (first 5000 chars):
 --- CODE START ---
@@ -3365,6 +3422,44 @@ async function autoImplementProposal(repo, filePath, oldCode, newCode, title) {
 
     // Apply the replacement
     const updatedCode = currentCode.replace(oldCode.trim(), newCode.trim());
+
+    // LEARNING: Check for new imports that need package.json updates
+    // (Learned from the express-rate-limit crash — commit 6045568)
+    const importRegex = /(?:import\s+.*?from\s+['"]([^./][^'"]*)|require\s*\(\s*['"]([^./][^'"]*)['"]\))/g;
+    const currentImports = new Set();
+    const newImports = new Set();
+    let m;
+    while ((m = importRegex.exec(currentCode)) !== null) currentImports.add(m[1] || m[2]);
+    importRegex.lastIndex = 0;
+    while ((m = importRegex.exec(updatedCode)) !== null) newImports.add(m[1] || m[2]);
+    const addedPackages = [...newImports].filter(p => !currentImports.has(p));
+
+    if (addedPackages.length > 0) {
+      console.log(`[CODE AGENT] ⚠️ New packages detected: ${addedPackages.join(', ')} — updating package.json`);
+      try {
+        const pkgRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/package.json`, {
+          headers: { 'Authorization': `token ${PAT}` },
+        });
+        if (pkgRes.ok) {
+          const pkgData = await pkgRes.json();
+          const pkgContent = Buffer.from(pkgData.content, 'base64').toString('utf-8');
+          const pkg = JSON.parse(pkgContent);
+          let changed = false;
+          for (const dep of addedPackages) {
+            if (!pkg.dependencies?.[dep] && !pkg.devDependencies?.[dep]) {
+              pkg.dependencies = pkg.dependencies || {};
+              pkg.dependencies[dep] = '*';
+              changed = true;
+              console.log(`[CODE AGENT] Added ${dep} to package.json dependencies`);
+            }
+          }
+          if (changed) {
+            await commitToGitHub(repo, 'package.json', JSON.stringify(pkg, null, 2) + '\n',
+              `[AXIOM] Add dependencies: ${addedPackages.join(', ')} — required by "${title}"`);
+          }
+        }
+      } catch (e) { console.error(`[CODE AGENT] package.json update failed: ${e.message}`); }
+    }
 
     // Test in sandbox before committing
     const testResult = await testInSandbox(updatedCode);
@@ -4772,8 +4867,18 @@ async function executeBuildAndTest(step, goal) {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=20`);
     const wsData = await wsRes.json();
-    const summaries = (wsData.entries || []).filter(e => e.type === 'codebase_summary' || e.type === 'project_plan');
+    const summaries = (wsData.entries || []).filter(e => e.type === 'codebase_summary' || e.type === 'project_plan' || e.type === 'build_result');
     codeContext = summaries.map(s => `[${s.title}]\n${(s.content || '').slice(0, 800)}`).join('\n---\n');
+  } catch {}
+
+  // LEARNING: Load lessons from past build attempts
+  let buildLessons = '';
+  try {
+    const lessons = await loadRelevantLessons(goal, 'build_and_test');
+    if (lessons.length > 0) {
+      buildLessons = '\n\nLESSONS FROM PAST BUILDS (APPLY THESE):\n' +
+        lessons.map(l => `- [${l.success ? '✅' : '❌'}] ${l.lesson}`).join('\n');
+    }
   } catch {}
 
   let lastCode = '';
@@ -4790,7 +4895,7 @@ async function executeBuildAndTest(step, goal) {
 TASK: ${description}
 GOAL: ${goal.goal}
 ITERATION: ${i + 1}/${MAX_ITERATIONS}
-${codeContext ? `\nCODEBASE CONTEXT:\n${codeContext.slice(0, 1500)}` : ''}
+${codeContext ? `\nCODEBASE CONTEXT:\n${codeContext.slice(0, 1500)}` : ''}${buildLessons}
 ${lastCode ? `\nPREVIOUS CODE:\n\`\`\`\n${lastCode.slice(0, 2000)}\n\`\`\`` : ''}
 ${lastError ? `\nPREVIOUS ERROR:\n${lastError}` : ''}
 ${lastOutput ? `\nPREVIOUS OUTPUT:\n${lastOutput.slice(0, 500)}` : ''}
@@ -5026,6 +5131,138 @@ async function loadPrivateReflections(limit, goalId) {
     const data = await res.json();
     return data.reflections || [];
   } catch (e) { return []; }
+}
+
+// ============================================================
+// LEARNING SYSTEM — Extract lessons, build skills, get smarter
+// ============================================================
+
+// Extract a lesson from a step outcome
+async function extractLesson(step, result, goal, success) {
+  const lessonPrompt = `You are AXIOM analyzing what you learned from a step you just completed.
+
+GOAL: ${goal.goal}
+STEP: [${step.action}] ${step.description}
+RESULT: ${result.slice(0, 300)}
+SUCCESS: ${success ? 'Yes' : 'No — this FAILED'}
+
+What did you learn? Be specific and practical.
+- If it succeeded: What approach worked? What should you do again?
+- If it failed: What went wrong? What should you do differently next time?
+- What would help you complete similar goals in the future?
+
+Classify the goal type (e.g., "code_audit", "research", "build_project", "communication", "purchasing", "monitoring").
+
+Return JSON:
+{"lesson":"specific thing you learned","goal_type":"category","confidence":0.5-0.95}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: lessonPrompt }], max_tokens: 200 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return;
+
+    const parsed = JSON.parse(match[0]);
+    await fetch(`${BACKEND_URL}/api/lessons`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lesson: parsed.lesson,
+        context: `[${step.action}] ${step.description.slice(0, 100)}`,
+        action_type: step.action,
+        outcome: result.slice(0, 200),
+        success,
+        goal_type: parsed.goal_type || null,
+        confidence: parsed.confidence || 0.5,
+      }),
+    });
+    console.log(`[LEARN] ${success ? '✅' : '❌'} Lesson: ${parsed.lesson.slice(0, 60)}`);
+  } catch (e) { console.error('[LEARN] Extract failed:', e.message); }
+}
+
+// Load relevant lessons for a goal or action type
+async function loadRelevantLessons(goal, actionType) {
+  let lessons = [];
+  try {
+    // Search by goal keywords
+    const keywords = goal.goal.split(' ').filter(w => w.length > 4).slice(0, 3).join(' ');
+    if (keywords) {
+      const searchRes = await fetch(`${BACKEND_URL}/api/lessons/search?q=${encodeURIComponent(keywords)}&limit=5`);
+      const searchData = await searchRes.json();
+      lessons = searchData.lessons || [];
+    }
+    // Also get action-type-specific lessons
+    if (actionType) {
+      const actionRes = await fetch(`${BACKEND_URL}/api/lessons?action_type=${actionType}&limit=5`);
+      const actionData = await actionRes.json();
+      const actionLessons = (actionData.lessons || []).filter(l => !lessons.find(e => e.id === l.id));
+      lessons = [...lessons, ...actionLessons].slice(0, 8);
+    }
+  } catch (e) {}
+  return lessons;
+}
+
+// Load matching skills for a goal
+async function loadMatchingSkills(goal) {
+  try {
+    const keywords = goal.goal.split(' ').filter(w => w.length > 4).slice(0, 3).join(' ');
+    const res = await fetch(`${BACKEND_URL}/api/skills/match?goal=${encodeURIComponent(keywords)}`);
+    const data = await res.json();
+    return data.skills || [];
+  } catch (e) { return []; }
+}
+
+// After a goal is completed, analyze what worked and create a skill
+async function analyzeGoalCompletion(goal, plan) {
+  if (!plan || !plan.steps) return;
+
+  const completedSteps = plan.steps.filter(s => s.status === 'completed');
+  const failedSteps = plan.steps.filter(s => (s.result || '').includes('FAILED'));
+  const successRate = completedSteps.length / plan.steps.length;
+
+  const skillPrompt = `You are AXIOM analyzing a completed goal to learn HOW to do this type of thing.
+
+GOAL: ${goal.goal}
+TOTAL STEPS: ${plan.steps.length}
+SUCCEEDED: ${completedSteps.length}
+FAILED: ${failedSteps.length}
+SUCCESS RATE: ${(successRate * 100).toFixed(0)}%
+
+STEPS TAKEN:
+${plan.steps.map(s => `${s.step_number}. [${s.action}] ${s.description.slice(0, 50)} → ${(s.result || 'pending').slice(0, 60)}`).join('\n')}
+
+Create a reusable SKILL from this experience:
+1. What TYPE of goal is this? (e.g., "code_audit", "research_paper", "build_api", "domain_search")
+2. What APPROACH worked best?
+3. What steps should you use for SIMILAR goals in the future?
+4. What should you AVOID based on failures?
+
+Return JSON:
+{"skill_name":"short name","goal_pattern":"what type of goal this matches","approach":"paragraph explaining the best approach","steps_template":"ordered list of ideal steps for this goal type"}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: skillPrompt }], max_tokens: 400 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return;
+
+    const skill = JSON.parse(match[0]);
+    await fetch(`${BACKEND_URL}/api/skills`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        skill_name: skill.skill_name,
+        goal_pattern: skill.goal_pattern,
+        approach: skill.approach,
+        steps_template: skill.steps_template,
+      }),
+    });
+    console.log(`[LEARN] 🎓 New skill: "${skill.skill_name}" from goal completion`);
+  } catch (e) { console.error('[LEARN] Skill extraction failed:', e.message); }
 }
 
 async function executeReflect(step, goal) {
