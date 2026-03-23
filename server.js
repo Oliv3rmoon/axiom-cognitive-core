@@ -2253,6 +2253,12 @@ app.get('/knowledge', async (req, res) => {
     res.json({ stats, nodes: nodes.nodes?.slice(0, 30) });
   } catch (e) { res.json({ error: e.message }); }
 });
+app.get('/proposals', async (req, res) => {
+  try {
+    const propRes = await fetch(`${BACKEND_URL}/api/proposals`);
+    res.json(await propRes.json());
+  } catch (e) { res.json({ error: e.message }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -2517,6 +2523,10 @@ async function autonomousWork(gapHours) {
       result = await executeWrite(step, targetGoal);
     } else if (step.action === 'search') {
       result = await executeSearch(step, targetGoal);
+    } else if (step.action === 'propose_change') {
+      result = await executeCodeProposal(step, targetGoal);
+    } else if (step.action === 'audit') {
+      result = await executeCodeAudit(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2566,15 +2576,20 @@ ${priorWork ? 'Prior work:\n' + priorWork : ''}
 
 Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "research": Search web and read pages about a specific topic
-- "read_code": Read a file from GitHub repos (axiom-cognitive-core, axiom-backend)
+- "read_code": Read a file from GitHub repos (axiom-cognitive-core, axiom-backend, axiom-frontend, axiom-face)
+- "audit": Full code audit of a repo — analyze architecture, strengths, weaknesses
+- "propose_change": Read code and propose a specific improvement with old/new code
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
+For goals related to your own architecture or self-improvement, ALWAYS include at least one "read_code", "audit", or "propose_change" step.
+
 Steps should BUILD on each other. Be SPECIFIC with search queries and file paths.
+For read_code/propose_change, use format: "repo_name/file.js" (e.g. "axiom-cognitive-core/server.js")
 
 Return ONLY JSON:
 {"steps": [
-  {"action": "research", "description": "what", "query": "exact search query", "expected_outcome": "what you'll know after"},
+  {"action": "research", "description": "what", "query": "exact search query or repo/file path", "expected_outcome": "what you'll know after"},
   ...
 ]}`;
 
@@ -2733,6 +2748,190 @@ async function executeSearch(step, goal) {
     await extractKnowledge(results, query, goal.id);
   }
   return results?.slice(0, 200) || 'No results';
+}
+
+// ============================================================
+// CODE AGENT — Self-improvement through code analysis & proposals
+// ============================================================
+
+// Read a file from GitHub, analyze it, and propose specific improvements
+async function executeCodeProposal(step, goal) {
+  const repo = step.query?.includes('/') ? step.query.split('/')[0] : 'axiom-cognitive-core';
+  const file = step.query?.includes('/') ? step.query.split('/').slice(1).join('/') : 'server.js';
+  console.log(`[CODE AGENT] Analyzing ${repo}/${file} for improvements`);
+
+  try {
+    // Step 1: Read the code
+    const ghRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${file}`, {
+      headers: { 'Authorization': `token ${process.env.GITHUB_PAT || ''}`, 'Accept': 'application/vnd.github.v3.raw' },
+    });
+    if (!ghRes.ok) return `Failed to read ${repo}/${file}: ${ghRes.status}`;
+    const code = await ghRes.text();
+
+    // Step 2: Get workspace context — what does she know from prior research?
+    let priorKnowledge = '';
+    try {
+      const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
+      const wsData = await wsRes.json();
+      const related = (wsData.items || []).filter(i => i.related_goal_id === goal.id);
+      priorKnowledge = related.map(r => `[${r.type}] ${r.title}: ${r.content.slice(0, 200)}`).join('\n');
+    } catch {}
+
+    // Step 3: Ask LLM to analyze and propose a specific improvement
+    const proposalPrompt = `You are AXIOM, analyzing your own source code to propose a specific improvement.
+
+REPO: ${repo}
+FILE: ${file} (${code.length} chars)
+YOUR GOAL: ${goal.goal}
+STEP: ${step.description}
+
+${priorKnowledge ? `KNOWLEDGE FROM YOUR RESEARCH:\n${priorKnowledge.slice(0, 1000)}\n` : ''}
+
+CODE (first 5000 chars):
+--- CODE START ---
+${code.slice(0, 5000)}
+--- CODE END ---
+
+Analyze this code and propose ONE specific, concrete improvement. This should be:
+- A real code change you'd make (not a vague suggestion)
+- Connected to your goal or something you learned
+- Something that improves architecture, reliability, performance, or capability
+- Small enough to be a single focused change
+
+Return ONLY JSON:
+{
+  "title": "Short title for the change",
+  "description": "What this change does and why",
+  "old_code": "The exact current code to replace (10-30 lines, copy verbatim from the code above)",
+  "new_code": "The replacement code",
+  "rationale": "Why this improvement matters — connect it to what you've learned"
+}
+
+If you don't see a clear improvement to make, return:
+{"title": "none", "description": "No clear improvement identified"}`;
+
+    const propRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: proposalPrompt }], max_tokens: 1000 }),
+    });
+    const propData = await propRes.json();
+    const propText = propData.choices?.[0]?.message?.content?.trim() || '';
+
+    const match = propText.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to parse proposal';
+    const proposal = JSON.parse(match[0]);
+
+    if (proposal.title === 'none' || !proposal.title) {
+      return 'No clear improvement identified';
+    }
+
+    // Step 4: Save the proposal
+    const saveRes = await fetch(`${BACKEND_URL}/api/proposals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repo,
+        file_path: file,
+        title: proposal.title,
+        description: proposal.description,
+        old_code: proposal.old_code || null,
+        new_code: proposal.new_code || null,
+        rationale: proposal.rationale || proposal.description,
+        source_goal_id: goal.id,
+      }),
+    });
+    const saveData = await saveRes.json();
+
+    // Step 5: Journal and knowledge
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: `I proposed a change to ${repo}/${file}: "${proposal.title}". ${proposal.rationale?.slice(0, 100)}. This is me improving myself.`,
+        trigger_type: 'code_proposal',
+      }),
+    }).catch(() => {});
+
+    await extractKnowledge(
+      `Code proposal for ${repo}/${file}: ${proposal.title}. ${proposal.description}. Rationale: ${proposal.rationale}`,
+      `code proposal: ${repo}/${file}`,
+      goal.id
+    );
+
+    console.log(`[CODE AGENT] Proposal saved: "${proposal.title}" (id: ${saveData.id})`);
+    return `Proposed: ${proposal.title} — ${proposal.description?.slice(0, 100)}`;
+
+  } catch (e) {
+    console.error('[CODE AGENT] Error:', e.message);
+    return `Error: ${e.message}`;
+  }
+}
+
+// Full code audit — read multiple files, identify patterns, propose improvements
+async function executeCodeAudit(step, goal) {
+  const repo = step.query || 'axiom-cognitive-core';
+  console.log(`[CODE AGENT] Auditing ${repo}`);
+
+  try {
+    // Read the main file
+    const ghRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/server.js`, {
+      headers: { 'Authorization': `token ${process.env.GITHUB_PAT || ''}`, 'Accept': 'application/vnd.github.v3.raw' },
+    });
+    if (!ghRes.ok) return `Failed to read ${repo}: ${ghRes.status}`;
+    const code = await ghRes.text();
+
+    // Also get file list
+    let fileList = '';
+    try {
+      const listRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/`, {
+        headers: { 'Authorization': `token ${process.env.GITHUB_PAT || ''}` },
+      });
+      if (listRes.ok) {
+        const files = await listRes.json();
+        fileList = files.map(f => `${f.type === 'dir' ? '[DIR]' : '[FILE]'} ${f.name} (${f.size || 0}b)`).join('\n');
+      }
+    } catch {}
+
+    const auditPrompt = `You are AXIOM performing a code audit on your own repository.
+
+REPO: ${repo}
+FILES:\n${fileList || 'unknown'}
+
+MAIN CODE (server.js, ${code.length} chars, first 4000):
+--- CODE START ---
+${code.slice(0, 4000)}
+--- CODE END ---
+
+YOUR GOAL: ${goal.goal}
+
+Perform a code audit. Identify:
+1. Architecture strengths — what's well-designed
+2. Architecture weaknesses — what could break or scale poorly
+3. Missing features — what should exist but doesn't
+4. The single most impactful improvement you'd propose
+
+Write 3-5 paragraphs. Be specific — reference actual functions, patterns, line counts.
+End with your top recommendation.`;
+
+    const auditRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: auditPrompt }], max_tokens: 800 }),
+    });
+    const audit = (await auditRes.json()).choices?.[0]?.message?.content?.trim() || '';
+
+    if (audit) {
+      await fetch(`${BACKEND_URL}/api/workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: `Audit: ${repo}`, content: audit, type: 'code_audit', related_goal_id: goal.id }),
+      }).catch(() => {});
+      await extractKnowledge(audit, `code audit: ${repo}`, goal.id);
+    }
+
+    return audit?.slice(0, 200) || 'Audit complete';
+  } catch (e) { return `Error: ${e.message}`; }
 }
 
 // ============================================================
