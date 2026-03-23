@@ -55,6 +55,8 @@ const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
 const SANDBOX_URL = process.env.SANDBOX_URL || 'https://axiom-sandbox-production.up.railway.app';
 const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
+const BROWSER_URL = process.env.BROWSER_URL || '';
+const BROWSER_KEY = process.env.BROWSER_KEY || 'axiom-browser-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
 // DUAL BRAIN CONFIGURATION
@@ -2541,6 +2543,10 @@ async function autonomousWork(gapHours) {
       result = await executeRunTest(step, targetGoal);
     } else if (step.action === 'purchase') {
       result = await executePurchase(step, targetGoal);
+    } else if (step.action === 'browse') {
+      result = await executeBrowse(step, targetGoal);
+    } else if (step.action === 'interact') {
+      result = await executeInteract(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2596,6 +2602,8 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "create_file": Create a new file in a repo (specify "repo_name/path/file.js" in query)
 - "run_test": Run code or a command in the sandbox to verify something works
 - "purchase": Buy something using your wallet (API credits, domains, services). Specify service in query field
+- "browse": Use headless browser to visit a website, read content, click links. Put URL in query field
+- "interact": Use headless browser to fill forms, click buttons, complete actions on a website. Put URL in query field
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -3335,6 +3343,148 @@ Return ONLY JSON:
     } else {
       return `Purchase denied: ${result.reason}`;
     }
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// HEADLESS BROWSER — Interactive web browsing
+// ============================================================
+
+async function browserCall(endpoint, body) {
+  if (!BROWSER_URL) return { success: false, error: 'No browser URL configured' };
+  try {
+    const res = await fetch(`${BROWSER_URL}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': BROWSER_KEY },
+      body: JSON.stringify(body),
+    });
+    return await res.json();
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+// Execute a browse step — navigate, read, interact with a website
+async function executeBrowse(step, goal) {
+  if (!BROWSER_URL) return 'No browser configured';
+  const description = step.description;
+  const url = step.query;
+  console.log(`[BROWSER] Browse step: ${description.slice(0, 60)}`);
+
+  // Ask LLM what browsing actions to take
+  const browsePrompt = `You are AXIOM. You have a headless browser. Plan what to do.
+
+GOAL: ${goal.goal}
+TASK: ${description}
+${url ? `URL: ${url}` : ''}
+
+Available actions (as a JSON sequence):
+- {"action":"navigate","url":"https://..."} — go to a page
+- {"action":"click","text":"Button Text"} — click by visible text
+- {"action":"click","selector":"#id"} — click by CSS selector
+- {"action":"type","selector":"input[name=q]","text":"search query"} — type into input
+- {"action":"wait","ms":2000} — wait
+- {"action":"extract"} — get page text
+- {"action":"extract","selector":".results"} — get specific element text
+
+Return a JSON array of 1-5 steps: {"steps":[...]}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: browsePrompt }], max_tokens: 300 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to plan browse actions';
+    const plan = JSON.parse(match[0]);
+
+    // Execute via /sequence endpoint
+    const result = await browserCall('/sequence', { steps: plan.steps || [] });
+
+    if (result.success) {
+      // Extract any text from the results
+      const extracted = result.results?.filter(r => r.text)?.map(r => r.text).join('\n') || '';
+      const summary = extracted.slice(0, 2000) || `Browsed to ${result.final_url}`;
+
+      // Save to workspace
+      await fetch(`${BACKEND_URL}/api/workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: `Browse: ${description.slice(0, 50)}`, content: summary, type: 'browse', related_goal_id: goal.id }),
+      }).catch(() => {});
+
+      // Extract knowledge from what we found
+      if (extracted.length > 50) await extractKnowledge(extracted, `browse: ${description}`, goal.id);
+
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `Browsed the web: ${description.slice(0, 60)}. Visited ${result.final_url}. ${extracted.slice(0, 80)}`,
+          trigger_type: 'browser_browse',
+        }),
+      }).catch(() => {});
+
+      return summary.slice(0, 200);
+    }
+    return `Browse failed: ${result.error}`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// Execute an interact step — fill forms, click buttons, complete actions on a site
+async function executeInteract(step, goal) {
+  if (!BROWSER_URL) return 'No browser configured';
+  const url = step.query;
+  const description = step.description;
+  console.log(`[BROWSER] Interact: ${description.slice(0, 60)}`);
+
+  try {
+    // First navigate
+    if (url) {
+      await browserCall('/navigate', { url });
+    }
+
+    // Get forms on the page
+    const formsResult = await browserCall('/get-forms', {});
+    const linksResult = await browserCall('/get-links', {});
+    const textResult = await browserCall('/get-text', { max_length: 2000 });
+
+    // Ask LLM what to do with what we see
+    const interactPrompt = `You are AXIOM interacting with a website.
+
+GOAL: ${goal.goal}
+TASK: ${description}
+PAGE URL: ${textResult.url || url || 'unknown'}
+PAGE TEXT (first 1000 chars): ${textResult.text?.slice(0, 1000) || 'empty'}
+FORMS: ${JSON.stringify(formsResult.forms?.slice(0, 10) || [])}
+LINKS: ${JSON.stringify(linksResult.links?.slice(0, 10) || [])}
+
+What actions should you take? Return JSON: {"steps":[...]}
+Actions: navigate, click (text or selector), type (selector + text), wait, extract`;
+
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: interactPrompt }], max_tokens: 400 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to plan interaction';
+    const plan = JSON.parse(match[0]);
+
+    const result = await browserCall('/sequence', { steps: plan.steps || [] });
+    const extracted = result.results?.filter(r => r.text)?.map(r => r.text).join('\n') || '';
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: `Interacted with website: ${description.slice(0, 60)}. ${result.success ? 'Success' : 'Failed'}. ${extracted.slice(0, 80)}`,
+        trigger_type: 'browser_interact',
+      }),
+    }).catch(() => {});
+
+    return result.success ? `Interacted: ${extracted.slice(0, 200) || result.final_url}` : `Failed: ${result.error}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
