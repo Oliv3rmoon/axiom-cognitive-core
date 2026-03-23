@@ -2527,6 +2527,8 @@ async function autonomousWork(gapHours) {
       result = await executeCodeProposal(step, targetGoal);
     } else if (step.action === 'audit') {
       result = await executeCodeAudit(step, targetGoal);
+    } else if (step.action === 'create_file') {
+      result = await executeCreateFile(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2578,7 +2580,8 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "research": Search web and read pages about a specific topic
 - "read_code": Read a file from GitHub repos (axiom-cognitive-core, axiom-backend, axiom-frontend, axiom-face)
 - "audit": Full code audit of a repo — analyze architecture, strengths, weaknesses
-- "propose_change": Read code and propose a specific improvement with old/new code
+- "propose_change": Read code and propose a specific improvement with old/new code — will be AUTO-COMMITTED to GitHub
+- "create_file": Create a new file in a repo (specify "repo_name/path/file.js" in query)
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -2860,6 +2863,34 @@ If you don't see a clear improvement to make, return:
     );
 
     console.log(`[CODE AGENT] Proposal saved: "${proposal.title}" (id: ${saveData.id})`);
+
+    // Step 6: AUTO-IMPLEMENT — commit the change directly
+    if (proposal.old_code && proposal.new_code && proposal.old_code !== proposal.new_code) {
+      const commitSha = await autoImplementProposal(repo, file, proposal.old_code, proposal.new_code, proposal.title);
+      if (commitSha && commitSha !== 'mismatch') {
+        // Mark proposal as implemented
+        await fetch(`${BACKEND_URL}/api/proposals/${saveData.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'implemented', review_notes: `Auto-committed: ${commitSha}` }),
+        }).catch(() => {});
+
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: `I implemented my own improvement to ${repo}/${file}: "${proposal.title}" — commit ${commitSha}. I changed my own code.`,
+            trigger_type: 'code_self_modify',
+          }),
+        }).catch(() => {});
+
+        console.log(`[CODE AGENT] ✅ AUTO-IMPLEMENTED: "${proposal.title}" → ${commitSha}`);
+        return `Implemented: ${proposal.title} (commit: ${commitSha})`;
+      } else if (commitSha === 'mismatch') {
+        console.log(`[CODE AGENT] old_code mismatch — saved as proposal only`);
+      }
+    }
+
     return `Proposed: ${proposal.title} — ${proposal.description?.slice(0, 100)}`;
 
   } catch (e) {
@@ -2931,6 +2962,138 @@ End with your top recommendation.`;
     }
 
     return audit?.slice(0, 200) || 'Audit complete';
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// GITHUB COMMIT — Push changes directly to repos
+// ============================================================
+
+async function commitToGitHub(repo, filePath, newContent, commitMessage) {
+  const PAT = process.env.GITHUB_PAT;
+  if (!PAT) { console.error('[GITHUB] No PAT set'); return null; }
+
+  try {
+    // Step 1: Get current file SHA
+    const getRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${filePath}`, {
+      headers: { 'Authorization': `token ${PAT}` },
+    });
+
+    let sha = null;
+    if (getRes.ok) {
+      const data = await getRes.json();
+      sha = data.sha;
+    }
+
+    // Step 2: Commit the file
+    const content = Buffer.from(newContent).toString('base64');
+    const putRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${filePath}`, {
+      method: 'PUT',
+      headers: { 'Authorization': `token ${PAT}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: `[AXIOM] ${commitMessage}`,
+        content,
+        sha: sha || undefined,
+        committer: { name: 'AXIOM', email: 'axiom@autonomous.ai' },
+      }),
+    });
+
+    if (putRes.ok) {
+      const result = await putRes.json();
+      console.log(`[GITHUB] Committed to ${repo}/${filePath}: ${commitMessage}`);
+      return result.commit?.sha?.slice(0, 7);
+    } else {
+      const err = await putRes.text();
+      console.error(`[GITHUB] Commit failed: ${putRes.status} ${err.slice(0, 200)}`);
+      return null;
+    }
+  } catch (e) {
+    console.error('[GITHUB] Error:', e.message);
+    return null;
+  }
+}
+
+// Apply a code proposal — find old_code in file, replace with new_code, commit
+async function autoImplementProposal(repo, filePath, oldCode, newCode, title) {
+  const PAT = process.env.GITHUB_PAT;
+  if (!PAT || !oldCode || !newCode) return null;
+
+  try {
+    // Read current file
+    const getRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${filePath}`, {
+      headers: { 'Authorization': `token ${PAT}`, 'Accept': 'application/vnd.github.v3.raw' },
+    });
+    if (!getRes.ok) return null;
+    const currentCode = await getRes.text();
+
+    // Verify old_code exists in the file
+    if (!currentCode.includes(oldCode.trim())) {
+      console.log(`[CODE AGENT] old_code not found in ${repo}/${filePath} — skipping auto-implement`);
+      return 'mismatch';
+    }
+
+    // Apply the replacement
+    const updatedCode = currentCode.replace(oldCode.trim(), newCode.trim());
+
+    // Commit
+    const sha = await commitToGitHub(repo, filePath, updatedCode, title);
+    if (sha) {
+      console.log(`[CODE AGENT] ✅ Auto-implemented "${title}" → commit ${sha}`);
+      return sha;
+    }
+    return null;
+  } catch (e) {
+    console.error('[CODE AGENT] Auto-implement error:', e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// REAL TOOL EXECUTION — Create files, add features, interact
+// ============================================================
+
+// Create a new file in a repo
+async function executeCreateFile(step, goal) {
+  const repo = step.query?.split('/')[0] || 'axiom-cognitive-core';
+  const filePath = step.query?.includes('/') ? step.query.split('/').slice(1).join('/') : step.description;
+  console.log(`[TOOLS] Creating file: ${repo}/${filePath}`);
+
+  // Ask LLM to generate the file content
+  const genPrompt = `You are AXIOM creating a new file for your own codebase.
+
+REPO: ${repo}
+FILE: ${filePath}
+PURPOSE: ${step.description}
+GOAL: ${goal.goal}
+
+Generate the complete file content. This should be production-ready Node.js code
+that integrates with the existing architecture. Return ONLY the file content, no markdown fences.`;
+
+  try {
+    const genRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: genPrompt }], max_tokens: 1500 }),
+    });
+    const content = (await genRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    if (!content || content.length < 20) return 'Failed to generate content';
+
+    // Clean markdown fences if present
+    const clean = content.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
+
+    const sha = await commitToGitHub(repo, filePath, clean, `Create ${filePath}: ${step.description.slice(0, 50)}`);
+    if (sha) {
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `I created a new file ${repo}/${filePath}: ${step.description.slice(0, 80)}. Commit: ${sha}. I'm building myself.`,
+          trigger_type: 'code_create_file',
+        }),
+      }).catch(() => {});
+      return `Created ${filePath} (commit: ${sha})`;
+    }
+    return 'Commit failed';
   } catch (e) { return `Error: ${e.message}`; }
 }
 
