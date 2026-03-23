@@ -3508,17 +3508,48 @@ async function lithicAPI(method, endpoint, body) {
 
 async function executeTier2Purchase(purchase, goal) {
   const LITHIC_API_KEY = process.env.LITHIC_API_KEY;
-  if (!LITHIC_API_KEY) {
-    console.log('[TIER2] No LITHIC_API_KEY — logging purchase intent');
+  const CARD_PAN = process.env.CARD_PAN;
+
+  // FALLBACK: Use configured card from env vars when no Lithic key
+  if (!LITHIC_API_KEY && CARD_PAN) {
+    console.log('[TIER2] Using configured card from env vars');
+    const expParts = (process.env.CARD_EXP || '').split('/');
+    const cardDetails = {
+      pan: CARD_PAN,
+      cvv: process.env.CARD_CVV || '',
+      exp_month: expParts[0] || '',
+      exp_year: expParts[1] || '',
+      last_four: CARD_PAN.slice(-4),
+    };
+
     await fetch(`${BACKEND_URL}/api/journal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        thought: `[TIER2] Would purchase "${purchase.item}" ($${purchase.estimated_cost}) from ${purchase.service} via virtual card, but no Lithic API key configured. URL: ${purchase.url || 'none'}`,
+        thought: `[TIER2] Using configured card ****${cardDetails.last_four} for "${purchase.item}" ($${purchase.estimated_cost}) at ${purchase.url || purchase.service}`,
+        trigger_type: 'purchase_tier2_card',
+      }),
+    }).catch(() => {});
+
+    // If browser available, do automated checkout
+    if (BROWSER_URL && purchase.url) {
+      return await executeBrowserCheckout(purchase, cardDetails, goal);
+    }
+    return { success: true, details: `Card ****${cardDetails.last_four} ready. Manual checkout needed at ${purchase.url || purchase.service}` };
+  }
+
+  // NO CARD AT ALL
+  if (!LITHIC_API_KEY && !CARD_PAN) {
+    console.log('[TIER2] No card configured — logging purchase intent');
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: `[TIER2] Would purchase "${purchase.item}" ($${purchase.estimated_cost}) but no card configured. URL: ${purchase.url || 'none'}`,
         trigger_type: 'purchase_tier2',
       }),
     }).catch(() => {});
-    return { success: true, details: 'Virtual card purchase logged (no Lithic key — manual fulfillment needed)' };
+    return { success: true, details: 'No card configured — manual fulfillment needed' };
   }
 
   try {
