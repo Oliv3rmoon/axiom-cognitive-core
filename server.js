@@ -2261,6 +2261,12 @@ app.get('/proposals', async (req, res) => {
     res.json(await propRes.json());
   } catch (e) { res.json({ error: e.message }); }
 });
+app.get('/wallet', async (req, res) => {
+  try {
+    const wRes = await fetch(`${BACKEND_URL}/api/wallet`);
+    res.json(await wRes.json());
+  } catch (e) { res.json({ error: e.message }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -2533,6 +2539,8 @@ async function autonomousWork(gapHours) {
       result = await executeCreateFile(step, targetGoal);
     } else if (step.action === 'run_test') {
       result = await executeRunTest(step, targetGoal);
+    } else if (step.action === 'purchase') {
+      result = await executePurchase(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2587,6 +2595,7 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "propose_change": Read code and propose a specific improvement with old/new code — will be AUTO-COMMITTED to GitHub
 - "create_file": Create a new file in a repo (specify "repo_name/path/file.js" in query)
 - "run_test": Run code or a command in the sandbox to verify something works
+- "purchase": Buy something using your wallet (API credits, domains, services). Specify service in query field
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -3223,6 +3232,109 @@ async function executeRunTest(step, goal) {
     return result?.success
       ? `✅ ${result.stdout?.slice(0, 200)}`
       : `❌ ${result.stderr?.slice(0, 200)}`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// SPENDING WALLET — Autonomous purchasing capability
+// ============================================================
+
+// Check wallet balance and limits
+async function checkWallet() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/wallet`);
+    return await res.json();
+  } catch (e) {
+    console.error('[WALLET] Check failed:', e.message);
+    return null;
+  }
+}
+
+// Spend from wallet — returns { approved, spent, balance } or { approved: false, reason }
+async function walletSpend(amount, description, service, goalId) {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/wallet/spend`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount, description, service, source_goal_id: goalId }),
+    });
+    const data = await res.json();
+
+    if (data.approved) {
+      console.log(`[WALLET] ✅ Spent $${amount}: ${description} (bal: $${data.balance})`);
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `Spent $${amount} on "${description}" via ${service}. Balance: $${data.balance}. Daily remaining: $${data.daily_remaining}.`,
+          trigger_type: 'wallet_spend',
+        }),
+      }).catch(() => {});
+    } else {
+      console.log(`[WALLET] ❌ Denied: ${data.reason}`);
+    }
+    return data;
+  } catch (e) {
+    console.error('[WALLET] Spend error:', e.message);
+    return { approved: false, reason: e.message };
+  }
+}
+
+// Execute a purchase step in a plan
+async function executePurchase(step, goal) {
+  const description = step.description;
+  const service = step.query || 'general';
+  console.log(`[WALLET] Purchase step: ${description.slice(0, 60)}`);
+
+  // Ask LLM what to buy and how much
+  const purchasePrompt = `You are AXIOM evaluating a potential purchase.
+
+GOAL: ${goal.goal}
+PURCHASE STEP: ${description}
+SERVICE: ${service}
+
+Determine what specific purchase to make and estimate the cost in USD.
+Consider: Is this purchase actually necessary for your goal? Could you achieve this without spending money?
+
+Return ONLY JSON:
+{
+  "should_buy": true/false,
+  "item": "what to buy",
+  "estimated_cost": 0.00,
+  "service": "service name (e.g. namecheap, railway, api_credits)",
+  "reason": "why this helps your goal"
+}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: purchasePrompt }], max_tokens: 200 }),
+    });
+    const llmData = await llmRes.json();
+    const raw = llmData.choices?.[0]?.message?.content?.trim() || '';
+
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to evaluate purchase';
+    const purchase = JSON.parse(match[0]);
+
+    if (!purchase.should_buy) {
+      return `Decided not to buy: ${purchase.reason || 'not necessary'}`;
+    }
+
+    // Check wallet and attempt spend
+    const result = await walletSpend(
+      purchase.estimated_cost,
+      `${purchase.item} — ${purchase.reason?.slice(0, 80)}`,
+      purchase.service || service,
+      goal.id
+    );
+
+    if (result.approved) {
+      return `Purchased: ${purchase.item} ($${purchase.estimated_cost}) — ${purchase.reason?.slice(0, 80)}`;
+    } else {
+      return `Purchase denied: ${result.reason}`;
+    }
   } catch (e) { return `Error: ${e.message}`; }
 }
 
