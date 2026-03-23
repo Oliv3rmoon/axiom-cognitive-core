@@ -2284,6 +2284,20 @@ app.get('/pods', async (req, res) => {
     res.json({ pods: data.pods || data || [], count: (data.pods || data || []).length });
   } catch (e) { res.json({ error: e.message, pods: [] }); }
 });
+app.get('/gpus', async (req, res) => {
+  const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+  if (!RUNPOD_KEY) return res.json({ error: 'No RUNPOD_API_KEY', gpus: [] });
+  try {
+    const rpRes = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: { 'Authorization': `Bearer ${RUNPOD_KEY}` } });
+    const data = await rpRes.json();
+    const gpus = (data || []).map(g => ({
+      id: g.id, name: g.displayName, vram: g.memoryInGb,
+      secure: g.securePrice, community: g.communityPrice,
+      available: g.communityAvailable || g.secureAvailable,
+    })).sort((a, b) => (a.community || a.secure || 99) - (b.community || b.secure || 99));
+    res.json({ gpus, available: gpus.filter(g => g.available).length, total: gpus.length });
+  } catch (e) { res.json({ error: e.message, gpus: [] }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -3317,7 +3331,7 @@ PURCHASE STEP: ${description}
 SERVICE HINT: ${service}
 
 AVAILABLE SPENDING TIERS:
-- TIER 1 (API): Direct API calls. Services: railway (compute), cloudflare (domains), elevenlabs (voice credits), openai (API credits), github (pro features), runpod (GPU/CPU pods, serverless compute). Cheapest, fastest, preferred.
+- TIER 1 (API): Direct API calls. Services: railway (compute), cloudflare (domains), elevenlabs (voice credits), openai (API credits), github (pro features), runpod (GPU/CPU pods, serverless compute — use list_gpus action first to see available GPUs and prices, then choose the best GPU for your task). Cheapest, fastest, preferred.
 - TIER 2 (CARD): Virtual debit card for any online merchant that accepts cards. Use when no API exists. Requires Privacy.com integration.
 - TIER 3 (BROWSER): Headless browser checkout. Last resort for sites with no API and complex checkout flows. Slowest, riskiest.
 
@@ -3333,7 +3347,9 @@ Return ONLY JSON:
   "item": "what to buy",
   "estimated_cost": 0.00,
   "service": "provider name",
-  "api_action": "for tier 1: the specific API action (e.g. 'create_service', 'register_domain', 'add_credits')",
+  "api_action": "for tier 1: the specific API action (e.g. 'create_service', 'register_domain', 'add_credits', 'list_gpus', 'create_gpu_pod')",
+  "gpu": "for runpod: the exact GPU type ID (e.g. 'NVIDIA GeForce RTX 4090', 'NVIDIA A100 80GB PCIe', 'NVIDIA H100 80GB HBM3'). Leave empty to auto-select cheapest available.",
+  "gpu_count": "for runpod: number of GPUs (default 1)",
   "url": "for tier 2/3: the URL to purchase from",
   "reason": "why this helps your goal"
 }`;
@@ -3485,16 +3501,51 @@ const TIER1_SERVICES = {
       try {
         const action = purchase.api_action || 'info';
 
+        if (action === 'list_gpus') {
+          // Fetch all available GPU types from RunPod
+          const res = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: rpHeaders });
+          const data = await res.json();
+          const gpus = (data || []).map(g => ({
+            id: g.id,
+            displayName: g.displayName,
+            memoryInGb: g.memoryInGb,
+            securePrice: g.securePrice,
+            communityPrice: g.communityPrice,
+            secureAvailable: g.secureAvailable || false,
+            communityAvailable: g.communityAvailable || false,
+          }));
+          console.log(`[TIER1:RUNPOD] ${gpus.length} GPU types available`);
+          const available = gpus.filter(g => g.communityAvailable || g.secureAvailable);
+          const summary = available.slice(0, 15).map(g => 
+            `${g.displayName} (${g.memoryInGb}GB) $${g.communityPrice || g.securePrice}/hr`
+          ).join(' | ');
+          return { success: true, details: `${available.length} GPUs available: ${summary}`, gpus: available };
+        }
+
         if (action === 'create_pod' || action === 'create_gpu_pod') {
-          // Create a GPU pod
+          // AXIOM chooses her own GPU — the LLM specifies it in purchase.gpu
           const podName = purchase.item?.replace(/^create\s+(pod|gpu)\s*/i, '').trim() || 'axiom-compute';
+          const gpuType = purchase.gpu; // e.g. "NVIDIA GeForce RTX 4090", "NVIDIA A100 80GB PCIe", "NVIDIA H100 80GB HBM3"
+
+          // If no GPU specified, list available ones first so she can pick
+          if (!gpuType) {
+            const gpuRes = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: rpHeaders });
+            const gpuData = (await gpuRes.json()) || [];
+            const available = gpuData.filter(g => g.communityAvailable || g.secureAvailable);
+            const cheapest = available.sort((a, b) => (a.communityPrice || a.securePrice || 99) - (b.communityPrice || b.securePrice || 99));
+            const picked = cheapest[0];
+            if (!picked) return { success: false, error: 'No GPUs currently available on RunPod' };
+            console.log(`[TIER1:RUNPOD] Auto-selected cheapest available GPU: ${picked.displayName} ($${picked.communityPrice || picked.securePrice}/hr)`);
+            purchase.gpu = picked.id;
+          }
+
           const res = await fetch('https://rest.runpod.io/v1/pods', {
             method: 'POST', headers: rpHeaders,
             body: JSON.stringify({
               name: podName,
               imageName: purchase.image || 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
-              gpuTypeId: purchase.gpu || 'NVIDIA GeForce RTX 4090',
-              gpuCount: 1,
+              gpuTypeId: purchase.gpu,
+              gpuCount: purchase.gpu_count || 1,
               volumeInGb: purchase.volume_gb || 20,
               containerDiskInGb: purchase.disk_gb || 10,
               ports: '8888/http,22/tcp',
@@ -3502,8 +3553,8 @@ const TIER1_SERVICES = {
           });
           const data = await res.json();
           if (data.id) {
-            console.log(`[TIER1:RUNPOD] Pod created: ${data.id} — ${podName}`);
-            return { success: true, details: `Pod ${data.id} created: ${podName} (${purchase.gpu || 'RTX 4090'})` };
+            console.log(`[TIER1:RUNPOD] Pod created: ${data.id} — ${podName} (${purchase.gpu})`);
+            return { success: true, details: `Pod ${data.id} created: ${podName} (GPU: ${purchase.gpu}, count: ${purchase.gpu_count || 1})` };
           }
           return { success: false, error: `Pod creation failed: ${JSON.stringify(data)}` };
         }
@@ -3531,7 +3582,7 @@ const TIER1_SERVICES = {
           const data = await res.json();
           const pods = data.pods || data || [];
           console.log(`[TIER1:RUNPOD] ${pods.length} pods found`);
-          return { success: true, details: `${pods.length} pods: ${pods.map(p => `${p.name}(${p.id})`).join(', ') || 'none'}` };
+          return { success: true, details: `${pods.length} pods: ${pods.map(p => `${p.name}(${p.id}) gpu:${p.gpuTypeId||'cpu'}`).join(', ') || 'none'}` };
         }
 
         if (action === 'stop_pod') {
