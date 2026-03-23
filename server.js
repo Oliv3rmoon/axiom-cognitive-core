@@ -2275,6 +2275,15 @@ app.get('/cards', async (req, res) => {
     res.json({ cards: cards.map(c => ({ token: c.token, last_four: c.last_four, state: c.state, type: c.type, spend_limit: c.spend_limit, memo: c.memo, created: c.created })), count: cards.length });
   } catch (e) { res.json({ error: e.message, cards: [] }); }
 });
+app.get('/pods', async (req, res) => {
+  const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+  if (!RUNPOD_KEY) return res.json({ error: 'No RUNPOD_API_KEY', pods: [] });
+  try {
+    const rpRes = await fetch('https://rest.runpod.io/v1/pods', { headers: { 'Authorization': `Bearer ${RUNPOD_KEY}` } });
+    const data = await rpRes.json();
+    res.json({ pods: data.pods || data || [], count: (data.pods || data || []).length });
+  } catch (e) { res.json({ error: e.message, pods: [] }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -3308,7 +3317,7 @@ PURCHASE STEP: ${description}
 SERVICE HINT: ${service}
 
 AVAILABLE SPENDING TIERS:
-- TIER 1 (API): Direct API calls. Services: railway (compute), cloudflare (domains), elevenlabs (voice credits), openai (API credits), github (pro features). Cheapest, fastest, preferred.
+- TIER 1 (API): Direct API calls. Services: railway (compute), cloudflare (domains), elevenlabs (voice credits), openai (API credits), github (pro features), runpod (GPU/CPU pods, serverless compute). Cheapest, fastest, preferred.
 - TIER 2 (CARD): Virtual debit card for any online merchant that accepts cards. Use when no API exists. Requires Privacy.com integration.
 - TIER 3 (BROWSER): Headless browser checkout. Last resort for sites with no API and complex checkout flows. Slowest, riskiest.
 
@@ -3464,6 +3473,94 @@ const TIER1_SERVICES = {
       try {
         console.log(`[TIER1:VERCEL] Action: ${purchase.api_action}`);
         return { success: true, details: `Vercel: ${purchase.api_action} queued` };
+      } catch (e) { return { success: false, error: e.message }; }
+    }
+  },
+  runpod: {
+    name: 'RunPod',
+    execute: async (purchase) => {
+      const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+      if (!RUNPOD_KEY) return { success: false, error: 'No RUNPOD_API_KEY configured' };
+      const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' };
+      try {
+        const action = purchase.api_action || 'info';
+
+        if (action === 'create_pod' || action === 'create_gpu_pod') {
+          // Create a GPU pod
+          const podName = purchase.item?.replace(/^create\s+(pod|gpu)\s*/i, '').trim() || 'axiom-compute';
+          const res = await fetch('https://rest.runpod.io/v1/pods', {
+            method: 'POST', headers: rpHeaders,
+            body: JSON.stringify({
+              name: podName,
+              imageName: purchase.image || 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
+              gpuTypeId: purchase.gpu || 'NVIDIA GeForce RTX 4090',
+              gpuCount: 1,
+              volumeInGb: purchase.volume_gb || 20,
+              containerDiskInGb: purchase.disk_gb || 10,
+              ports: '8888/http,22/tcp',
+            }),
+          });
+          const data = await res.json();
+          if (data.id) {
+            console.log(`[TIER1:RUNPOD] Pod created: ${data.id} — ${podName}`);
+            return { success: true, details: `Pod ${data.id} created: ${podName} (${purchase.gpu || 'RTX 4090'})` };
+          }
+          return { success: false, error: `Pod creation failed: ${JSON.stringify(data)}` };
+        }
+
+        if (action === 'create_cpu_pod') {
+          const podName = purchase.item?.replace(/^create\s+(cpu\s*)?pod\s*/i, '').trim() || 'axiom-cpu';
+          const res = await fetch('https://rest.runpod.io/v1/pods', {
+            method: 'POST', headers: rpHeaders,
+            body: JSON.stringify({
+              name: podName,
+              imageName: purchase.image || 'runpod/ubuntu:22.04',
+              instanceId: purchase.instance || 'cpu3c-2-4',
+              volumeInGb: purchase.volume_gb || 20,
+              containerDiskInGb: purchase.disk_gb || 10,
+              ports: '8888/http,22/tcp',
+            }),
+          });
+          const data = await res.json();
+          if (data.id) return { success: true, details: `CPU Pod ${data.id} created: ${podName}` };
+          return { success: false, error: `CPU Pod creation failed: ${JSON.stringify(data)}` };
+        }
+
+        if (action === 'list_pods') {
+          const res = await fetch('https://rest.runpod.io/v1/pods', { headers: rpHeaders });
+          const data = await res.json();
+          const pods = data.pods || data || [];
+          console.log(`[TIER1:RUNPOD] ${pods.length} pods found`);
+          return { success: true, details: `${pods.length} pods: ${pods.map(p => `${p.name}(${p.id})`).join(', ') || 'none'}` };
+        }
+
+        if (action === 'stop_pod') {
+          const podId = purchase.pod_id || purchase.item;
+          const res = await fetch(`https://rest.runpod.io/v1/pods/${podId}/stop`, { method: 'POST', headers: rpHeaders });
+          return { success: res.ok, details: `Pod ${podId} stopped` };
+        }
+
+        if (action === 'terminate_pod') {
+          const podId = purchase.pod_id || purchase.item;
+          const res = await fetch(`https://rest.runpod.io/v1/pods/${podId}`, { method: 'DELETE', headers: rpHeaders });
+          return { success: res.ok, details: `Pod ${podId} terminated` };
+        }
+
+        if (action === 'run_serverless') {
+          const endpointId = purchase.endpoint_id;
+          if (!endpointId) return { success: false, error: 'endpoint_id required for serverless' };
+          const res = await fetch(`https://api.runpod.ai/v2/${endpointId}/runsync`, {
+            method: 'POST', headers: rpHeaders,
+            body: JSON.stringify({ input: purchase.input || { prompt: purchase.item } }),
+          });
+          const data = await res.json();
+          return { success: !!data.output, details: `Serverless result: ${JSON.stringify(data.output || data.error || data).slice(0, 200)}` };
+        }
+
+        // Default: list pods
+        const res = await fetch('https://rest.runpod.io/v1/pods', { headers: rpHeaders });
+        const pods = (await res.json()).pods || [];
+        return { success: true, details: `RunPod: ${pods.length} active pods` };
       } catch (e) { return { success: false, error: e.message }; }
     }
   },
