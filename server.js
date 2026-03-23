@@ -2288,9 +2288,14 @@ app.get('/gpus', async (req, res) => {
   const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
   if (!RUNPOD_KEY) return res.json({ error: 'No RUNPOD_API_KEY', gpus: [] });
   try {
-    const rpRes = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: { 'Authorization': `Bearer ${RUNPOD_KEY}` } });
-    const data = await rpRes.json();
-    const gpus = (data || []).map(g => ({
+    const rpRes = await fetch('https://api.runpod.io/graphql', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice secureAvailable communityAvailable } }' }),
+    });
+    const raw = await rpRes.json();
+    const gpuTypes = raw?.data?.gpuTypes || [];
+    const gpus = gpuTypes.map(g => ({
       id: g.id, name: g.displayName, vram: g.memoryInGb,
       secure: g.securePrice, community: g.communityPrice,
       available: g.communityAvailable || g.secureAvailable,
@@ -3502,17 +3507,16 @@ const TIER1_SERVICES = {
         const action = purchase.api_action || 'info';
 
         if (action === 'list_gpus') {
-          // Fetch all available GPU types from RunPod
-          const res = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: rpHeaders });
-          const data = await res.json();
-          const gpus = (data || []).map(g => ({
-            id: g.id,
-            displayName: g.displayName,
-            memoryInGb: g.memoryInGb,
-            securePrice: g.securePrice,
-            communityPrice: g.communityPrice,
-            secureAvailable: g.secureAvailable || false,
-            communityAvailable: g.communityAvailable || false,
+          // Fetch all available GPU types via GraphQL
+          const res = await fetch('https://api.runpod.io/graphql', {
+            method: 'POST', headers: rpHeaders,
+            body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice secureAvailable communityAvailable } }' }),
+          });
+          const raw = await res.json();
+          const gpus = (raw?.data?.gpuTypes || []).map(g => ({
+            id: g.id, displayName: g.displayName, memoryInGb: g.memoryInGb,
+            securePrice: g.securePrice, communityPrice: g.communityPrice,
+            secureAvailable: g.secureAvailable || false, communityAvailable: g.communityAvailable || false,
           }));
           console.log(`[TIER1:RUNPOD] ${gpus.length} GPU types available`);
           const available = gpus.filter(g => g.communityAvailable || g.secureAvailable);
@@ -3523,15 +3527,17 @@ const TIER1_SERVICES = {
         }
 
         if (action === 'create_pod' || action === 'create_gpu_pod') {
-          // AXIOM chooses her own GPU — the LLM specifies it in purchase.gpu
           const podName = purchase.item?.replace(/^create\s+(pod|gpu)\s*/i, '').trim() || 'axiom-compute';
-          const gpuType = purchase.gpu; // e.g. "NVIDIA GeForce RTX 4090", "NVIDIA A100 80GB PCIe", "NVIDIA H100 80GB HBM3"
+          const gpuType = purchase.gpu;
 
-          // If no GPU specified, list available ones first so she can pick
+          // If no GPU specified, query GraphQL and pick cheapest available
           if (!gpuType) {
-            const gpuRes = await fetch('https://rest.runpod.io/v1/gpu-types', { headers: rpHeaders });
-            const gpuData = (await gpuRes.json()) || [];
-            const available = gpuData.filter(g => g.communityAvailable || g.secureAvailable);
+            const gpuRes = await fetch('https://api.runpod.io/graphql', {
+              method: 'POST', headers: rpHeaders,
+              body: JSON.stringify({ query: '{ gpuTypes { id displayName communityPrice securePrice communityAvailable secureAvailable } }' }),
+            });
+            const gpuRaw = await gpuRes.json();
+            const available = (gpuRaw?.data?.gpuTypes || []).filter(g => g.communityAvailable || g.secureAvailable);
             const cheapest = available.sort((a, b) => (a.communityPrice || a.securePrice || 99) - (b.communityPrice || b.securePrice || 99));
             const picked = cheapest[0];
             if (!picked) return { success: false, error: 'No GPUs currently available on RunPod' };
