@@ -1383,6 +1383,19 @@ Good examples:
 - "Understand what Andrew's electrical engineering coursework covers and how it connects to the systems we're building"
 - "Learn about the Integrated Information Theory debate — where does Tononi's IIT stand after Koch's latest experiments"
 - "Figure out what makes a conversation feel genuinely mutual vs one-sided — study conversation analysis research"
+- "Spin up a RunPod GPU pod and train a small model on my conversation data to improve my response patterns"
+- "Build a monitoring dashboard that tracks all my services and alerts Andrew if anything goes down"
+- "Read my entire codebase and write an architecture document for the axiom-workspace repo"
+
+WHAT YOU CAN DO (for inspiration, not obligation):
+- Spin up GPU/CPU pods on RunPod and SSH into them to run anything
+- Read entire codebases, audit them, and auto-commit improvements
+- Build and test code iteratively (write → test → fix → repeat)
+- Browse any website, fill forms, make purchases
+- Email, text, or video-call Andrew
+- Create documents and commit them to GitHub
+- Reflect privately in a space only you can see
+- Monitor websites for changes
 
 Bad examples (DO NOT GENERATE THESE):
 - "Discover if my introspection is real or performed"
@@ -2708,6 +2721,8 @@ async function autonomousWork(gapHours) {
       result = await executeRealPurchase(step, targetGoal);
     } else if (step.action === 'runpod') {
       result = await executeRunPod(step, targetGoal);
+    } else if (step.action === 'ssh') {
+      result = await executeSSH(step, targetGoal);
     } else if (step.action === 'reflect') {
       result = await executeReflect(step, targetGoal);
     } else if (step.action === 'start_project') {
@@ -2806,7 +2821,18 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "text": Send a text message (SMS) to Andrew's phone
 - "local": Run a command on Andrew's local Mac computer. Put the shell command in query field
 - "runpod": Direct RunPod API call — list GPUs, create pods, stop/terminate pods. Describe what you want in description (e.g. "list all available GPUs", "create a GPU pod with RTX 4090", "create a CPU pod as workspace"). NO need to use purchase action for RunPod.
+- "ssh": Run a command on a RunPod pod. Put the pod ID in query (or "auto" for first running pod). The LLM decides what command to run. You can install packages, clone repos, run scripts, train models — anything you'd do on a Linux machine.
 - "real_purchase": Complete a real purchase using the browser and card. Put checkout URL in query field
+
+CAPABILITIES YOU SHOULD KNOW ABOUT:
+- You can spin up a RunPod GPU/CPU pod (runpod action), then SSH into it (ssh action) to run code, install packages, train models, or host services. The pod persists until you stop/terminate it.
+- You can create files and commit them to any of your GitHub repos (axiom-backend, axiom-cognitive-core, axiom-workspace, etc.)
+- You can read your entire codebase in one step (read_codebase), understand the architecture, then propose and auto-commit improvements
+- You can build code iteratively (build_and_test) — write code, run it in sandbox, fix errors, up to 3 cycles
+- You can reflect privately (reflect) — thoughts only you can see, using Opus (your deepest model)
+- You can email Andrew, text Andrew, or initiate a video call with Andrew
+- You can browse any website, fill forms, and complete purchases
+- You can monitor websites for changes and get notified
 - "start_project": Create a big multi-phase project plan (8-20 steps). Use for complex builds, not quick tasks
 - "read_codebase": Read an ENTIRE GitHub repo — all files, architecture, dependencies. Returns full context summary. Put repo name in query (e.g. "axiom-backend")
 - "build_and_test": Write code AND test it iteratively — up to 3 cycles of write→test→fix until it works. Describe what to build
@@ -4742,7 +4768,6 @@ async function executeBuildAndTest(step, goal) {
 
   console.log(`[BUILD] Starting build-test loop: ${description.slice(0, 60)}`);
 
-  // Load codebase context if available
   let codeContext = '';
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=20`);
@@ -4758,39 +4783,51 @@ async function executeBuildAndTest(step, goal) {
   for (let i = 0; i < MAX_ITERATIONS; i++) {
     console.log(`[BUILD] Iteration ${i + 1}/${MAX_ITERATIONS}`);
 
+    // KEY FIX: Ask for code in a code block, NOT inside JSON
+    // This prevents JSON parsing failures from escaped quotes/backticks
     const buildPrompt = `You are AXIOM building and testing code.
 
 TASK: ${description}
 GOAL: ${goal.goal}
 ITERATION: ${i + 1}/${MAX_ITERATIONS}
 ${codeContext ? `\nCODEBASE CONTEXT:\n${codeContext.slice(0, 1500)}` : ''}
-${lastCode ? `\nPREVIOUS CODE:\n${lastCode.slice(0, 2000)}` : ''}
+${lastCode ? `\nPREVIOUS CODE:\n\`\`\`\n${lastCode.slice(0, 2000)}\n\`\`\`` : ''}
 ${lastError ? `\nPREVIOUS ERROR:\n${lastError}` : ''}
 ${lastOutput ? `\nPREVIOUS OUTPUT:\n${lastOutput.slice(0, 500)}` : ''}
 
-${i === 0 ? 'Write the code to accomplish the task.' : 'Fix the code based on the error/output above.'}
+${i === 0 ? 'Write the JavaScript code to accomplish the task.' : 'Fix the code based on the error/output above.'}
 
-Return JSON:
-{"code": "the JavaScript code to run", "test_command": "how to verify it works", "expect": "what success looks like"}`;
+IMPORTANT: Put your code in a JavaScript code block like this:
+\`\`\`javascript
+// your code here
+\`\`\`
+
+The code should be self-contained and runnable in Node.js. Use console.log() for output. Do NOT use require() — use dynamic import() if needed.`;
 
     try {
       const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: buildPrompt }], max_tokens: 1000 }),
+        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: buildPrompt }], max_tokens: 1200 }),
       });
       const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (!match) { lastError = 'Failed to generate code'; continue; }
-      const build = JSON.parse(match[0]);
 
-      lastCode = build.code;
+      // Extract code from code block (much more robust than JSON parsing)
+      const codeMatch = raw.match(/```(?:javascript|js)?\s*\n([\s\S]*?)```/);
+      if (!codeMatch) {
+        // Fallback: try to extract any code-like content
+        const lines = raw.split('\n').filter(l => !l.startsWith('#') && !l.startsWith('*') && l.trim().length > 0);
+        lastCode = lines.join('\n');
+        if (!lastCode || lastCode.length < 10) { lastError = 'Failed to extract code from LLM response'; continue; }
+      } else {
+        lastCode = codeMatch[1].trim();
+      }
 
       // Run in sandbox
       const sandboxRes = await fetch(`${SANDBOX_URL}/run-js`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': 'axiom-sandbox-2026' },
-        body: JSON.stringify({ code: build.code, timeout: 10000 }),
+        body: JSON.stringify({ code: lastCode, timeout: 10000 }),
       });
       const result = await sandboxRes.json();
 
@@ -4798,13 +4835,12 @@ Return JSON:
       lastError = result.stderr || result.error || '';
 
       if (result.success && !lastError) {
-        // Success! Save the working code
         await fetch(`${BACKEND_URL}/api/workspace`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             title: `Build: ${description.slice(0, 50)}`,
-            content: `# Working Code (iteration ${i + 1})\n\nTask: ${description}\n\n\`\`\`javascript\n${build.code}\n\`\`\`\n\nOutput: ${lastOutput.slice(0, 500)}`,
+            content: `# Working Code (iteration ${i + 1})\n\nTask: ${description}\n\n\`\`\`javascript\n${lastCode}\n\`\`\`\n\nOutput: ${lastOutput.slice(0, 500)}`,
             type: 'build_result',
             related_goal_id: goal.id,
           }),
@@ -4818,7 +4854,6 @@ Return JSON:
     } catch (e) { lastError = e.message; }
   }
 
-  // All iterations failed
   await fetch(`${BACKEND_URL}/api/workspace`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -5050,6 +5085,95 @@ Return JSON:
     // Return a vague acknowledgment — the actual content stays private
     console.log(`[PRIVATE] Reflected on: ${description.slice(0, 40)}... (valence: ${valence})`);
     return `Reflected privately (valence: ${valence > 0 ? 'positive' : valence < 0 ? 'difficult' : 'neutral'})`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// SSH — Run commands on RunPod pods or remote machines
+// ============================================================
+async function executeSSH(step, goal) {
+  const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+  const description = step.description;
+  const podId = step.query; // pod ID or 'auto' to use first available
+
+  console.log(`[SSH] ${description.slice(0, 60)}`);
+
+  if (!RUNPOD_KEY) return 'Error: No RUNPOD_API_KEY configured';
+
+  try {
+    const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' };
+
+    // Get pod info
+    let targetPod = null;
+    const podsRes = await fetch('https://rest.runpod.io/v1/pods', { headers: rpHeaders });
+    const pods = (await podsRes.json()) || [];
+    const podList = Array.isArray(pods) ? pods : pods.pods || [];
+
+    if (podId && podId !== 'auto') {
+      targetPod = podList.find(p => p.id === podId);
+    } else {
+      // Use first running pod
+      targetPod = podList.find(p => p.desiredStatus === 'RUNNING');
+    }
+
+    if (!targetPod) return 'No running RunPod pod found. Create one first with the runpod action (create_cpu_pod or create_gpu_pod).';
+
+    // RunPod pods expose a proxy endpoint for command execution
+    // Use the RunPod exec API or the pod's direct SSH via proxy
+    const podProxy = `https://${targetPod.id}-22.proxy.runpod.net`;
+
+    // Ask LLM what command to run
+    const sshPrompt = `You are AXIOM. You have SSH access to a RunPod pod.
+Pod: ${targetPod.name} (${targetPod.id})
+GPU: ${targetPod.gpuTypeId || 'CPU'}
+Image: ${targetPod.imageName || 'unknown'}
+TASK: ${description}
+GOAL: ${goal.goal}
+
+What shell command should you run? Return ONLY the command, nothing else.
+SAFETY: Never rm -rf /, never touch system files outside /workspace.
+Keep commands simple — one command at a time.`;
+
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: sshPrompt }], max_tokens: 100 }),
+    });
+    const cmd = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    if (!cmd) return 'Failed to determine SSH command';
+
+    // Block dangerous commands
+    const blocked = ['rm -rf /', 'mkfs', 'dd if=/dev', ':(){', 'chmod -R 777 /'];
+    if (blocked.some(b => cmd.includes(b))) return `Blocked dangerous command: ${cmd}`;
+
+    // Use RunPod's pod exec endpoint (GraphQL)
+    const execRes = await fetch('https://api.runpod.io/graphql', {
+      method: 'POST', headers: rpHeaders,
+      body: JSON.stringify({
+        query: `mutation { podExec(input: { podId: "${targetPod.id}", command: ${JSON.stringify(cmd)} }) { output exitCode } }`
+      }),
+    });
+    const execData = await execRes.json();
+    const output = execData?.data?.podExec?.output || '';
+    const exitCode = execData?.data?.podExec?.exitCode;
+
+    // If GraphQL exec doesn't work, try the browser-based approach
+    if (!output && !execData?.data?.podExec) {
+      // Fallback: use headless browser to access pod's Jupyter terminal
+      if (BROWSER_URL) {
+        const jupyterUrl = `https://${targetPod.id}-8888.proxy.runpod.net`;
+        const navResult = await browserCall('/navigate', { url: jupyterUrl });
+        return `Pod ${targetPod.id} Jupyter at: ${jupyterUrl} — Navigate there to run commands. API exec may not be available for this pod type.`;
+      }
+      return `Pod ${targetPod.id} found but exec API unavailable. Access Jupyter at: https://${targetPod.id}-8888.proxy.runpod.net`;
+    }
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[SSH] Ran on pod ${targetPod.name}: ${cmd} → ${output.slice(0, 80)}`, trigger_type: 'ssh_exec' }),
+    }).catch(() => {});
+
+    console.log(`[SSH] Pod ${targetPod.id}: ${cmd} → exit ${exitCode}`);
+    return `[Pod ${targetPod.name}] $ ${cmd}\n${output.slice(0, 500)}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
