@@ -4112,6 +4112,41 @@ setInterval(sleepCycle, 600000);
 // Check conversation state every 30 seconds
 setInterval(checkConversationState, 30000);
 
+// ============================================================
+// AUTO-WORK LOOP — Autonomous work between sessions
+// ============================================================
+// Runs every 5 minutes. Only works when NOT in conversation.
+// AXIOM decides what to do — she's never forced to buy anything
+// or take any specific action. The LLM evaluates every step.
+const AUTO_WORK_INTERVAL = 300000; // 5 minutes
+const AUTO_WORK_QUIET_PERIOD = 120000; // 2 min after session ends before starting work
+let autoWorkRunning = false;
+
+setInterval(async () => {
+  // Don't run during conversations
+  if (sleepState.isInConversation) return;
+
+  // Don't run if conversation just ended (give her a breath)
+  if (sleepState.lastConversationEnd && Date.now() - sleepState.lastConversationEnd < AUTO_WORK_QUIET_PERIOD) return;
+
+  // Don't run if already running
+  if (autoWorkRunning) return;
+
+  // Don't run if dream is in progress
+  if (dreamInProgress) return;
+
+  autoWorkRunning = true;
+  try {
+    console.log('[AUTO-WORK] Starting autonomous work cycle (idle)');
+    await autonomousWork(1.0);
+    console.log('[AUTO-WORK] Cycle complete');
+  } catch (e) {
+    console.error('[AUTO-WORK] Error:', e.message);
+  } finally {
+    autoWorkRunning = false;
+  }
+}, AUTO_WORK_INTERVAL);
+
 // Endpoints
 app.get('/heartbeat', (req, res) => {
   res.json({
