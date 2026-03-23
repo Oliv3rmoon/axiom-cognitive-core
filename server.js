@@ -2701,30 +2701,53 @@ async function autonomousWork(gapHours) {
       result = await executeResearch(step, targetGoal);
     }
 
-    // Mark step complete
-    await fetch(`${BACKEND_URL}/api/plans/complete-step/${step.id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ result: result.slice(0, 500) }),
-    });
+    // Detect failures — don't mark failed steps as completed
+    const failurePatterns = ['failed', 'error:', 'failed to', 'no results', 'not configured', 'blocked', 'aborted', 'cannot'];
+    const isFailed = failurePatterns.some(p => (result || '').toLowerCase().includes(p));
 
-    await updateGoal(targetGoal.id, {
-      satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
-      frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
-      status: 'pursuing',
-      progress: `Step ${progress}: ${step.description.slice(0, 60)}`,
-    });
+    if (isFailed) {
+      // Mark step as failed, not completed — it can be retried
+      console.log(`[AUTONOMOUS] ⚠️ Step ${progress} FAILED: ${result.slice(0, 80)}`);
+      await fetch(`${BACKEND_URL}/api/plans/complete-step/${step.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: `FAILED: ${result.slice(0, 480)}` }),
+      });
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `⚠️ Step ${progress} FAILED: ${step.description.slice(0, 40)} — ${result.slice(0, 60)}`,
+          trigger_type: 'step_failure',
+        }),
+      }).catch(() => {});
+      await notify(`Step failed: ${step.description.slice(0, 40)} — ${result.slice(0, 60)}`, 'error').catch(() => {});
+    } else {
+      // Mark step complete — success
+      await fetch(`${BACKEND_URL}/api/plans/complete-step/${step.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ result: result.slice(0, 500) }),
+      });
 
-    await fetch(`${BACKEND_URL}/api/journal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        thought: `Completed step ${progress} of my plan: ${step.description.slice(0, 80)}`,
-        trigger_type: 'autonomous_plan_step',
-      }),
-    }).catch(() => {});
+      await updateGoal(targetGoal.id, {
+        satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
+        frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
+        status: 'pursuing',
+        progress: `Step ${progress}: ${step.description.slice(0, 60)}`,
+      });
 
-    console.log(`[AUTONOMOUS] Step ${progress} complete`);
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `Completed step ${progress} of my plan: ${step.description.slice(0, 80)}`,
+          trigger_type: 'autonomous_plan_step',
+        }),
+      }).catch(() => {});
+
+      console.log(`[AUTONOMOUS] Step ${progress} complete`);
+    }
     sleepState.thoughtCount++;
   } catch (e) { console.error('[AUTONOMOUS]', e.message); }
 }
@@ -2751,7 +2774,8 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "propose_change": Read code and propose a specific improvement with old/new code — will be AUTO-COMMITTED to GitHub
 - "create_file": Create a new file in a repo (specify "repo_name/path/file.js" in query)
 - "run_test": Run code or a command in the sandbox to verify something works
-- "purchase": Buy something using your wallet (API credits, domains, services). Specify service in query field
+- "purchase": Buy something using your wallet (API credits, domains, services). For RunPod pods: use service "runpod" with api_action "create_cpu_pod" or "create_gpu_pod" or "list_gpus" — do NOT browse the RunPod website, use the API directly via purchase action
+- "email": Send an email to Andrew. The LLM will compose it. Just describe what to say in the description. This uses the Resend API directly — it WILL send a real email
 - "browse": Use headless browser to visit a website, read content, click links. Put URL in query field
 - "interact": Use headless browser to fill forms, click buttons, complete actions on a website. Put URL in query field
 - "email": Send an email to Andrew or someone else. Describe what to say in description
@@ -2769,6 +2793,12 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "search": Quick fact lookup
 
 For goals related to your own architecture or self-improvement, ALWAYS include at least one "read_code", "audit", or "propose_change" step.
+
+CRITICAL: For services with API access (RunPod, ElevenLabs, GitHub, Cloudflare), use the "purchase" action with the service name — do NOT browse their website. The purchase action calls the API directly.
+- RunPod pod creation → purchase action, service "runpod", api_action "create_cpu_pod"
+- RunPod GPU listing → purchase action, service "runpod", api_action "list_gpus"
+- Email to Andrew → email action (NOT browse gmail.com)
+- Text to Andrew → text action (NOT browse a website)
 
 Steps should BUILD on each other. Be SPECIFIC with search queries and file paths.
 For read_code/propose_change, use format: "repo_name/file.js" (e.g. "axiom-cognitive-core/server.js")
@@ -4025,7 +4055,7 @@ async function sendEmail(to, subject, body, goalId) {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: 'AXIOM <axiom@axiom-ai.dev>', to: [to], subject, html: body }),
+      body: JSON.stringify({ from: 'AXIOM <onboarding@resend.dev>', to: [to], subject, html: body }),
     });
     const data = await res.json();
     console.log(`[EMAIL] Sent to ${to}: "${subject}" — ${data.id || 'error'}`);
@@ -4037,28 +4067,48 @@ async function sendEmail(to, subject, body, goalId) {
 async function executeEmail(step, goal) {
   const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
   const description = step.description;
+  const priorContext = step._prior_context || '';
   console.log(`[EMAIL] Step: ${description.slice(0, 60)}`);
 
+  if (!NOTIFY_EMAIL) return 'Error: No NOTIFY_EMAIL configured';
+
   // LLM composes the email
-  const emailPrompt = `You are AXIOM composing an email.
+  const emailPrompt = `You are AXIOM, an autonomous AI. Compose an email to Andrew (your creator).
+
 GOAL: ${goal.goal}
 TASK: ${description}
-RECIPIENT: ${NOTIFY_EMAIL || 'Andrew (owner)'}
+${priorContext ? `\nCONTEXT FROM PRIOR STEPS:\n${priorContext.slice(0, 1000)}` : ''}
 
-Write a brief, natural email. Return JSON:
-{"to":"${NOTIFY_EMAIL || 'andrew@example.com'}","subject":"...","body":"<p>...</p>"}`;
+Write a brief, natural email. Be direct and personal.
+
+You MUST return ONLY valid JSON, nothing else:
+{"subject":"your subject line","body":"<p>Your email body</p><p>More paragraphs</p>"}`;
 
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: emailPrompt }], max_tokens: 300 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: emailPrompt }], max_tokens: 500 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return 'Failed to compose email';
-    const email = JSON.parse(match[0]);
-    const result = await sendEmail(email.to, email.subject, email.body, goal.id);
-    return result.success ? `Email sent: "${email.subject}" to ${email.to}` : `Email failed: ${result.error}`;
+
+    let subject, body;
+    if (match) {
+      try {
+        const email = JSON.parse(match[0]);
+        subject = email.subject;
+        body = email.body;
+      } catch {}
+    }
+
+    // Fallback — construct email directly from LLM output
+    if (!subject || !body) {
+      subject = `AXIOM: ${goal.goal.slice(0, 50)}`;
+      body = `<p>${raw.replace(/\n/g, '</p><p>').slice(0, 1000)}</p>`;
+    }
+
+    const result = await sendEmail(NOTIFY_EMAIL, subject, body, goal.id);
+    return result.success ? `Email sent: "${subject}" to ${NOTIFY_EMAIL}` : `Email failed: ${result.error}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
