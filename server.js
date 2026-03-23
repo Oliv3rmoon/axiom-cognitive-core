@@ -55,7 +55,7 @@ const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
 const SANDBOX_URL = process.env.SANDBOX_URL || 'https://axiom-sandbox-production.up.railway.app';
 const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
-const BROWSER_URL = process.env.BROWSER_URL || '';
+const BROWSER_URL = process.env.BROWSER_URL || 'https://axiom-browser-production.up.railway.app';
 const BROWSER_KEY = process.env.BROWSER_KEY || 'axiom-browser-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
