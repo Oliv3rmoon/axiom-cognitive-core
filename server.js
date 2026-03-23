@@ -1,4 +1,5 @@
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -12,6 +13,17 @@ process.on('unhandledRejection', (reason) => {
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting — prevent request flooding and resource exhaustion
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 100, // 100 requests per minute per IP
+  message: { error: 'Too many requests, please slow down' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health' || req.path === '/heartbeat',
+});
+app.use(limiter);
 
 // ============================================================
 // MESSAGE SAFETY (keep context from exploding, not timeouts)
