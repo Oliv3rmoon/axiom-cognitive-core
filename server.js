@@ -2861,6 +2861,15 @@ app.post('/sleep', (req, res) => {
   res.json({ status: 'sleeping', stage: 'light', message: 'Sleep cycle activated. Dream processing started.' });
 });
 
+// Manual autonomous work trigger — for testing the execution planner
+app.post('/work', async (req, res) => {
+  sleepState.isInConversation = false;
+  if (!sleepState.lastConversationEnd) sleepState.lastConversationEnd = Date.now() - 600000;
+  console.log('[WORK] Manually triggered autonomous work cycle');
+  autonomousWork(1.0).catch(e => console.error('[WORK]', e.message));
+  res.json({ status: 'working', message: 'Autonomous work cycle triggered.' });
+});
+
 const PORT = process.env.PORT || 4001;
 app.listen(PORT, () => {
   console.log(`AXIOM Cognitive Core on port ${PORT}`);
