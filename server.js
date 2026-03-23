@@ -673,7 +673,7 @@ async function curiositySearch(topic) {
   const query = topic.startsWith('_') ? topic.slice(1).replace(/_/g, ' ') : topic;
   console.log(`[SEARCH] "${query}"`);
 
-  const SEARCH_PROXY = process.env.SEARCH_PROXY_URL || 'https://axiom-frontend-khaki.vercel.app/api/search';
+  const SEARCH_PROXY = process.env.SEARCH_PROXY_URL || 'https://axiom-search-proxy.vercel.app/api/search';
   const SEARCH_KEY = 'axiom-search-2026';
 
   try {
