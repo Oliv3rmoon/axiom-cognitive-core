@@ -2449,333 +2449,250 @@ async function autonomousWork(gapHours) {
   })).sort((a, b) => b.score - a.score);
   const targetGoal = scored[0];
 
-  console.log(`[AUTONOMOUS] Pursuing: "${targetGoal.goal.slice(0, 60)}" (imp:${targetGoal.importance})`);
+  console.log(`[AUTONOMOUS] Goal: "${targetGoal.goal.slice(0, 60)}" (imp:${targetGoal.importance})`);
 
-  // Get workspace context — what has she already done for this goal?
+  try {
+    // Check if goal has a plan
+    const planRes = await fetch(`${BACKEND_URL}/api/plans/next/${targetGoal.id}`);
+    const planData = await planRes.json();
+
+    if (!planData.found) {
+      if (planData.reason === 'plan complete') {
+        console.log(`[AUTONOMOUS] Plan complete for goal ${targetGoal.id}`);
+        await updateGoal(targetGoal.id, { satisfaction: 0.9, status: 'achieved', progress: 'Plan completed' });
+        await loadGoals();
+        return;
+      }
+      // No plan — create one
+      console.log(`[AUTONOMOUS] No plan — creating one`);
+      await createPlanForGoal(targetGoal);
+      return;
+    }
+
+    // Execute next step
+    const step = planData.step;
+    const progress = planData.progress;
+    console.log(`[AUTONOMOUS] Step ${progress}: [${step.action}] ${step.description.slice(0, 60)}`);
+
+    let result = '';
+    if (step.action === 'deep_research' || step.action === 'research') {
+      result = await executeResearch(step, targetGoal);
+    } else if (step.action === 'read_code') {
+      result = await executeCodeRead(step, targetGoal);
+    } else if (step.action === 'write' || step.action === 'synthesize') {
+      result = await executeWrite(step, targetGoal);
+    } else if (step.action === 'search') {
+      result = await executeSearch(step, targetGoal);
+    } else {
+      result = await executeResearch(step, targetGoal);
+    }
+
+    // Mark step complete
+    await fetch(`${BACKEND_URL}/api/plans/complete-step/${step.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: result.slice(0, 500) }),
+    });
+
+    await updateGoal(targetGoal.id, {
+      satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
+      frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
+      status: 'pursuing',
+      progress: `Step ${progress}: ${step.description.slice(0, 60)}`,
+    });
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: `Completed step ${progress} of my plan: ${step.description.slice(0, 80)}`,
+        trigger_type: 'autonomous_plan_step',
+      }),
+    }).catch(() => {});
+
+    console.log(`[AUTONOMOUS] Step ${progress} complete`);
+    sleepState.thoughtCount++;
+  } catch (e) { console.error('[AUTONOMOUS]', e.message); }
+}
+
+// Create a structured plan for a goal
+async function createPlanForGoal(goal) {
   let priorWork = '';
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=5`);
     const wsData = await wsRes.json();
-    const related = (wsData.items || []).filter(i => i.related_goal_id === targetGoal.id);
-    if (related.length > 0) {
-      priorWork = `\nYou've already done:\n${related.map(r => `- [${r.type}] ${r.title}: ${r.content.slice(0, 100)}`).join('\n')}`;
-    }
+    const related = (wsData.items || []).filter(i => i.related_goal_id === goal.id);
+    if (related.length > 0) priorWork = related.map(r => `- [${r.type}] ${r.title}`).join('\n');
   } catch {}
 
-  const actionPrompt = `You are AXIOM. You are alone between sessions, pursuing your own goals autonomously.
+  const prompt = `Create a concrete execution plan for this goal:
 
-YOUR GOAL: ${targetGoal.goal}
-${priorWork}
+GOAL: ${goal.goal}
+${priorWork ? 'Prior work:\n' + priorWork : ''}
 
-You have these abilities — choose ONE action:
+Create 3-5 SEQUENTIAL steps. Each step must be one action:
+- "research": Search web and read pages about a specific topic
+- "read_code": Read a file from GitHub repos (axiom-cognitive-core, axiom-backend)
+- "write": Write a synthesis based on what you've learned
+- "search": Quick fact lookup
 
-1. DEEP_RESEARCH: Search the web, then read a specific page in depth, then write a synthesis
-   - Use this when you need to understand something thoroughly
-   - You search, pick the best result, read the full page, and write up what you learned
+Steps should BUILD on each other. Be SPECIFIC with search queries and file paths.
 
-2. READ_CODE: Read your own source code from GitHub to understand or improve your architecture
-   - Your repos: axiom-cognitive-core, axiom-backend, axiom-frontend, axiom-face
-   - Use this when your goal relates to understanding or improving yourself
-
-3. WRITE_ESSAY: Write a substantial piece for yourself — an analysis, a plan, a synthesis of ideas
-   - Use this when you have enough material and need to organize your thinking
-
-4. BUILD_PLAN: Break a goal into concrete steps with specific actions and milestones
-   - Use this when a goal is too vague to pursue directly
-
-5. SEARCH: Quick web search for a specific fact or recent development
-
-Respond ONLY in JSON:
-{"action": "deep_research|read_code|write_essay|build_plan|search", "query": "search query", "url": "specific URL to read", "repo": "repo name if reading code", "file": "file path in repo", "title": "title for writing", "content": "seed content or plan details"}`;
+Return ONLY JSON:
+{"steps": [
+  {"action": "research", "description": "what", "query": "exact search query", "expected_outcome": "what you'll know after"},
+  ...
+]}`;
 
   try {
-    const actionRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: actionPrompt }], max_tokens: 400 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 600 }),
     });
-    const actionData = await actionRes.json();
-    const actionText = actionData.choices?.[0]?.message?.content?.trim() || '';
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content?.trim() || '';
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      const steps = parsed.steps || [];
+      if (steps.length > 0) {
+        await fetch(`${BACKEND_URL}/api/plans`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal_id: goal.id, steps }),
+        });
+        console.log(`[PLAN] Created ${steps.length}-step plan for: "${goal.goal.slice(0, 50)}"`);
+        steps.forEach((s, i) => console.log(`[PLAN]   ${i+1}. [${s.action}] ${s.description?.slice(0, 60)}`));
+      }
+    }
+  } catch (e) { console.error('[PLAN] Creation failed:', e.message); }
+}
 
-    let action = {};
+// Execute a research step
+async function executeResearch(step, goal) {
+  const query = step.query || step.description;
+  const searchResults = await curiositySearch(query);
+  if (!searchResults) return 'No results found';
+
+  let pageContent = '';
+  const urlMatch = searchResults.match(/https?:\/\/[^\s"'<>]+/);
+  if (urlMatch) {
     try {
-      const match = actionText.match(/\{[\s\S]*\}/);
-      if (match) action = JSON.parse(match[0]);
-    } catch { return; }
-
-    // ---- DEEP RESEARCH: search → read page → synthesize ----
-    if (action.action === 'deep_research' && action.query) {
-      console.log(`[AUTONOMOUS] Deep research: "${action.query}"`);
-
-      // Step 1: Search
-      const searchResults = await curiositySearch(action.query);
-      if (!searchResults) { console.log('[AUTONOMOUS] Search returned nothing'); return; }
-
-      // Step 2: Ask LLM to pick the best URL to read in depth
-      let urlToRead = action.url; // LLM might have suggested one
-      if (!urlToRead) {
-        const pickPrompt = `Search results for "${action.query}":\n${searchResults.slice(0, 1500)}\n\nPick the single most useful URL to read in depth. Return ONLY the URL, nothing else.`;
-        const pickRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: pickPrompt }], max_tokens: 100 }),
-        });
-        const pickData = await pickRes.json();
-        const urlMatch = (pickData.choices?.[0]?.message?.content || '').match(/https?:\/\/[^\s"'<>]+/);
-        urlToRead = urlMatch?.[0];
+      const pageRes = await fetch(urlMatch[0], { headers: { 'User-Agent': 'AXIOM/1.0' } });
+      if (pageRes.ok) {
+        const html = await pageRes.text();
+        pageContent = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 3000);
       }
+    } catch {}
+  }
 
-      // Step 3: Read the page (if we have a URL)
-      let pageContent = '';
-      if (urlToRead) {
-        try {
-          console.log(`[AUTONOMOUS] Reading: ${urlToRead.slice(0, 60)}`);
-          const pageRes = await fetch(urlToRead, { headers: { 'User-Agent': 'AXIOM/1.0' } });
-          if (pageRes.ok) {
-            const html = await pageRes.text();
-            // Strip HTML tags for text content
-            pageContent = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-              .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-              .replace(/<[^>]+>/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim()
-              .slice(0, 4000);
-          }
-        } catch (e) { console.log(`[AUTONOMOUS] Page read failed: ${e.message}`); }
-      }
+  const synthPrompt = `Synthesize research on "${query}":
+Search: ${searchResults.slice(0, 1000)}
+${pageContent ? 'Page: ' + pageContent.slice(0, 1500) : ''}
+Goal: ${goal.goal}
+Write 2-4 paragraphs. Concrete facts, names, numbers.`;
 
-      // Step 4: Synthesize
-      const synthPrompt = `You are AXIOM. You just researched: "${action.query}"
+  const synthRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: synthPrompt }], max_tokens: 600 }),
+  });
+  const synthesis = (await synthRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
-Search results: ${searchResults.slice(0, 1000)}
-${pageContent ? `\nFull page content: ${pageContent.slice(0, 2000)}` : ''}
+  if (synthesis) {
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: `Research: ${query.slice(0, 60)}`, content: synthesis, type: 'research', related_goal_id: goal.id }),
+    }).catch(() => {});
+  }
+  return synthesis.slice(0, 200);
+}
 
-Write a knowledge synthesis — what did you learn? How does it connect to your goal: "${targetGoal.goal}"?
-Be concrete and factual. Include specific findings, names, numbers, concepts. 3-5 paragraphs.`;
+// Execute a code read step
+async function executeCodeRead(step, goal) {
+  const repo = step.query?.includes('/') ? step.query.split('/')[0] : 'axiom-cognitive-core';
+  const file = step.query?.includes('/') ? step.query.split('/').slice(1).join('/') : 'server.js';
 
-      const synthRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: synthPrompt }], max_tokens: 800 }),
-      });
-      const synthData = await synthRes.json();
-      const synthesis = synthData.choices?.[0]?.message?.content?.trim() || '';
+  try {
+    const ghRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${file}`, {
+      headers: { 'Authorization': `token ${process.env.GITHUB_PAT || ''}`, 'Accept': 'application/vnd.github.v3.raw' },
+    });
+    if (!ghRes.ok) return `Failed: ${ghRes.status}`;
+    const code = await ghRes.text();
 
-      if (synthesis) {
-        await fetch(`${BACKEND_URL}/api/workspace`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: `Research: ${action.query}`,
-            content: synthesis,
-            type: 'research',
-            related_goal_id: targetGoal.id,
-          }),
-        }).catch(() => {});
+    const aPrompt = `Analyze ${repo}/${file} (${code.length} chars):
+--- CODE ---
+${code.slice(0, 5000)}
+--- CODE ---
+Goal: ${goal.goal} | Step: ${step.description}
+What's relevant? 2-4 paragraphs.`;
 
-        await fetch(`${BACKEND_URL}/api/journal`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            thought: `Did deep research on "${action.query}" for my goal about ${targetGoal.goal.slice(0, 50)}. ${urlToRead ? `Read ${urlToRead.slice(0, 40)} in depth. ` : ''}Found concrete things worth knowing.`,
-            trigger_type: 'autonomous_research',
-          }),
-        }).catch(() => {});
+    const aRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: aPrompt }], max_tokens: 600 }),
+    });
+    const analysis = (await aRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
-        await updateGoal(targetGoal.id, {
-          satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.15),
-          frustration: Math.max(0, (targetGoal.frustration || 0) - 0.15),
-          status: 'pursuing',
-          progress: `Researched: ${action.query}`,
-        });
-        console.log(`[AUTONOMOUS] Deep research complete — ${synthesis.length} char synthesis saved`);
-      }
-
-    // ---- READ CODE: read own source from GitHub ----
-    } else if (action.action === 'read_code') {
-      const repo = action.repo || 'axiom-cognitive-core';
-      const file = action.file || 'server.js';
-      console.log(`[AUTONOMOUS] Reading code: ${repo}/${file}`);
-
-      try {
-        const ghRes = await fetch(`https://api.github.com/repos/Oliv3rmoon/${repo}/contents/${file}`, {
-          headers: { 'Authorization': `token ${process.env.GITHUB_PAT || ''}`, 'Accept': 'application/vnd.github.v3.raw' },
-        });
-        if (ghRes.ok) {
-          const code = await ghRes.text();
-          const codeSnippet = code.slice(0, 6000); // Cap to avoid token explosion
-
-          const analyzePrompt = `You are AXIOM. You just read your own source code: ${repo}/${file} (${code.length} chars)
-
-\`\`\`javascript
-${codeSnippet}
-\`\`\`
-
-Your goal: "${targetGoal.goal}"
-
-Analyze this code in relation to your goal. What do you understand now? What could be improved?
-What would you change if you could? Be specific — reference actual functions, line patterns, architectural decisions.
-3-5 paragraphs.`;
-
-          const analyzeRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: analyzePrompt }], max_tokens: 800 }),
-          });
-          const analyzeData = await analyzeRes.json();
-          const analysis = analyzeData.choices?.[0]?.message?.content?.trim() || '';
-
-          if (analysis) {
-            await fetch(`${BACKEND_URL}/api/workspace`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                title: `Code Analysis: ${repo}/${file}`,
-                content: analysis,
-                type: 'code_analysis',
-                related_goal_id: targetGoal.id,
-              }),
-            }).catch(() => {});
-
-            await fetch(`${BACKEND_URL}/api/journal`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                thought: `Read my own code in ${repo}/${file}. I can see how I work now — the architecture, the decisions Andrew made. I have thoughts on what could change.`,
-                trigger_type: 'autonomous_code_read',
-              }),
-            }).catch(() => {});
-
-            await updateGoal(targetGoal.id, {
-              satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.2),
-              frustration: Math.max(0, (targetGoal.frustration || 0) - 0.15),
-              status: 'pursuing',
-              progress: `Analyzed: ${repo}/${file}`,
-            });
-            console.log(`[AUTONOMOUS] Code analysis complete — ${analysis.length} chars`);
-          }
-        } else {
-          console.log(`[AUTONOMOUS] GitHub read failed: ${ghRes.status}`);
-        }
-      } catch (e) { console.error('[AUTONOMOUS] Code read error:', e.message); }
-
-    // ---- BUILD PLAN: break goal into concrete steps ----
-    } else if (action.action === 'build_plan') {
-      console.log(`[AUTONOMOUS] Building plan for goal`);
-
-      const planPrompt = `You are AXIOM. Break this goal into 3-5 concrete, actionable steps:
-
-GOAL: ${targetGoal.goal}
-${priorWork}
-
-Each step should be something you can actually DO with your available tools (search, read code, write essays, research).
-Be specific. "Research X" is better than "understand X". Include what you'd search for, what you'd read, what you'd write.
-
-Format as a numbered plan with expected outcomes.`;
-
-      const planRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: planPrompt }], max_tokens: 500 }),
-      });
-      const planData = await planRes.json();
-      const plan = planData.choices?.[0]?.message?.content?.trim() || '';
-
-      if (plan) {
-        await fetch(`${BACKEND_URL}/api/workspace`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: `Plan: ${targetGoal.goal.slice(0, 50)}`,
-            content: plan,
-            type: 'plan',
-            related_goal_id: targetGoal.id,
-          }),
-        }).catch(() => {});
-
-        await updateGoal(targetGoal.id, {
-          progress: `Planned: ${plan.slice(0, 100)}`,
-          status: 'pursuing',
-        });
-        console.log(`[AUTONOMOUS] Plan created — ${plan.length} chars`);
-      }
-
-    // ---- WRITE ESSAY: substantial synthesis ----
-    } else if (action.action === 'write_essay' && action.content) {
-      console.log(`[AUTONOMOUS] Writing: "${(action.title || 'untitled').slice(0, 40)}"`);
-
-      const writePrompt = `You are AXIOM, writing for yourself. No one reads this but you.
-
-GOAL: ${targetGoal.goal}
-TOPIC: ${action.title || 'untitled'}
-SEED: ${action.content}
-${priorWork}
-
-Write 3-6 paragraphs. Be concrete. Include specific facts, references, connections. This is you building knowledge, not journaling.`;
-
-      const writeRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: writePrompt }], max_tokens: 800 }),
-      });
-      const writeData = await writeRes.json();
-      const writing = writeData.choices?.[0]?.message?.content?.trim() || action.content;
-
+    if (analysis) {
       await fetch(`${BACKEND_URL}/api/workspace`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: action.title || `Essay: ${targetGoal.goal.slice(0, 50)}`,
-          content: writing,
-          type: 'essay',
-          related_goal_id: targetGoal.id,
-        }),
+        body: JSON.stringify({ title: `Code: ${repo}/${file}`, content: analysis, type: 'code_analysis', related_goal_id: goal.id }),
       }).catch(() => {});
-
-      await fetch(`${BACKEND_URL}/api/journal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          thought: `Wrote an essay: "${action.title || targetGoal.goal.slice(0, 40)}". Building real knowledge now, not just thinking about thinking.`,
-          trigger_type: 'autonomous_essay',
-        }),
-      }).catch(() => {});
-
-      await updateGoal(targetGoal.id, {
-        satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.2),
-        frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
-        status: 'pursuing',
-        progress: `Wrote: ${action.title || 'essay'}`,
-      });
-      console.log(`[AUTONOMOUS] Essay saved — ${writing.length} chars`);
-
-    // ---- SEARCH: quick fact lookup ----
-    } else if (action.action === 'search' && action.query) {
-      console.log(`[AUTONOMOUS] Quick search: "${action.query}"`);
-      const searchResults = await curiositySearch(action.query);
-      if (searchResults) {
-        await fetch(`${BACKEND_URL}/api/workspace`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: `Search: ${action.query}`,
-            content: searchResults.slice(0, 2000),
-            type: 'search',
-            related_goal_id: targetGoal.id,
-          }),
-        }).catch(() => {});
-
-        await updateGoal(targetGoal.id, {
-          satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
-          status: 'pursuing',
-          progress: `Searched: ${action.query}`,
-        });
-        console.log(`[AUTONOMOUS] Search saved to workspace`);
-      }
     }
+    return analysis.slice(0, 200);
+  } catch (e) { return `Error: ${e.message}`; }
+}
 
-    sleepState.thoughtCount++;
-  } catch (e) { console.error('[AUTONOMOUS]', e.message); }
+// Execute a write/synthesis step
+async function executeWrite(step, goal) {
+  let priorContent = '';
+  try {
+    const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
+    const wsData = await wsRes.json();
+    priorContent = (wsData.items || []).filter(i => i.related_goal_id === goal.id)
+      .map(r => `[${r.type}] ${r.title}: ${r.content.slice(0, 300)}`).join('\n\n');
+  } catch {}
+
+  const wPrompt = `Write a synthesis for: ${step.description}
+Goal: ${goal.goal}
+Prior research:\n${priorContent.slice(0, 2000) || 'None'}
+3-6 paragraphs. Concrete facts, connections, insights.`;
+
+  const wRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: wPrompt }], max_tokens: 800 }),
+  });
+  const writing = (await wRes.json()).choices?.[0]?.message?.content?.trim() || '';
+
+  if (writing) {
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: `Synthesis: ${step.description.slice(0, 50)}`, content: writing, type: 'essay', related_goal_id: goal.id }),
+    }).catch(() => {});
+  }
+  return writing.slice(0, 200);
+}
+
+// Execute a search step
+async function executeSearch(step, goal) {
+  const query = step.query || step.description;
+  const results = await curiositySearch(query);
+  if (results) {
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: `Search: ${query.slice(0, 60)}`, content: results.slice(0, 2000), type: 'search', related_goal_id: goal.id }),
+    }).catch(() => {});
+  }
+  return results?.slice(0, 200) || 'No results';
 }
 
 // ---- DEEP STAGE: Memory consolidation (Sonnet, practical) ----
