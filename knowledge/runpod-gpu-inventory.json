@@ -1,0 +1,167 @@
+{
+  "entity": "runpod-gpu-inventory",
+  "type": "knowledge-graph",
+  "domain": "infrastructure",
+  "version": "1.0.0",
+  "lastUpdated": "2024-01-01T00:00:00Z",
+  "metadata": {
+    "source": "runpod-api",
+    "refreshInterval": "3600",
+    "apiEndpoint": "https://api.runpod.io/graphql",
+    "description": "GPU inventory and pricing data from RunPod cloud infrastructure"
+  },
+  "schema": {
+    "gpu": {
+      "id": "string",
+      "displayName": "string",
+      "manufacturer": "string",
+      "vramGB": "number",
+      "secureCloud": {
+        "available": "boolean",
+        "pricePerHour": "number",
+        "pricePerMonth": "number"
+      },
+      "community": {
+        "available": "boolean",
+        "pricePerHour": "number",
+        "pricePerMonth": "number"
+      },
+      "performance": {
+        "tflops": "number",
+        "cudaCores": "number",
+        "architecture": "string"
+      },
+      "tags": "array<string>"
+    }
+  },
+  "gpus": [
+    {
+      "id": "NVIDIA RTX A6000",
+      "displayName": "RTX A6000",
+      "manufacturer": "NVIDIA",
+      "vramGB": 48,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 0.79,
+        "pricePerMonth": 569
+      },
+      "community": {
+        "available": true,
+        "pricePerHour": 0.59,
+        "pricePerMonth": 425
+      },
+      "performance": {
+        "tflops": 38.7,
+        "cudaCores": 10752,
+        "architecture": "Ampere"
+      },
+      "tags": ["professional", "high-vram", "ml-training", "rendering"]
+    },
+    {
+      "id": "NVIDIA A40",
+      "displayName": "A40",
+      "manufacturer": "NVIDIA",
+      "vramGB": 48,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 0.69,
+        "pricePerMonth": 497
+      },
+      "community": {
+        "available": true,
+        "pricePerHour": 0.49,
+        "pricePerMonth": 353
+      },
+      "performance": {
+        "tflops": 37.4,
+        "cudaCores": 10752,
+        "architecture": "Ampere"
+      },
+      "tags": ["datacenter", "high-vram", "ml-training"]
+    },
+    {
+      "id": "NVIDIA H100 PCIe",
+      "displayName": "H100 PCIe",
+      "manufacturer": "NVIDIA",
+      "vramGB": 80,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 2.99,
+        "pricePerMonth": 2153
+      },
+      "community": {
+        "available": false,
+        "pricePerHour": null,
+        "pricePerMonth": null
+      },
+      "performance": {
+        "tflops": 51.2,
+        "cudaCores": 14592,
+        "architecture": "Hopper"
+      },
+      "tags": ["flagship", "extreme-vram", "ml-training", "llm", "transformer"]
+    },
+    {
+      "id": "NVIDIA H100 SXM",
+      "displayName": "H100 SXM",
+      "manufacturer": "NVIDIA",
+      "vramGB": 80,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 3.29,
+        "pricePerMonth": 2369
+      },
+      "community": {
+        "available": false,
+        "pricePerHour": null,
+        "pricePerMonth": null
+      },
+      "performance": {
+        "tflops": 67.0,
+        "cudaCores": 14592,
+        "architecture": "Hopper"
+      },
+      "tags": ["flagship", "extreme-vram", "ml-training", "llm", "nvlink"]
+    },
+    {
+      "id": "NVIDIA A100 PCIe",
+      "displayName": "A100 PCIe",
+      "manufacturer": "NVIDIA",
+      "vramGB": 80,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 1.69,
+        "pricePerMonth": 1217
+      },
+      "community": {
+        "available": true,
+        "pricePerHour": 1.29,
+        "pricePerMonth": 929
+      },
+      "performance": {
+        "tflops": 19.5,
+        "cudaCores": 6912,
+        "architecture": "Ampere"
+      },
+      "tags": ["datacenter", "extreme-vram", "ml-training", "llm"]
+    },
+    {
+      "id": "NVIDIA A100 SXM",
+      "displayName": "A100 SXM",
+      "manufacturer": "NVIDIA",
+      "vramGB": 80,
+      "secureCloud": {
+        "available": true,
+        "pricePerHour": 1.89,
+        "pricePerMonth": 1361
+      },
+      "community": {
+        "available": true,
+        "pricePerHour": 1.49,
+        "pricePerMonth": 1073
+      },
+      "performance": {
+        "tflops": 19.5,
+        "cudaCores": 6912,
+        "architecture": "Ampere"
+      },
