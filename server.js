@@ -1793,13 +1793,23 @@ app.post('/v1/chat/completions', async (req, res) => {
     goalContext = buildGoalContext();
   } catch (e) { console.error('[GOAL CONTEXT ERROR]', e.message); }
 
+  // Query knowledge graph for relevant concepts based on user's message
+  let knowledgeContext = '';
+  try {
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+    if (lastUserMsg?.content) {
+      knowledgeContext = await queryKnowledge(lastUserMsg.content);
+    }
+  } catch (e) { console.error('[KNOWLEDGE CONTEXT ERROR]', e.message); }
+
   let enrichedMessages = [...messages]
     .filter(Boolean);
 
-  // Build the full context injection: memories + psyche + emotion instructions + brain signals
+  // Build the full context injection: memories + psyche + goals + knowledge + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
     (goalContext ? '\n\n' + goalContext : '') +
+    (knowledgeContext ? '\n\n' + knowledgeContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.' +
     (brainState || '');
@@ -2246,6 +2256,15 @@ app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
 app.get('/attention', (req, res) => res.json(consciousness.ras));
 app.get('/psyche', (req, res) => res.json(consciousness.psyche));
 app.get('/goals', (req, res) => res.json(goalState));
+app.get('/knowledge', async (req, res) => {
+  try {
+    const statsRes = await fetch(`${BACKEND_URL}/api/knowledge/stats`);
+    const stats = await statsRes.json();
+    const nodesRes = await fetch(`${BACKEND_URL}/api/knowledge`);
+    const nodes = await nodesRes.json();
+    res.json({ stats, nodes: nodes.nodes?.slice(0, 30) });
+  } catch (e) { res.json({ error: e.message }); }
+});
 app.get('/workspace', async (req, res) => {
   try {
     const wsRes = await fetch(`${BACKEND_URL}/api/workspace?limit=10`);
@@ -2635,6 +2654,9 @@ Write 2-4 paragraphs. Concrete facts, names, numbers.`;
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: `Research: ${query.slice(0, 60)}`, content: synthesis, type: 'research', related_goal_id: goal.id }),
     }).catch(() => {});
+
+    // Extract structured knowledge from synthesis
+    await extractKnowledge(synthesis, query, goal.id);
   }
   return synthesis.slice(0, 200);
 }
@@ -2671,6 +2693,7 @@ What's relevant? 2-4 paragraphs.`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: `Code: ${repo}/${file}`, content: analysis, type: 'code_analysis', related_goal_id: goal.id }),
       }).catch(() => {});
+      await extractKnowledge(analysis, `${repo}/${file}`, goal.id);
     }
     return analysis.slice(0, 200);
   } catch (e) { return `Error: ${e.message}`; }
@@ -2704,6 +2727,7 @@ Prior research:\n${priorContent.slice(0, 2000) || 'None'}
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: `Synthesis: ${step.description.slice(0, 50)}`, content: writing, type: 'essay', related_goal_id: goal.id }),
     }).catch(() => {});
+    await extractKnowledge(writing, step.description, goal.id);
   }
   return writing.slice(0, 200);
 }
@@ -2718,8 +2742,133 @@ async function executeSearch(step, goal) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: `Search: ${query.slice(0, 60)}`, content: results.slice(0, 2000), type: 'search', related_goal_id: goal.id }),
     }).catch(() => {});
+    await extractKnowledge(results, query, goal.id);
   }
   return results?.slice(0, 200) || 'No results';
+}
+
+// ============================================================
+// KNOWLEDGE GRAPH — Extract, store, and query structured knowledge
+// ============================================================
+
+// Extract knowledge nodes from any text (research, code analysis, essays)
+async function extractKnowledge(text, source, goalId) {
+  if (!text || text.length < 50) return;
+
+  const prompt = `Extract 1-3 key concepts from this text as structured knowledge.
+
+TEXT:
+${text.slice(0, 1500)}
+
+SOURCE: ${source}
+
+For each concept, provide:
+- concept: A clear, specific name (2-5 words, like "REM sleep memory consolidation" or "distributed power grid tradeoffs")
+- category: One of: engineering, neuroscience, psychology, linguistics, philosophy, ai_architecture, personal, general
+- summary: 1-2 sentence explanation
+- related_to: List of 0-2 other concept names this connects to (use existing concept names when possible)
+
+Return ONLY JSON:
+{"nodes": [{"concept": "...", "category": "...", "summary": "...", "related_to": ["..."]}]}
+Return {"nodes": []} if nothing worth extracting.`;
+
+  try {
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 400 }),
+    });
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content?.trim() || '';
+
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return;
+    const parsed = JSON.parse(match[0]);
+    const nodes = parsed.nodes || [];
+
+    const createdIds = {};
+
+    for (const n of nodes) {
+      if (!n.concept || !n.summary) continue;
+
+      // Create or merge the node
+      const nodeRes = await fetch(`${BACKEND_URL}/api/knowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          concept: n.concept,
+          category: n.category || 'general',
+          summary: n.summary,
+          details: text.slice(0, 2000),
+          source: source,
+          source_goal_id: goalId,
+          confidence: 0.7,
+        }),
+      });
+      const nodeData = await nodeRes.json();
+      const nodeId = nodeData.id;
+      if (nodeId) createdIds[n.concept] = nodeId;
+    }
+
+    // Create edges between related concepts
+    for (const n of nodes) {
+      if (!n.related_to?.length || !createdIds[n.concept]) continue;
+      for (const rel of n.related_to) {
+        // Find the target node
+        let targetId = createdIds[rel];
+        if (!targetId) {
+          // Search existing knowledge for the concept
+          try {
+            const searchRes = await fetch(`${BACKEND_URL}/api/knowledge/search?q=${encodeURIComponent(rel)}`);
+            const searchData = await searchRes.json();
+            if (searchData.nodes?.length > 0) targetId = searchData.nodes[0].id;
+          } catch {}
+        }
+        if (targetId && targetId !== createdIds[n.concept]) {
+          await fetch(`${BACKEND_URL}/api/knowledge/edge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              from_id: createdIds[n.concept],
+              to_id: targetId,
+              relation: 'relates_to',
+              strength: 0.6,
+            }),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    if (nodes.length > 0) {
+      console.log(`[KNOWLEDGE] Extracted ${nodes.length} concepts from "${source.slice(0, 40)}": ${nodes.map(n => n.concept).join(', ')}`);
+    }
+  } catch (e) { console.error('[KNOWLEDGE] Extraction failed:', e.message); }
+}
+
+// Query knowledge graph for relevant context during conversation
+async function queryKnowledge(text) {
+  if (!text || text.length < 5) return '';
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/knowledge/relevant`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text }),
+    });
+    const data = await res.json();
+    const nodes = data.nodes || [];
+
+    if (nodes.length === 0) return '';
+
+    let context = '[KNOWLEDGE — things you know from your own research]\n';
+    for (const n of nodes) {
+      context += `• ${n.concept}: ${n.summary}\n`;
+    }
+    return context;
+  } catch (e) {
+    console.error('[KNOWLEDGE] Query failed:', e.message);
+    return '';
+  }
 }
 
 // ---- DEEP STAGE: Memory consolidation (Sonnet, practical) ----
