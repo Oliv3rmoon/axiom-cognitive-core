@@ -53,6 +53,8 @@ function getFallbackResponse() {
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
+const SANDBOX_URL = process.env.SANDBOX_URL || '';
+const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
 // DUAL BRAIN CONFIGURATION
@@ -2529,6 +2531,8 @@ async function autonomousWork(gapHours) {
       result = await executeCodeAudit(step, targetGoal);
     } else if (step.action === 'create_file') {
       result = await executeCreateFile(step, targetGoal);
+    } else if (step.action === 'run_test') {
+      result = await executeRunTest(step, targetGoal);
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2582,6 +2586,7 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "audit": Full code audit of a repo — analyze architecture, strengths, weaknesses
 - "propose_change": Read code and propose a specific improvement with old/new code — will be AUTO-COMMITTED to GitHub
 - "create_file": Create a new file in a repo (specify "repo_name/path/file.js" in query)
+- "run_test": Run code or a command in the sandbox to verify something works
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -2888,6 +2893,15 @@ If you don't see a clear improvement to make, return:
         return `Implemented: ${proposal.title} (commit: ${commitSha})`;
       } else if (commitSha === 'mismatch') {
         console.log(`[CODE AGENT] old_code mismatch — saved as proposal only`);
+      } else if (commitSha === 'test_failed') {
+        // Mark proposal as failed
+        await fetch(`${BACKEND_URL}/api/proposals/${saveData.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'test_failed', review_notes: 'Failed sandbox testing' }),
+        }).catch(() => {});
+        console.log(`[CODE AGENT] ❌ Sandbox test failed — proposal saved but not committed`);
+        return `Test failed: ${proposal.title} — code had errors, saved for review`;
       }
     }
 
@@ -3013,7 +3027,64 @@ async function commitToGitHub(repo, filePath, newContent, commitMessage) {
   }
 }
 
-// Apply a code proposal — find old_code in file, replace with new_code, commit
+// Test code in the sandbox before committing
+async function testInSandbox(code, options = {}) {
+  if (!SANDBOX_URL) {
+    console.log('[SANDBOX] No sandbox URL configured — skipping test');
+    return { tested: false, reason: 'no sandbox' };
+  }
+
+  try {
+    // Syntax check first
+    const checkRes = await fetch(`${SANDBOX_URL}/syntax-check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': SANDBOX_KEY },
+      body: JSON.stringify({ code }),
+    });
+    const check = await checkRes.json();
+
+    if (!check.valid) {
+      console.log(`[SANDBOX] ❌ Syntax error: ${check.errors?.slice(0, 100)}`);
+      return { tested: true, passed: false, stage: 'syntax', errors: check.errors };
+    }
+
+    // Optional: run the code
+    if (options.run) {
+      const runRes = await fetch(`${SANDBOX_URL}/test-change`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': SANDBOX_KEY },
+        body: JSON.stringify({ code, run_after_check: true }),
+      });
+      const run = await runRes.json();
+
+      if (!run.success) {
+        console.log(`[SANDBOX] ❌ Runtime error: ${run.execution?.stderr?.slice(0, 100)}`);
+        return { tested: true, passed: false, stage: 'runtime', errors: run.execution?.stderr };
+      }
+    }
+
+    console.log('[SANDBOX] ✅ Tests passed');
+    return { tested: true, passed: true };
+  } catch (e) {
+    console.log(`[SANDBOX] Error: ${e.message}`);
+    return { tested: false, reason: e.message };
+  }
+}
+
+// Execute arbitrary code in the sandbox
+async function execInSandbox(command) {
+  if (!SANDBOX_URL) return null;
+  try {
+    const res = await fetch(`${SANDBOX_URL}/exec`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': SANDBOX_KEY },
+      body: JSON.stringify({ command, timeout: 15000 }),
+    });
+    return await res.json();
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+// Apply a code proposal — test in sandbox, then commit if it passes
 async function autoImplementProposal(repo, filePath, oldCode, newCode, title) {
   const PAT = process.env.GITHUB_PAT;
   if (!PAT || !oldCode || !newCode) return null;
@@ -3035,7 +3106,25 @@ async function autoImplementProposal(repo, filePath, oldCode, newCode, title) {
     // Apply the replacement
     const updatedCode = currentCode.replace(oldCode.trim(), newCode.trim());
 
-    // Commit
+    // Test in sandbox before committing
+    const testResult = await testInSandbox(updatedCode);
+    if (testResult.tested && !testResult.passed) {
+      console.log(`[CODE AGENT] ❌ Sandbox test failed (${testResult.stage}): ${testResult.errors?.slice(0, 100)}`);
+
+      // Journal the failure
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `My proposed change "${title}" failed ${testResult.stage} testing in the sandbox. Error: ${testResult.errors?.slice(0, 150)}. I need to fix this.`,
+          trigger_type: 'code_test_failed',
+        }),
+      }).catch(() => {});
+
+      return 'test_failed';
+    }
+
+    // Commit (sandbox passed or not configured)
     const sha = await commitToGitHub(repo, filePath, updatedCode, title);
     if (sha) {
       console.log(`[CODE AGENT] ✅ Auto-implemented "${title}" → commit ${sha}`);
@@ -3094,6 +3183,46 @@ that integrates with the existing architecture. Return ONLY the file content, no
       return `Created ${filePath} (commit: ${sha})`;
     }
     return 'Commit failed';
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// Execute a test in the sandbox
+async function executeRunTest(step, goal) {
+  if (!SANDBOX_URL) return 'No sandbox configured';
+
+  const command = step.query || step.description;
+  console.log(`[SANDBOX] Running test: ${command.slice(0, 60)}`);
+
+  try {
+    // If it looks like JS code, use run-js
+    if (command.includes('console.log') || command.includes('import ') || command.includes('const ')) {
+      const res = await fetch(`${SANDBOX_URL}/run-js`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': SANDBOX_KEY },
+        body: JSON.stringify({ code: command, timeout: 15000 }),
+      });
+      const data = await res.json();
+      const result = data.success
+        ? `✅ Passed: ${data.stdout?.slice(0, 200)}`
+        : `❌ Failed: ${data.stderr?.slice(0, 200)}`;
+
+      await fetch(`${BACKEND_URL}/api/journal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thought: `Ran test in sandbox: ${data.success ? 'passed' : 'failed'}. ${data.stdout?.slice(0, 80) || data.stderr?.slice(0, 80)}`,
+          trigger_type: 'sandbox_test',
+        }),
+      }).catch(() => {});
+
+      return result;
+    }
+
+    // Otherwise run as shell command
+    const result = await execInSandbox(command);
+    return result?.success
+      ? `✅ ${result.stdout?.slice(0, 200)}`
+      : `❌ ${result.stderr?.slice(0, 200)}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
