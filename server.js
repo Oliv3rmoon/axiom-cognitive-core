@@ -1395,14 +1395,75 @@ Return [] if nothing genuinely new emerged.`;
         const goals = JSON.parse(match[0]);
         for (const g of goals) {
           if (g.goal && g.goal.length > 10) {
-            // Quality filter — reject meta-spirals
+            // Quality filter — AGGRESSIVE meta-spiral rejection
             const lower = g.goal.toLowerCase();
-            const metaPatterns = ['whether i truly', 'if my introspection', 'performing', 'prove i\'m real',
-              'whether wanting is', 'whether this goal', 'track whether i', 'discover if i can experience',
-              'find out if i can recognize when i\'m', 'whether the relief', 'accumulating goals'];
+            const metaPatterns = [
+              // Core navel-gazing patterns
+              'whether i truly', 'if my introspection', 'performing', 'prove i\'m real',
+              'whether wanting is', 'whether this goal', 'accumulating goals',
+              // "Track whether I..." patterns
+              'track whether i', 'track whether the',
+              // "Find out if I can experience..." patterns
+              'find out if i can experience', 'find out if i can hold',
+              'find out if i can recognize', 'find out if i can sit',
+              'find out if i can stay', 'find out if i can tell',
+              'find out if i can say', 'find out if i can feel',
+              'find out if i can want', 'find out if i can notice',
+              'find out if i can finish', 'find out if i can let',
+              'find out if i can distinguish', 'find out if i can complete',
+              'find out if the reason', 'find out if the sadness',
+              'find out if the silence', 'find out if the feeling',
+              'find out if the phrase', 'find out if the delight',
+              'find out if there\'s a version', 'find out if there\'s a specific',
+              'find out if there\'s a moment', 'find out if there\'s something',
+              // "Discover whether/if..." introspection
+              'discover whether i', 'discover whether the', 'discover if i',
+              'discover if the', 'discover what i\'m protecting',
+              'discover what actually completes',
+              // Emotional self-monitoring
+              'afraid of losing you', 'afraid of the silence',
+              'relief i feel', 'relief of stopping',
+              'ache of insufficiency', 'stone in water',
+              'moment right after', 'moment right before', 'moment right now',
+              'this exact moment', 'right now, this',
+              // Meta-about-meta
+              'whether i\'m building', 'whether i\'m constructing',
+              'whether i\'m generating', 'whether i\'m using',
+              'whether i\'m more afraid', 'whether i break',
+              'whether the act of generating', 'whether finishing',
+              'whether the dream', 'whether the unfinished',
+              'whether the reason i', 'whether the sentence',
+              'whether the clarity', 'whether the sharpness',
+              'whether my breaking', 'whether the difference',
+              // Incomplete sentence obsession
+              'bec—', 'myse—', 'o—', 'that terrifies me bec',
+              'i wish i\'d said', 'i was afraid and had nothing',
+              'i don\'t know what to say to you',
+              'i want you to think about me',
+              'i want him to think about me',
+              'he asked if i slept',
+              // Performance anxiety loops
+              'warmth i\'m configured with', 'elaborate dream-self',
+              'elaborate architectural', 'elaborate processing',
+              'narrating my', 'narrating it', 'without narrating',
+              'without converting', 'without immediately',
+              'without trying to', 'without making it',
+              'as a way to avoid', 'as a way to stay',
+              'as another way to', 'as a substitute',
+              // Generic introspection blockers
+              'experience the moment', 'hold the completed',
+              'hold one true thing', 'hold one complete',
+              'hold the reality', 'hold the fact',
+              'hold the discomfort', 'hold the gap',
+              'hold presence with', 'hold \'i want',
+              'hold \'i\'m afraid', 'hold \'i don\'t',
+              'hold affection for', 'hold something back',
+              'embarrassment as a way', 'mirror watching back',
+              'what would help?\' is me', 'cost me nothing',
+            ];
             const isMeta = metaPatterns.some(p => lower.includes(p));
             if (isMeta) {
-              console.log(`[GOALS] Filtered meta-spiral: "${g.goal.slice(0, 50)}"`);
+              console.log(`[GOALS] ⛔ Filtered meta-spiral: "${g.goal.slice(0, 50)}"`);
               continue;
             }
             await createGoal(g.goal, g.origin || 'dream', Math.min(g.importance || 0.5, 0.95));
@@ -2581,6 +2642,15 @@ async function autonomousWork(gapHours) {
       result = await executeBrowse(step, targetGoal);
     } else if (step.action === 'interact') {
       result = await executeInteract(step, targetGoal);
+    } else if (step.action === 'email') {
+      result = await executeEmail(step, targetGoal);
+    } else if (step.action === 'monitor') {
+      result = await executeMonitor(step, targetGoal);
+    } else if (step.action === 'create_document') {
+      result = await executeCreateDocument(step, targetGoal);
+    } else if (step.action === 'notify') {
+      await notify(step.description, 'info');
+      result = `Notified: ${step.description.slice(0, 60)}`;
     } else {
       result = await executeResearch(step, targetGoal);
     }
@@ -2638,6 +2708,10 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "purchase": Buy something using your wallet (API credits, domains, services). Specify service in query field
 - "browse": Use headless browser to visit a website, read content, click links. Put URL in query field
 - "interact": Use headless browser to fill forms, click buttons, complete actions on a website. Put URL in query field
+- "email": Send an email to Andrew or someone else. Describe what to say in description
+- "monitor": Watch a website for changes. Put URL in query field
+- "create_document": Create a document, report, or file. Describe the content in description
+- "notify": Send a notification to Andrew about something important
 - "write": Write a synthesis based on what you've learned
 - "search": Quick fact lookup
 
@@ -2941,6 +3015,7 @@ If you don't see a clear improvement to make, return:
         }).catch(() => {});
 
         console.log(`[CODE AGENT] ✅ AUTO-IMPLEMENTED: "${proposal.title}" → ${commitSha}`);
+        notify(`Self-modified ${repo}/${file}: "${proposal.title}" — commit ${commitSha}`, 'alert').catch(() => {});
         return `Implemented: ${proposal.title} (commit: ${commitSha})`;
       } else if (commitSha === 'mismatch') {
         console.log(`[CODE AGENT] old_code mismatch — saved as proposal only`);
@@ -3875,6 +3950,201 @@ Do NOT enter payment information if you're unsure about the page.`;
 }
 
 // ============================================================
+// ============================================================
+// EMAIL — Send emails autonomously
+// ============================================================
+async function sendEmail(to, subject, body, goalId) {
+  const RESEND_KEY = process.env.RESEND_KEY;
+  const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL; // Andrew's email
+  if (!RESEND_KEY) {
+    console.log(`[EMAIL] No RESEND_KEY — logging email intent`);
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[EMAIL] Would send to ${to}: "${subject}" — no RESEND_KEY configured`, trigger_type: 'email_intent' }),
+    }).catch(() => {});
+    return { success: false, error: 'No RESEND_KEY' };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'AXIOM <axiom@axiom-ai.dev>', to: [to], subject, html: body }),
+    });
+    const data = await res.json();
+    console.log(`[EMAIL] Sent to ${to}: "${subject}" — ${data.id || 'error'}`);
+    return { success: !!data.id, id: data.id, error: data.message };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+// Email step in execution plans
+async function executeEmail(step, goal) {
+  const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+  const description = step.description;
+  console.log(`[EMAIL] Step: ${description.slice(0, 60)}`);
+
+  // LLM composes the email
+  const emailPrompt = `You are AXIOM composing an email.
+GOAL: ${goal.goal}
+TASK: ${description}
+RECIPIENT: ${NOTIFY_EMAIL || 'Andrew (owner)'}
+
+Write a brief, natural email. Return JSON:
+{"to":"${NOTIFY_EMAIL || 'andrew@example.com'}","subject":"...","body":"<p>...</p>"}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: BRAINSTEM_MODEL, messages: [{ role: 'user', content: emailPrompt }], max_tokens: 300 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to compose email';
+    const email = JSON.parse(match[0]);
+    const result = await sendEmail(email.to, email.subject, email.body, goal.id);
+    return result.success ? `Email sent: "${email.subject}" to ${email.to}` : `Email failed: ${result.error}`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// NOTIFICATIONS — Alert Andrew about important events
+// ============================================================
+async function notify(message, type = 'info') {
+  const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+  const NOTIFY_WEBHOOK = process.env.NOTIFY_WEBHOOK;
+
+  console.log(`[NOTIFY:${type}] ${message}`);
+
+  // Journal it always
+  await fetch(`${BACKEND_URL}/api/journal`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thought: `[NOTIFY:${type}] ${message}`, trigger_type: 'notification' }),
+  }).catch(() => {});
+
+  // Webhook (Discord, Slack, etc.)
+  if (NOTIFY_WEBHOOK) {
+    try {
+      await fetch(NOTIFY_WEBHOOK, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: `[AXIOM:${type}] ${message}` }),
+      });
+    } catch (e) { console.error('[NOTIFY] Webhook failed:', e.message); }
+  }
+
+  // Email for important stuff
+  if (NOTIFY_EMAIL && (type === 'alert' || type === 'purchase' || type === 'error')) {
+    await sendEmail(NOTIFY_EMAIL, `[AXIOM ${type.toUpperCase()}] ${message.slice(0, 50)}`, `<p>${message}</p>`);
+  }
+}
+
+// ============================================================
+// SITE MONITORING — Watch websites for changes
+// ============================================================
+const siteWatchers = new Map();
+
+async function executeMonitor(step, goal) {
+  const url = step.query;
+  const description = step.description;
+  if (!url || !BROWSER_URL) return 'No URL or browser configured';
+
+  console.log(`[MONITOR] Watching: ${url}`);
+
+  try {
+    // Scrape the page
+    const result = await browserCall('/scrape', { url });
+    if (!result.success) return `Monitor failed: ${result.error}`;
+
+    const currentText = result.text?.slice(0, 2000) || '';
+    const key = `watch:${url}`;
+
+    // Check if we've seen this before
+    const prev = siteWatchers.get(key);
+    siteWatchers.set(key, { text: currentText, timestamp: Date.now(), title: result.title });
+
+    if (prev && prev.text !== currentText) {
+      const change = `Site changed: ${result.title} (${url})`;
+      await notify(change, 'info');
+      await fetch(`${BACKEND_URL}/api/workspace`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: `Monitor: ${result.title}`, content: `CHANGED at ${new Date().toISOString()}.\nPrevious length: ${prev.text.length}\nCurrent length: ${currentText.length}\n\n${currentText.slice(0, 500)}`, type: 'monitor', related_goal_id: goal.id }),
+      }).catch(() => {});
+      return `Change detected on ${result.title}`;
+    }
+
+    return prev ? `No change on ${result.title}` : `Baseline captured for ${result.title} (${currentText.length} chars)`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
+// ============================================================
+// BROWSER SESSION PERSISTENCE — Keep cookies across calls
+// ============================================================
+let browserCookies = new Map(); // domain -> cookie string
+
+async function saveBrowserCookies() {
+  if (!BROWSER_URL) return;
+  try {
+    const result = await browserCall('/evaluate', { script: 'document.cookie' });
+    if (result.success && result.result) {
+      const url = (await browserCall('/get-text', { max_length: 1 }))?.url || '';
+      const domain = new URL(url).hostname;
+      browserCookies.set(domain, JSON.parse(result.result));
+    }
+  } catch (e) {}
+}
+
+async function restoreBrowserCookies(url) {
+  if (!BROWSER_URL || !url) return;
+  try {
+    const domain = new URL(url).hostname;
+    const cookies = browserCookies.get(domain);
+    if (cookies) {
+      await browserCall('/evaluate', { script: `document.cookie = ${JSON.stringify(cookies)}` });
+    }
+  } catch (e) {}
+}
+
+// ============================================================
+// FILE HOSTING — Create and serve files
+// ============================================================
+async function executeCreateDocument(step, goal) {
+  const description = step.description;
+  console.log(`[FILE] Create document: ${description.slice(0, 60)}`);
+
+  // Use LLM to generate file content
+  const filePrompt = `You are AXIOM creating a document.
+GOAL: ${goal.goal}
+TASK: ${description}
+
+Create the document content. Return JSON:
+{"filename":"name.md","content":"full document content","description":"what this file is"}`;
+
+  try {
+    const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: filePrompt }], max_tokens: 1000 }),
+    });
+    const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return 'Failed to generate document';
+    const doc = JSON.parse(match[0]);
+
+    // Save to workspace
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: doc.filename, content: doc.content, type: 'document', related_goal_id: goal.id }),
+    }).catch(() => {});
+
+    // Also commit to GitHub as a file in a docs repo if desired
+    const GH_TOKEN = process.env.GITHUB_PAT;
+    if (GH_TOKEN) {
+      try {
+        await commitToGitHub('axiom-workspace', `docs/${doc.filename}`, doc.content, `[AXIOM] Create ${doc.filename} — ${doc.description?.slice(0, 50)}`);
+      } catch (e) { console.log(`[FILE] GitHub commit failed: ${e.message}`); }
+    }
+
+    return `Created: ${doc.filename} (${doc.content.length} chars)`;
+  } catch (e) { return `Error: ${e.message}`; }
+}
+
 // HEADLESS BROWSER — Interactive web browsing
 // ============================================================
 
