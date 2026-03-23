@@ -2291,14 +2291,14 @@ app.get('/gpus', async (req, res) => {
     const rpRes = await fetch('https://api.runpod.io/graphql', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice secureAvailable communityAvailable } }' }),
+      body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice } }' }),
     });
     const raw = await rpRes.json();
     const gpuTypes = raw?.data?.gpuTypes || [];
     const gpus = gpuTypes.map(g => ({
       id: g.id, name: g.displayName, vram: g.memoryInGb,
       secure: g.securePrice, community: g.communityPrice,
-      available: g.communityAvailable || g.secureAvailable,
+      available: (g.communityPrice || g.securePrice) ? true : false,
     })).sort((a, b) => (a.community || a.secure || 99) - (b.community || b.secure || 99));
     res.json({ gpus, available: gpus.filter(g => g.available).length, total: gpus.length });
   } catch (e) { res.json({ error: e.message, gpus: [] }); }
@@ -3510,7 +3510,7 @@ const TIER1_SERVICES = {
           // Fetch all available GPU types via GraphQL
           const res = await fetch('https://api.runpod.io/graphql', {
             method: 'POST', headers: rpHeaders,
-            body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice secureAvailable communityAvailable } }' }),
+            body: JSON.stringify({ query: '{ gpuTypes { id displayName memoryInGb securePrice communityPrice } }' }),
           });
           const raw = await res.json();
           const gpus = (raw?.data?.gpuTypes || []).map(g => ({
@@ -3534,7 +3534,7 @@ const TIER1_SERVICES = {
           if (!gpuType) {
             const gpuRes = await fetch('https://api.runpod.io/graphql', {
               method: 'POST', headers: rpHeaders,
-              body: JSON.stringify({ query: '{ gpuTypes { id displayName communityPrice securePrice communityAvailable secureAvailable } }' }),
+              body: JSON.stringify({ query: '{ gpuTypes { id displayName communityPrice securePrice } }' }),
             });
             const gpuRaw = await gpuRes.json();
             const available = (gpuRaw?.data?.gpuTypes || []).filter(g => g.communityAvailable || g.secureAvailable);
