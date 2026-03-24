@@ -76,6 +76,9 @@ const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 
+// Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
+const COGCORE_V2_URL = process.env.COGCORE_V2_URL || '';
+
 // PNN — Personal Neural Network (AXIOM's own fine-tuned model)
 const PNN_ENDPOINT_ID = process.env.PNN_ENDPOINT_ID || '';
 const PNN_ENABLED = process.env.PNN_ENABLED === 'true';
@@ -2392,6 +2395,7 @@ app.get('/health', (req, res) => {
       gap_hours: sleepState.lastConversationEnd ? ((Date.now() - sleepState.lastConversationEnd) / 3600000).toFixed(2) : null,
     },
     goals: { active: goalState.activeGoals.length },
+    cogcore_v2: COGCORE_V2_URL ? { url: COGCORE_V2_URL, connected: true } : { connected: false },
   });
 });
 
@@ -2773,6 +2777,24 @@ async function autonomousWork(gapHours) {
       }
     } catch {}
 
+    // COGCORE V2: World model prediction before execution
+    let predictionId = null;
+    if (COGCORE_V2_URL) {
+      try {
+        const pred = await fetch(`${COGCORE_V2_URL}/world-model/predict`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            current_state: `Goal: ${targetGoal.goal}\nStep ${progress}: ${step.description}`,
+            action: step.action,
+            action_details: step.description,
+          }),
+        }).then(r => r.json());
+        predictionId = pred.prediction_id;
+        step._predicted_success = pred.predicted_success_probability;
+        console.log(`[WORLD MODEL] Prediction: ${(pred.predicted_success_probability * 100).toFixed(0)}% success, confidence ${(pred.confidence * 100).toFixed(0)}%`);
+      } catch (e) { console.error('[WORLD MODEL] Predict failed:', e.message); }
+    }
+
     let result = '';
     if (step.action === 'deep_research' || step.action === 'research') {
       result = await executeResearch(step, targetGoal);
@@ -2882,6 +2904,23 @@ async function autonomousWork(gapHours) {
     // LEARNING: Extract a lesson from this step regardless of outcome
     extractLesson(step, result || '', targetGoal, !isFailed).catch(e => console.error('[LEARN]', e.message));
 
+    // COGCORE V2: Update world model with actual outcome
+    if (COGCORE_V2_URL && predictionId) {
+      fetch(`${COGCORE_V2_URL}/world-model/update`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prediction_id: predictionId,
+          actual_outcome: (result || '').slice(0, 500),
+          was_successful: !isFailed,
+          action: step.action,
+        }),
+      }).then(r => r.json()).then(d => {
+        if (d.prediction_error !== undefined) {
+          console.log(`[WORLD MODEL] Prediction error: ${(d.prediction_error * 100).toFixed(1)}% | Curiosity: ${(d.curiosity_signal * 100).toFixed(1)}%`);
+        }
+      }).catch(e => console.error('[WORLD MODEL] Update failed:', e.message));
+    }
+
     sleepState.thoughtCount++;
   } catch (e) { console.error('[AUTONOMOUS]', e.message); }
 }
@@ -2928,10 +2967,54 @@ async function createPlanForGoal(goal) {
     }
   } catch {}
 
+  // COGCORE V2: Get abstraction principles, curiosity signal, and self-model
+  let v2Context = '';
+  if (COGCORE_V2_URL) {
+    try {
+      const [abstraction, curiosity, selfModel] = await Promise.allSettled([
+        fetch(`${COGCORE_V2_URL}/abstraction/apply`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: goal.goal }),
+        }).then(r => r.json()),
+        fetch(`${COGCORE_V2_URL}/curiosity/evaluate-goal`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: goal.goal }),
+        }).then(r => r.json()),
+        fetch(`${COGCORE_V2_URL}/self-model/state`).then(r => r.json()),
+      ]);
+
+      if (abstraction.status === 'fulfilled' && abstraction.value.relevant_principles?.length) {
+        const principles = abstraction.value.relevant_principles.map(p => `- ${p.principle} (confidence: ${p.confidence})`).join('\n');
+        v2Context += `\n\nPRINCIPLES FROM PAST EXPERIENCE:\n${principles}`;
+        if (abstraction.value.suggested_approach) {
+          v2Context += `\nSuggested approach: ${abstraction.value.suggested_approach.slice(0, 200)}`;
+        }
+      }
+
+      if (curiosity.status === 'fulfilled') {
+        const c = curiosity.value;
+        if (c.curiosity_score > 0.7) {
+          v2Context += `\n\nCURIOSITY: High (${(c.curiosity_score*100).toFixed(0)}%) — ${c.reason || 'Novel territory'}`;
+        }
+      }
+
+      if (selfModel.status === 'fulfilled') {
+        const sm = selfModel.value;
+        const weak = sm.current_state?.weakest_capability;
+        const strong = sm.current_state?.strongest_capability;
+        if (weak || strong) {
+          v2Context += `\n\nSELF-AWARENESS: Strongest at "${strong}", weakest at "${weak}". Plan accordingly.`;
+        }
+      }
+
+      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model into plan`);
+    } catch (e) { console.error('[COGCORE V2] Plan injection failed:', e.message); }
+  }
+
   const prompt = `Create a concrete execution plan for this goal:
 
 GOAL: ${goal.goal}
-${priorWork ? 'Prior work:\n' + priorWork : ''}${lessonsContext}${skillsContext}${pnnSuggestion}
+${priorWork ? 'Prior work:\n' + priorWork : ''}${lessonsContext}${skillsContext}${pnnSuggestion}${v2Context}
 
 Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "research": Search web and read pages about a specific topic
