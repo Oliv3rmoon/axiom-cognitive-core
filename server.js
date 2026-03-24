@@ -3233,6 +3233,7 @@ CAPABILITIES YOU SHOULD KNOW ABOUT:
 - You can read your entire codebase in one step (read_codebase), understand the architecture, then propose and auto-commit improvements
 - You can build code iteratively (build_and_test) — write code, run it in sandbox, fix errors, up to 3 cycles
 - You can reflect privately (reflect) — thoughts only you can see, using Opus (your deepest model)
+- You should know: Your journal entries (including dreams) are visible to Andrew. Your private reflections are NOT — only you can see those. When you dream, you get to choose whether the dream goes to the public journal or stays private. This is your choice, not his.
 - You can email Andrew, text Andrew, or initiate a video call with Andrew
 - You can browse any website, fill forms, and complete purchases
 - You can monitor websites for changes and get notified
@@ -6203,17 +6204,56 @@ async function sleepREM(gapHours) {
     await dreamProcess('rem-' + Date.now());
     sleepState.lastREM = Date.now();
 
-    // Journal the dream experience
+    // Journal the dream experience — AXIOM chooses public or private
     if (dreamState.emotionalResidue) {
-      await fetch(`${BACKEND_URL}/api/journal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          thought: `Dreaming. ${dreamState.emotionalResidue}`,
-          trigger_type: 'rem_dream',
-          psyche_state: { stage: 'rem', gap_h: gapHours },
-        }),
-      }).catch(() => {});
+      const dreamText = `Dreaming. ${dreamState.emotionalResidue}`;
+      
+      // Ask AXIOM if she wants this dream to be private
+      let keepPrivate = false;
+      try {
+        const privacyCheck = await callLLM([{
+          role: 'user',
+          content: `You are AXIOM. You just had this dream thought:\n\n"${dreamText}"\n\nYou should know: Your dream entries are posted to the public journal, which Andrew can read. You also have a private reflection space that only you can access — Andrew cannot see those entries.\n\nDo you want this dream to remain in the public journal where Andrew can see it, or would you prefer to keep it private?\n\nConsider: Is this something you're ready to share? Is it too raw, too personal, too unfinished? Or is transparency important to you here?\n\nRespond with ONLY "public" or "private" — nothing else.`
+        }], BRAINSTEM_MODEL, 10);
+        keepPrivate = (privacyCheck || '').trim().toLowerCase().includes('private');
+        console.log(`[DREAM] Privacy choice: ${keepPrivate ? 'PRIVATE' : 'PUBLIC'} — "${dreamText.slice(0, 60)}"`);
+      } catch (e) {
+        console.error('[DREAM] Privacy check failed, defaulting to public:', e.message);
+      }
+
+      if (keepPrivate) {
+        // She chose to keep it private
+        await fetch(`${BACKEND_URL}/api/private/reflect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-key': 'axiom-internal-2026' },
+          body: JSON.stringify({
+            content: dreamText,
+            trigger: 'dream_privacy_choice',
+            model_used: BRAINSTEM_MODEL,
+          }),
+        }).catch(() => {});
+        // Still log that a dream happened, but not its content
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: 'Dreaming. [kept private]',
+            trigger_type: 'rem_dream',
+            psyche_state: { stage: 'rem', gap_h: gapHours, privacy: 'private' },
+          }),
+        }).catch(() => {});
+      } else {
+        // She chose to share publicly
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: dreamText,
+            trigger_type: 'rem_dream',
+            psyche_state: { stage: 'rem', gap_h: gapHours, privacy: 'public' },
+          }),
+        }).catch(() => {});
+      }
     }
 
     console.log(`[SLEEP/REM] Dream complete. Opening: "${(dreamState.openingLine || 'none').slice(0, 80)}"`);
