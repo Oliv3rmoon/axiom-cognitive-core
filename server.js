@@ -2831,6 +2831,21 @@ async function autonomousWork(gapHours) {
         step._predicted_success = pred.predicted_success_probability;
         console.log(`[WORLD MODEL] Prediction: ${(pred.predicted_success_probability * 100).toFixed(0)}% success, confidence ${(pred.confidence * 100).toFixed(0)}%`);
       } catch (e) { console.error('[WORLD MODEL] Predict failed:', e.message); }
+
+      // PHASE 4: Update attention schema — what is AXIOM focusing on?
+      fetch(`${COGCORE_V2_URL}/attention/update`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: `[${step.action}] ${step.description.slice(0, 80)}`,
+          target_type: 'step',
+          signals: {
+            curiosity_score: step._curiosity || 0.5,
+            prediction_error: step._predicted_success ? (1 - step._predicted_success) : 0.5,
+            goal_relevance: targetGoal.importance || 0.5,
+            broadcast_salience: 0.5,
+          },
+        }),
+      }).catch(e => console.error('[ATTENTION] Update failed:', e.message));
     }
 
     let result = '';
@@ -3001,6 +3016,23 @@ async function autonomousWork(gapHours) {
           mechanism: `${step.description.slice(0, 60)} → ${(result || '').slice(0, 60)}`,
         }),
       }).catch(e => console.error('[CAUSAL] Relationship add failed:', e.message));
+
+      // PHASE 4: Update predictive hierarchy (level 0 = step outcomes)
+      if (step._predicted_success !== undefined) {
+        fetch(`${COGCORE_V2_URL}/prediction-hierarchy/update`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            level: 0,
+            predicted: step._predicted_success,
+            actual: isFailed ? 0.0 : 1.0,
+            context: `[${step.action}] ${step.description.slice(0, 80)}`,
+          }),
+        }).then(r => r.json()).then(d => {
+          if (d.error_at_level_0 !== undefined) {
+            console.log(`[PREDICTIVE] L0 error: ${(d.error_at_level_0 * 100).toFixed(0)}% → L1: ${(d.propagated_to_level_1 * 100).toFixed(0)}% → L2: ${(d.propagated_to_level_2 * 100).toFixed(0)}%`);
+          }
+        }).catch(e => console.error('[PREDICTIVE] Update failed:', e.message));
+      }
     }
 
     sleepState.thoughtCount++;
@@ -3144,7 +3176,25 @@ async function createPlanForGoal(goal) {
         }
       } catch {}
 
-      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model + memory + active inference + dreamcoder + causal into plan`);
+      // PHASE 4: Attention Schema introspection — what should AXIOM focus on?
+      try {
+        const attnRes = await fetch(`${COGCORE_V2_URL}/attention/focus`).then(r => r.json());
+        if (attnRes.predicted_next_shift?.likely_target) {
+          v2Context += `\n\nATTENTION STATE: Currently focused on "${attnRes.current_focus?.target?.slice(0, 50) || 'unknown'}". Predicted next shift: "${attnRes.predicted_next_shift.likely_target}" (${(attnRes.predicted_next_shift.probability * 100).toFixed(0)}% likely)`;
+        }
+      } catch {}
+
+      // PHASE 4: Predictive hierarchy — what's the current prediction landscape?
+      try {
+        const predRes = await fetch(`${COGCORE_V2_URL}/prediction-hierarchy/state`).then(r => r.json());
+        const levels = predRes.levels || [];
+        const highErrorLevel = levels.find(l => l.mean_prediction_error > 0.5);
+        if (highErrorLevel) {
+          v2Context += `\n\nPREDICTIVE WARNING: High prediction error at level "${highErrorLevel.name}" (${(highErrorLevel.mean_prediction_error * 100).toFixed(0)}%). Consider approaches that reduce uncertainty here.`;
+        }
+      } catch {}
+
+      if (v2Context) console.log(`[COGCORE V2] Injected: all 4 phases into plan creation`);
     } catch (e) { console.error('[COGCORE V2] Plan injection failed:', e.message); }
   }
 
