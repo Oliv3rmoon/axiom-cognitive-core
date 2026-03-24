@@ -2734,6 +2734,44 @@ async function autonomousWork(gapHours) {
           }
         } catch {}
 
+        // PHASE 3: Trigger DreamCoder sleep (extract primitives) every 5 completed goals
+        if (COGCORE_V2_URL) {
+          try {
+            const goalsRes = await fetch(`${BACKEND_URL}/api/goals`);
+            const goalsData = await goalsRes.json();
+            const achievedCount = (goalsData.goals || []).filter(g => g.status === 'achieved').length;
+            if (achievedCount % 5 === 0 && achievedCount > 0) {
+              console.log(`[DREAMCODER] ${achievedCount} goals achieved — triggering abstraction sleep`);
+              fetch(`${COGCORE_V2_URL}/dreamcoder/sleep`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ min_solutions: 3 }),
+              }).then(r => r.json()).then(d => {
+                if (d.new_primitives?.length) console.log(`[DREAMCODER] Extracted ${d.new_primitives.length} new primitives!`);
+              }).catch(() => {});
+            }
+          } catch {}
+
+          // PHASE 3: Trigger causal structure learning
+          fetch(`${COGCORE_V2_URL}/causal/learn`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ min_evidence: 3 }),
+          }).then(r => r.json()).then(d => {
+            if (d.new_relationships) console.log(`[CAUSAL] Learned ${d.new_relationships} new causal relationships`);
+          }).catch(() => {});
+
+          // PHASE 3: Broadcast goal achievement to Global Workspace
+          fetch(`${COGCORE_V2_URL}/workspace/broadcast`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              source_module: 'goal_engine',
+              signal_type: 'goal_achieved',
+              content: { goal: targetGoal.goal.slice(0, 80), id: targetGoal.id },
+              salience: 0.9,
+              urgency: 0.5,
+            }),
+          }).catch(() => {});
+        }
+
         await loadGoals();
         return;
       }
@@ -2939,6 +2977,30 @@ async function autonomousWork(gapHours) {
           was_expected: !isFailed,
         }),
       }).catch(e => console.error('[ACTIVE INFERENCE] Beliefs update failed:', e.message));
+
+      // PHASE 3: Broadcast step outcome to Global Workspace
+      fetch(`${COGCORE_V2_URL}/workspace/broadcast`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_module: 'execution',
+          signal_type: isFailed ? 'step_failure' : 'step_success',
+          content: { action: step.action, goal: targetGoal.goal.slice(0, 60), result: (result || '').slice(0, 100), success: !isFailed },
+          salience: isFailed ? 0.85 : 0.4,
+          urgency: isFailed ? 0.8 : 0.3,
+        }),
+      }).catch(e => console.error('[WORKSPACE] Broadcast failed:', e.message));
+
+      // PHASE 3: Feed causal learner with action-outcome pair
+      fetch(`${COGCORE_V2_URL}/causal/add-relationship`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cause: step.action,
+          effect: isFailed ? 'step_failure' : 'step_success',
+          strength: isFailed ? -0.3 : 0.3,
+          evidence_count: 1,
+          mechanism: `${step.description.slice(0, 60)} → ${(result || '').slice(0, 60)}`,
+        }),
+      }).catch(e => console.error('[CAUSAL] Relationship add failed:', e.message));
     }
 
     sleepState.thoughtCount++;
@@ -3053,7 +3115,36 @@ async function createPlanForGoal(goal) {
         v2Context += `\n\nACTIVE INFERENCE SUGGESTS: Best actions: ${ranked}. Exploration tendency: ${(aiPolicy.value.exploration_exploitation_ratio * 100).toFixed(0)}%`;
       }
 
-      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model + memory + active inference into plan`);
+      // PHASE 3: DreamCoder compose — suggest solution from library primitives
+      try {
+        const dcRes = await fetch(`${COGCORE_V2_URL}/dreamcoder/compose`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task: goal.goal, domain: goal.origin || 'autonomous' }),
+        }).then(r => r.json());
+        if (dcRes.suggested_steps?.length && dcRes.confidence > 0.5) {
+          v2Context += `\n\nDREAMCODER SUGGESTS (from learned primitives, confidence ${(dcRes.confidence*100).toFixed(0)}%): ${dcRes.suggested_steps.join(' → ')}`;
+          if (dcRes.similar_solved_tasks?.length) {
+            v2Context += `\nSimilar solved tasks: ${dcRes.similar_solved_tasks.join(', ')}`;
+          }
+        }
+      } catch {}
+
+      // PHASE 3: Causal reasoner — predict intervention outcomes
+      try {
+        const causalRes = await fetch(`${COGCORE_V2_URL}/causal/intervene`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            intervention: `do(goal_type=${goal.origin || 'autonomous'})`,
+            given: { goal: goal.goal.slice(0, 50) },
+            query: 'P(success)',
+          }),
+        }).then(r => r.json());
+        if (causalRes.recommendation) {
+          v2Context += `\n\nCAUSAL REASONING: ${causalRes.explanation?.slice(0, 150) || causalRes.recommendation}`;
+        }
+      } catch {}
+
+      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model + memory + active inference + dreamcoder + causal into plan`);
     } catch (e) { console.error('[COGCORE V2] Plan injection failed:', e.message); }
   }
 
