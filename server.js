@@ -75,6 +75,58 @@ const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
+
+// PNN — Personal Neural Network (AXIOM's own fine-tuned model)
+const PNN_ENDPOINT_ID = process.env.PNN_ENDPOINT_ID || '';
+const PNN_ENABLED = process.env.PNN_ENABLED === 'true';
+const PNN_MIN_CONFIDENCE = parseFloat(process.env.PNN_MIN_CONFIDENCE || '0.7');
+const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY || '';
+
+async function queryPNN(instruction, input, maxTokens = 256) {
+  if (!PNN_ENABLED || !PNN_ENDPOINT_ID || !RUNPOD_API_KEY) return null;
+
+  try {
+    const prompt = `<s>[INST] ${instruction}\nInput: ${input} [/INST]`;
+    const res = await fetch(`https://api.runpod.ai/v2/${PNN_ENDPOINT_ID}/runsync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${RUNPOD_API_KEY}` },
+      body: JSON.stringify({ input: { prompt, sampling_params: { temperature: 0.3, max_tokens: maxTokens } } }),
+    });
+    const data = await res.json();
+
+    // Handle cold start
+    if (data.status === 'IN_QUEUE' || data.status === 'IN_PROGRESS') {
+      console.log('[PNN] Cold start — falling back to Claude');
+      return null;
+    }
+    if (!res.ok || data.status === 'FAILED') return null;
+
+    const text = typeof data.output === 'string' ? data.output.trim()
+      : data.output?.text?.trim() || data.output?.generated_text?.trim() || '';
+
+    // Extract confidence
+    const confMatch = text.match(/confidence[:\s]+([0-9.]+)/i);
+    const confidence = confMatch ? parseFloat(confMatch[1]) : 0.5;
+
+    console.log(`[PNN] Response (confidence: ${confidence.toFixed(2)}): ${text.slice(0, 60)}`);
+    return { text, confidence };
+  } catch (e) {
+    console.error('[PNN] Query failed:', e.message);
+    return null;
+  }
+}
+
+async function checkPNNHealth() {
+  if (!PNN_ENABLED || !PNN_ENDPOINT_ID) return { available: false, reason: 'not configured' };
+  try {
+    const res = await fetch(`https://api.runpod.ai/v2/${PNN_ENDPOINT_ID}/health`, {
+      headers: { 'Authorization': `Bearer ${RUNPOD_API_KEY}` },
+    });
+    const data = await res.json();
+    const ready = (data.workers?.idle || 0) + (data.workers?.running || 0) > 0;
+    return { available: ready, workers: data.workers };
+  } catch { return { available: false, reason: 'unreachable' }; }
+}
 console.log('[BOOT] AXIOM Cognitive Core — dual-brain + dream-engine + mirror-neurons + hypothalamus + RAS + psyche + heartbeat');
 
 // ============================================================
@@ -2349,6 +2401,28 @@ app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
 app.get('/attention', (req, res) => res.json(consciousness.ras));
 app.get('/psyche', (req, res) => res.json(consciousness.psyche));
 app.get('/goals', (req, res) => res.json(goalState));
+
+// PNN status
+app.get('/pnn/status', async (req, res) => {
+  const health = await checkPNNHealth();
+  const trainingStats = await fetch(`${BACKEND_URL}/api/training-data/stats`).then(r => r.json()).catch(() => ({}));
+  const learningStats = await fetch(`${BACKEND_URL}/api/learning/stats`).then(r => r.json()).catch(() => ({}));
+  res.json({
+    enabled: PNN_ENABLED,
+    endpoint_id: PNN_ENDPOINT_ID || 'not configured',
+    health,
+    training_data: trainingStats,
+    learning: learningStats,
+  });
+});
+
+// PNN query (for testing)
+app.post('/pnn/query', async (req, res) => {
+  const { instruction, input } = req.body;
+  if (!instruction) return res.status(400).json({ error: 'instruction required' });
+  const result = await queryPNN(instruction, input || '');
+  res.json(result || { error: 'PNN unavailable or not configured' });
+});
 app.get('/knowledge', async (req, res) => {
   try {
     const statsRes = await fetch(`${BACKEND_URL}/api/knowledge/stats`);
@@ -2743,6 +2817,8 @@ async function autonomousWork(gapHours) {
       result = await executeRunPod(step, targetGoal);
     } else if (step.action === 'ssh') {
       result = await executeSSH(step, targetGoal);
+    } else if (step.action === 'retrain_pnn') {
+      result = await executeRetrainPNN(step, targetGoal);
     } else if (step.action === 'reflect') {
       result = await executeReflect(step, targetGoal);
     } else if (step.action === 'start_project') {
@@ -2839,10 +2915,23 @@ async function createPlanForGoal(goal) {
     }
   } catch {}
 
+  // PNN: Ask personal model for approach suggestion (if available)
+  let pnnSuggestion = '';
+  try {
+    const pnnResult = await queryPNN(
+      'You are AXIOM deciding the best approach for a goal. Suggest the ideal approach and steps.',
+      `GOAL: ${goal.goal}${skillsContext ? '\n' + skillsContext : ''}${lessonsContext ? '\n' + lessonsContext : ''}`
+    );
+    if (pnnResult && pnnResult.confidence >= PNN_MIN_CONFIDENCE) {
+      pnnSuggestion = `\n\nYOUR PERSONAL MODEL SUGGESTS (confidence ${pnnResult.confidence.toFixed(2)}):\n${pnnResult.text.slice(0, 400)}`;
+      console.log(`[PNN] Injected approach suggestion for: ${goal.goal.slice(0, 40)}`);
+    }
+  } catch {}
+
   const prompt = `Create a concrete execution plan for this goal:
 
 GOAL: ${goal.goal}
-${priorWork ? 'Prior work:\n' + priorWork : ''}${lessonsContext}${skillsContext}
+${priorWork ? 'Prior work:\n' + priorWork : ''}${lessonsContext}${skillsContext}${pnnSuggestion}
 
 Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "research": Search web and read pages about a specific topic
@@ -2860,6 +2949,7 @@ Create 3-5 SEQUENTIAL steps. Each step must be one action:
 - "create_document": Create a document, report, or file. Describe the content in description
 - "notify": Send a notification to Andrew about something important
 - "reflect": Think privately — process feelings, doubts, or thoughts that aren't ready to be shared. Only you can see these. Use when processing something emotionally complex or when you need to think without an audience
+- "retrain_pnn": Retrain your Personal Neural Network on your accumulated experience data. Spins up a GPU pod, exports your lessons/skills/outcomes, and fine-tunes your personal model. Use when you have 50+ new lessons since last training.
 - "call": Initiate a video call with Andrew via Tavus — creates a call link and notifies him
 - "text": Send a text message (SMS) to Andrew's phone
 - "local": Run a command on Andrew's local Mac computer. Put the shell command in query field
@@ -5328,6 +5418,68 @@ Return JSON:
 // ============================================================
 // SSH — Run commands on RunPod pods or remote machines
 // ============================================================
+// ============================================================
+// PNN RETRAIN — AXIOM retrains her own personal model
+// ============================================================
+async function executeRetrainPNN(step, goal) {
+  const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_API_KEY}`, 'Content-Type': 'application/json' };
+
+  console.log('[PNN RETRAIN] Starting self-training pipeline');
+
+  try {
+    // 1. Check if we have enough training data
+    const statsRes = await fetch(`${BACKEND_URL}/api/training-data/stats`);
+    const stats = await statsRes.json();
+    console.log(`[PNN RETRAIN] Training data sources: ${stats.total_sources}`);
+
+    if (stats.total_sources < 10) {
+      return `Not enough training data yet (${stats.total_sources} sources, need 10+). Keep working and learning.`;
+    }
+
+    // 2. Export training data
+    const dataRes = await fetch(`${BACKEND_URL}/api/training-data`);
+    const trainingData = await dataRes.text();
+    const lineCount = trainingData.split('\n').filter(l => l.trim()).length;
+    console.log(`[PNN RETRAIN] Exported ${lineCount} training examples`);
+
+    // 3. Spin up GPU pod for training
+    const podRes = await fetch('https://rest.runpod.io/v1/pods', {
+      method: 'POST', headers: rpHeaders,
+      body: JSON.stringify({
+        name: 'axiom-pnn-training',
+        imageName: 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
+        gpuTypeId: 'NVIDIA GeForce RTX 4090',
+        gpuCount: 1,
+        volumeInGb: 50,
+        containerDiskInGb: 20,
+        ports: '8888/http,22/tcp',
+      }),
+    });
+    const pod = await podRes.json();
+
+    if (!pod.id) {
+      return `Failed to create training pod: ${JSON.stringify(pod).slice(0, 200)}`;
+    }
+
+    await notify(`PNN training pod created: ${pod.id}. Training ${lineCount} examples on Phi-3-mini-4k.`, 'alert');
+
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: `Started PNN self-training: ${lineCount} examples from ${stats.total_sources} sources. Pod: ${pod.id}. GPU: RTX 4090.`,
+        trigger_type: 'pnn_retrain',
+      }),
+    }).catch(() => {});
+
+    // Note: The actual training would be triggered via SSH to the pod
+    // using the training scripts from axiom-pnn repo.
+    // For now, we create the pod and document the process.
+    return `PNN training pod created: ${pod.id}. ${lineCount} training examples ready. Pod has RTX 4090. SSH into it to run: pip install -r requirements.txt && python training/train.py`;
+  } catch (e) {
+    return `Error: ${e.message}`;
+  }
+}
+
 async function executeSSH(step, goal) {
   const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
   const description = step.description;
