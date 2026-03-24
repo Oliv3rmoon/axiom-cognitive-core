@@ -2919,6 +2919,26 @@ async function autonomousWork(gapHours) {
           console.log(`[WORLD MODEL] Prediction error: ${(d.prediction_error * 100).toFixed(1)}% | Curiosity: ${(d.curiosity_signal * 100).toFixed(1)}%`);
         }
       }).catch(e => console.error('[WORLD MODEL] Update failed:', e.message));
+
+      // PHASE 2: Store experience in Hopfield episodic memory
+      fetch(`${COGCORE_V2_URL}/hopfield/store`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `[${step.action}] ${step.description.slice(0, 100)} → ${(result || '').slice(0, 100)}`,
+          context: `goal:${targetGoal.goal.slice(0, 60)} success:${!isFailed}`,
+          importance: isFailed ? 0.8 : 0.5,
+        }),
+      }).catch(e => console.error('[HOPFIELD] Store failed:', e.message));
+
+      // PHASE 2: Update active inference beliefs (precision adjustment)
+      fetch(`${COGCORE_V2_URL}/active-inference/update-beliefs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action_taken: step.action,
+          observation: (result || '').slice(0, 300),
+          was_expected: !isFailed,
+        }),
+      }).catch(e => console.error('[ACTIVE INFERENCE] Beliefs update failed:', e.message));
     }
 
     sleepState.thoughtCount++;
@@ -2967,11 +2987,11 @@ async function createPlanForGoal(goal) {
     }
   } catch {}
 
-  // COGCORE V2: Get abstraction principles, curiosity signal, and self-model
+  // COGCORE V2: Get abstraction principles, curiosity, self-model, episodic memory, and active inference
   let v2Context = '';
   if (COGCORE_V2_URL) {
     try {
-      const [abstraction, curiosity, selfModel] = await Promise.allSettled([
+      const [abstraction, curiosity, selfModel, memory, aiPolicy] = await Promise.allSettled([
         fetch(`${COGCORE_V2_URL}/abstraction/apply`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ goal: goal.goal }),
@@ -2981,6 +3001,20 @@ async function createPlanForGoal(goal) {
           body: JSON.stringify({ goal: goal.goal }),
         }).then(r => r.json()),
         fetch(`${COGCORE_V2_URL}/self-model/state`).then(r => r.json()),
+        // PHASE 2: Retrieve relevant past experiences from Hopfield memory
+        fetch(`${COGCORE_V2_URL}/hopfield/retrieve`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: goal.goal, top_k: 3 }),
+        }).then(r => r.json()),
+        // PHASE 2: Active inference — rank action types by Expected Free Energy
+        fetch(`${COGCORE_V2_URL}/active-inference/compare-policies`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            current_state: goal.goal,
+            policies: ['read_codebase', 'research', 'propose_change', 'build_and_test', 'audit', 'browse', 'reflect'],
+            goal: goal.goal,
+          }),
+        }).then(r => r.json()),
       ]);
 
       if (abstraction.status === 'fulfilled' && abstraction.value.relevant_principles?.length) {
@@ -3007,7 +3041,19 @@ async function createPlanForGoal(goal) {
         }
       }
 
-      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model into plan`);
+      // PHASE 2: Inject episodic memories
+      if (memory.status === 'fulfilled' && memory.value.retrieved?.length) {
+        const memories = memory.value.retrieved.map(m => `- [${(m.similarity*100).toFixed(0)}% match] ${m.content.slice(0, 100)}`).join('\n');
+        v2Context += `\n\nRELEVANT PAST EXPERIENCES (from episodic memory):\n${memories}`;
+      }
+
+      // PHASE 2: Inject active inference action ranking
+      if (aiPolicy.status === 'fulfilled' && aiPolicy.value.ranked_policies?.length) {
+        const ranked = aiPolicy.value.ranked_policies.slice(0, 3).map(p => `${p.action} (EFE: ${p.efe?.toFixed(2) || '?'})`).join(', ');
+        v2Context += `\n\nACTIVE INFERENCE SUGGESTS: Best actions: ${ranked}. Exploration tendency: ${(aiPolicy.value.exploration_exploitation_ratio * 100).toFixed(0)}%`;
+      }
+
+      if (v2Context) console.log(`[COGCORE V2] Injected: principles + curiosity + self-model + memory + active inference into plan`);
     } catch (e) { console.error('[COGCORE V2] Plan injection failed:', e.message); }
   }
 
