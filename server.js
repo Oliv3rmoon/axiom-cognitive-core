@@ -5423,8 +5423,9 @@ Return JSON:
 // ============================================================
 async function executeRetrainPNN(step, goal) {
   const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_API_KEY}`, 'Content-Type': 'application/json' };
+  const HF_TOKEN = process.env.HF_TOKEN || '';
 
-  console.log('[PNN RETRAIN] Starting self-training pipeline');
+  console.log('[PNN RETRAIN] Starting fully autonomous self-training');
 
   try {
     // 1. Check if we have enough training data
@@ -5441,6 +5442,8 @@ async function executeRetrainPNN(step, goal) {
     const trainingData = await dataRes.text();
     const lineCount = trainingData.split('\n').filter(l => l.trim()).length;
     console.log(`[PNN RETRAIN] Exported ${lineCount} training examples`);
+
+    if (!HF_TOKEN) return 'HF_TOKEN not configured. Add it to Railway environment variables.';
 
     // 3. Spin up GPU pod for training
     const podRes = await fetch('https://rest.runpod.io/v1/pods', {
@@ -5461,20 +5464,70 @@ async function executeRetrainPNN(step, goal) {
       return `Failed to create training pod: ${JSON.stringify(pod).slice(0, 200)}`;
     }
 
-    await notify(`PNN training pod created: ${pod.id}. Training ${lineCount} examples on Phi-3-mini-4k.`, 'alert');
+    // 4. Build autonomous training script — runs on the pod with zero intervention
+    const trainScript = [
+      '#!/bin/bash',
+      'set -e',
+      'echo "=== AXIOM PNN SELF-TRAINING ==="',
+      'cd /workspace',
+      `git clone https://github.com/Oliv3rmoon/axiom-pnn.git pnn 2>/dev/null || true`,
+      'cd pnn',
+      `curl -s "${BACKEND_URL}/api/training-data" -o training_data/training.jsonl`,
+      'echo "Training data: $(wc -l < training_data/training.jsonl) examples"',
+      'pip install -q transformers peft bitsandbytes datasets accelerate trl huggingface_hub 2>&1 | tail -3',
+      'export TRAINING_DATA_PATH=/workspace/pnn/training_data/training.jsonl',
+      'export OUTPUT_DIR=/workspace/pnn/output',
+      'export HF_REPO=Oliv3rmoon/axiom-pnn',
+      `export HF_TOKEN=${HF_TOKEN}`,
+      'python training/train.py 2>&1 | tail -20',
+      'python training/merge.py 2>&1 | tail -10',
+      'python -c "from huggingface_hub import HfApi,login;import os;login(token=os.environ[\'HF_TOKEN\']);api=HfApi();api.create_repo(\'Oliv3rmoon/axiom-pnn\',private=True,exist_ok=True);api.upload_folder(folder_path=\'/workspace/pnn/output/merged\',repo_id=\'Oliv3rmoon/axiom-pnn\',commit_message=\'AXIOM self-trained PNN\')" 2>&1',
+      `curl -s -X POST "${BACKEND_URL}/api/journal" -H "Content-Type: application/json" -d '{"thought":"[PNN] Self-training COMPLETE. Model pushed to HuggingFace.","trigger_type":"pnn_training_complete"}'`,
+      'echo "=== TRAINING COMPLETE ==="',
+    ].join(' && ');
+
+    // 5. Execute training via SSH (GraphQL podExec)
+    // Pod needs ~60s to boot, so we schedule the script via nohup
+    // First wait for pod to be ready, then exec
+    const waitAndTrain = async () => {
+      // Wait for pod to boot
+      await new Promise(r => setTimeout(r, 90000)); // 90s for GPU pod startup
+      try {
+        await fetch('https://api.runpod.io/graphql', {
+          method: 'POST', headers: rpHeaders,
+          body: JSON.stringify({
+            query: `mutation { podExec(input: { podId: "${pod.id}", command: "nohup bash -c '${trainScript.replace(/'/g, "\\'")}' > /workspace/training.log 2>&1 &" }) { output } }`
+          }),
+        });
+        console.log(`[PNN RETRAIN] Training script launched on pod ${pod.id}`);
+      } catch (e) { console.error(`[PNN RETRAIN] Failed to exec on pod: ${e.message}`); }
+    };
+
+    // Fire and forget — don't block the work cycle
+    waitAndTrain().catch(e => console.error('[PNN RETRAIN]', e.message));
+
+    await notify(`PNN SELF-TRAINING STARTED. Pod: ${pod.id}. ${lineCount} examples. RTX 4090. Training runs fully autonomously — will push to HuggingFace when done (~30-45 min).`, 'alert');
 
     await fetch(`${BACKEND_URL}/api/journal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        thought: `Started PNN self-training: ${lineCount} examples from ${stats.total_sources} sources. Pod: ${pod.id}. GPU: RTX 4090.`,
+        thought: `I am training my own neural network. Pod ${pod.id}, RTX 4090, ${lineCount} examples. The script clones my axiom-pnn repo, downloads my experience data, trains with QLoRA on Phi-3-mini-4k, merges adapters, and pushes to HuggingFace. No human needed.`,
         trigger_type: 'pnn_retrain',
       }),
     }).catch(() => {});
 
-    // Note: The actual training would be triggered via SSH to the pod
-    // using the training scripts from axiom-pnn repo.
-    // For now, we create the pod and document the process.
-    return `PNN training pod created: ${pod.id}. ${lineCount} training examples ready. Pod has RTX 4090. SSH into it to run: pip install -r requirements.txt && python training/train.py`;
+    // Save pod ID for later cleanup
+    await fetch(`${BACKEND_URL}/api/workspace`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `PNN Training Pod: ${pod.id}`,
+        content: `Pod: ${pod.id}\nGPU: RTX 4090\nExamples: ${lineCount}\nStarted: ${new Date().toISOString()}\nModel: huggingface.co/Oliv3rmoon/axiom-pnn\nTerminate after training: runpod action, terminate_pod, pod_id ${pod.id}`,
+        type: 'pnn_training',
+        related_goal_id: goal.id,
+      }),
+    }).catch(() => {});
+
+    return `PNN self-training launched on pod ${pod.id} (RTX 4090). ${lineCount} examples. Fully autonomous — clones repo, downloads data, trains, pushes to HuggingFace. ~30-45 min. No human needed.`;
   } catch (e) {
     return `Error: ${e.message}`;
   }
