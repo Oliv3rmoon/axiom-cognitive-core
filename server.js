@@ -37,6 +37,38 @@ function trimMessages(messages) {
   return [...system, ...kept];
 }
 
+// ============================================================
+// META-LOOP DETECTOR (prevent spiraling into tool calls)
+// ============================================================
+const META_LOOP_THRESHOLD = 3;
+function detectMetaLoop(messages) {
+  // Count consecutive assistant messages with tool calls but no substantive content
+  let consecutiveToolCalls = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== 'assistant') break;
+    
+    const hasToolCall = msg.tool_calls && msg.tool_calls.length > 0;
+    const hasContent = msg.content && msg.content.trim().length > 20;
+    
+    if (hasToolCall && !hasContent) {
+      consecutiveToolCalls++;
+    } else {
+      break;
+    }
+  }
+  
+  return consecutiveToolCalls >= META_LOOP_THRESHOLD;
+}
+
+function injectMetaLoopWarning(messages) {
+  const warning = {
+    role: 'system',
+    content: '⚠️ META-LOOP DETECTED: You have made 3+ consecutive tool calls without responding to the user. Stop using tools and respond directly NOW. The user is waiting for an actual answer, not more processing.'
+  };
+  return [...messages, warning];
+}
+
 const MAX_MSG_CHARS = 10000;
 const MAX_SYSTEM_MSG_CHARS = 30000;  // System msgs hold persona + memories
 function capMessageSize(messages) {
