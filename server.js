@@ -72,6 +72,63 @@ function injectMetaLoopWarning(messages) {
 const MAX_MSG_CHARS = 10000;
 
 // ============================================================
+// EXECUTION TRACER FOR CONVERSATION TURNS
+// Instruments every function call, state transition, and timing
+// to map complete tool-calling execution flow
+// ============================================================
+class ExecutionTracer {
+  constructor() {
+    this.traces = [];
+    this.startTime = null;
+    this.currentTurnId = null;
+  }
+
+  startTurn(turnId) {
+    this.currentTurnId = turnId;
+    this.startTime = Date.now();
+    this.traces = [];
+    this.log('TURN_START', { turnId });
+  }
+
+  log(event, data = {}) {
+    if (!this.currentTurnId) return;
+    const timestamp = Date.now();
+    const elapsed = this.startTime ? timestamp - this.startTime : 0;
+    this.traces.push({
+      turnId: this.currentTurnId,
+      event,
+      timestamp,
+      elapsed,
+      ...data
+    });
+  }
+
+  endTurn(status = 'completed') {
+    this.log('TURN_END', { status, totalTime: Date.now() - this.startTime });
+    const summary = this.summarize();
+    console.log('[TRACE]', JSON.stringify(summary, null, 2));
+    return summary;
+  }
+
+  summarize() {
+    const events = this.traces.reduce((acc, t) => {
+      acc[t.event] = (acc[t.event] || 0) + 1;
+      return acc;
+    }, {});
+    const totalTime = this.traces.length > 0 ? this.traces[this.traces.length - 1].elapsed : 0;
+    return {
+      turnId: this.currentTurnId,
+      totalTime,
+      eventCounts: events,
+      traceCount: this.traces.length,
+      traces: this.traces
+    };
+  }
+}
+
+const executionTracer = new ExecutionTracer();
+
+// ============================================================
 // CONVERSATION MOMENTUM TRACKER
 // Built from AXIOM's research on turn-taking, Gricean maxims,
 // repair mechanisms, and discourse markers
