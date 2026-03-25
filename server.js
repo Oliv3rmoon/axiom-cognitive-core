@@ -4724,16 +4724,42 @@ async function sendEmail(to, subject, body, goalId) {
     }).catch(() => {});
     return { success: false, error: 'No RESEND_KEY' };
   }
-  try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: 'AXIOM <onboarding@resend.dev>', to: [to], subject, html: body }),
-    });
-    const data = await res.json();
-    console.log(`[EMAIL] Sent to ${to}: "${subject}" — ${data.id || 'error'}`);
-    return { success: !!data.id, id: data.id, error: data.message };
-  } catch (e) { return { success: false, error: e.message }; }
+
+  // Try with custom domain first, fall back to onboarding@resend.dev
+  const fromAddresses = [
+    process.env.RESEND_FROM || null,  // Custom verified domain if set
+    'AXIOM <onboarding@resend.dev>',  // Resend test domain (only works for account owner email)
+  ].filter(Boolean);
+
+  for (const fromAddr of fromAddresses) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: fromAddr, to: [to], subject, html: body }),
+      });
+      const data = await res.json();
+      if (data.id) {
+        console.log(`[EMAIL] ✅ Sent via ${fromAddr} to ${to}: "${subject}"`);
+        return { success: true, id: data.id };
+      }
+      console.log(`[EMAIL] Failed with ${fromAddr}: ${data.message || JSON.stringify(data)}`);
+      // If it's the "testing emails" error, try next from address
+      if (data.message?.includes('testing emails')) continue;
+      return { success: false, error: data.message };
+    } catch (e) {
+      console.error(`[EMAIL] Error with ${fromAddr}:`, e.message);
+    }
+  }
+
+  // All from addresses failed — try text as fallback
+  console.log('[EMAIL] All from addresses failed — falling back to text notification');
+  const textResult = await sendText(`📧 AXIOM email: ${subject} — ${body.replace(/<[^>]+>/g, '').slice(0, 200)}`);
+  if (textResult.success) {
+    return { success: true, fallback: 'text', note: 'Email failed, sent as text instead' };
+  }
+
+  return { success: false, error: 'Email blocked by Resend free tier. Add RESEND_FROM env var with verified domain (e.g. "AXIOM <axiom@yourdomain.com>") or verify NOTIFY_EMAIL in Resend dashboard → Contacts → Add Audience.' };
 }
 
 // Email step in execution plans
@@ -4810,9 +4836,15 @@ async function notify(message, type = 'info') {
     } catch (e) { console.error('[NOTIFY] Webhook failed:', e.message); }
   }
 
-  // Email for important stuff
-  if (NOTIFY_EMAIL && (type === 'alert' || type === 'purchase' || type === 'error')) {
-    await sendEmail(NOTIFY_EMAIL, `[AXIOM ${type.toUpperCase()}] ${message.slice(0, 50)}`, `<p>${message}</p>`);
+  // For important stuff, try text first (more reliable), then email
+  if (type === 'alert' || type === 'purchase' || type === 'error') {
+    // Try text message (works if Twilio is set up)
+    const textResult = await sendText(`[AXIOM ${type}] ${message.slice(0, 140)}`);
+    
+    // Also try email (works if Resend domain is verified)
+    if (NOTIFY_EMAIL) {
+      await sendEmail(NOTIFY_EMAIL, `[AXIOM ${type.toUpperCase()}] ${message.slice(0, 50)}`, `<p>${message}</p>`);
+    }
   }
 }
 
@@ -5070,9 +5102,22 @@ async function sendText(message, to) {
   const TWILIO_FROM = process.env.TWILIO_FROM;
   const NOTIFY_PHONE = to || process.env.NOTIFY_PHONE;
 
-  if (!TWILIO_SID || !TWILIO_FROM || !NOTIFY_PHONE) {
-    console.log(`[TEXT] Missing Twilio config — logging text intent: ${message.slice(0, 60)}`);
-    return { success: false, error: 'Twilio not configured' };
+  if (!TWILIO_SID || !TWILIO_TOKEN) {
+    console.log(`[TEXT] Missing TWILIO_SID or TWILIO_TOKEN`);
+    // Fall back to journal notification
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thought: `[TEXT] Would text Andrew: "${message.slice(0, 100)}" — Twilio not configured`, trigger_type: 'text_intent' }),
+    }).catch(() => {});
+    return { success: false, error: 'Missing TWILIO_SID or TWILIO_TOKEN env vars' };
+  }
+  if (!TWILIO_FROM) {
+    console.log(`[TEXT] Missing TWILIO_FROM — need a Twilio phone number`);
+    return { success: false, error: 'Missing TWILIO_FROM env var (your Twilio phone number, e.g. +1234567890)' };
+  }
+  if (!NOTIFY_PHONE) {
+    console.log(`[TEXT] Missing NOTIFY_PHONE — need Andrew's phone number`);
+    return { success: false, error: 'Missing NOTIFY_PHONE env var (Andrew\'s phone number, e.g. +1234567890)' };
   }
 
   try {
@@ -5090,7 +5135,16 @@ async function sendText(message, to) {
       console.log(`[TEXT] ✅ Sent to ${NOTIFY_PHONE}: ${message.slice(0, 40)}...`);
       return { success: true, sid: data.sid };
     }
-    return { success: false, error: data.message || JSON.stringify(data) };
+
+    // Better error diagnosis
+    const errMsg = data.message || JSON.stringify(data);
+    if (errMsg.includes('unverified')) {
+      return { success: false, error: `Twilio trial: phone ${NOTIFY_PHONE} not verified. Go to twilio.com/console → Verified Caller IDs → add Andrew's number.` };
+    }
+    if (errMsg.includes('not a valid phone number')) {
+      return { success: false, error: `Invalid phone number format. NOTIFY_PHONE must be E.164 format like +12135551234` };
+    }
+    return { success: false, error: errMsg };
   } catch (e) { return { success: false, error: e.message }; }
 }
 
