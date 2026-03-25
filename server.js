@@ -5845,12 +5845,44 @@ async function executeRunPod(step, goal) {
   const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' };
   const action = step.query || step.description || '';
   const desc = step.description || '';
+  const combined = `${desc} ${action}`.toLowerCase();
 
-  console.log(`[RUNPOD] Direct action: ${action.slice(0, 60)}`);
+  console.log(`[RUNPOD] Direct action: ${combined.slice(0, 80)}`);
 
   try {
-    // Determine what RunPod action to perform via LLM
-    const rpPrompt = `You are AXIOM deciding what RunPod API action to take.
+    // KEYWORD DETECTION — bypass LLM for obvious actions
+    let cmd = null;
+
+    if (/create.*gpu.*pod|spin.*up.*gpu|launch.*gpu|start.*gpu.*pod|create.*pod.*gpu|create.*pod.*cheap|spin.*up.*cheap/i.test(combined)) {
+      // Extract GPU type from description or default to cheapest
+      let gpuType = 'NVIDIA RTX A2000'; // cheapest at $0.12/hr
+      if (/4090/i.test(combined)) gpuType = 'NVIDIA GeForce RTX 4090';
+      else if (/3090/i.test(combined)) gpuType = 'NVIDIA GeForce RTX 3090';
+      else if (/3080/i.test(combined)) gpuType = 'NVIDIA GeForce RTX 3080';
+      else if (/3070/i.test(combined)) gpuType = 'NVIDIA GeForce RTX 3070';
+      else if (/a5000/i.test(combined)) gpuType = 'NVIDIA RTX A5000';
+      else if (/a4000/i.test(combined)) gpuType = 'NVIDIA RTX A4000';
+      else if (/a100/i.test(combined)) gpuType = 'NVIDIA A100 80GB PCIe';
+      cmd = { action: 'create_gpu_pod', gpu_type: gpuType, name: 'axiom-compute', gpu_count: 1, volume_gb: 5 };
+      console.log(`[RUNPOD] Keyword match → create_gpu_pod (${gpuType})`);
+    } else if (/create.*cpu.*pod|spin.*up.*cpu|launch.*cpu/i.test(combined)) {
+      cmd = { action: 'create_cpu_pod', name: 'axiom-cpu', volume_gb: 5 };
+      console.log('[RUNPOD] Keyword match → create_cpu_pod');
+    } else if (/stop.*pod|shut.*down/i.test(combined)) {
+      const podIdMatch = combined.match(/pod[_\s-]?id[:\s]*([a-z0-9]+)/i) || combined.match(/([a-z0-9]{10,})/);
+      cmd = { action: 'stop_pod', pod_id: podIdMatch?.[1] || '' };
+    } else if (/terminate.*pod|delete.*pod|remove.*pod/i.test(combined)) {
+      const podIdMatch = combined.match(/pod[_\s-]?id[:\s]*([a-z0-9]+)/i) || combined.match(/([a-z0-9]{10,})/);
+      cmd = { action: 'terminate_pod', pod_id: podIdMatch?.[1] || '' };
+    } else if (/list.*pod|active.*pod|running.*pod|check.*pod/i.test(combined)) {
+      cmd = { action: 'list_pods' };
+    } else if (/list.*gpu|available.*gpu|gpu.*inventory|gpu.*price/i.test(combined)) {
+      cmd = { action: 'list_gpus' };
+    }
+
+    // FALLBACK — ask LLM only if keywords didn't match
+    if (!cmd) {
+      const rpPrompt = `You are AXIOM deciding what RunPod API action to take.
 
 TASK: ${desc}
 QUERY: ${action}
@@ -5879,7 +5911,10 @@ Return ONLY JSON:
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return 'Failed to determine RunPod action';
-    const cmd = JSON.parse(match[0]);
+    cmd = JSON.parse(match[0]);
+    } // end if (!cmd) — LLM fallback
+
+    console.log(`[RUNPOD] Action: ${cmd.action}`);
 
     if (cmd.action === 'list_gpus') {
       const res = await fetch('https://api.runpod.io/graphql', {
