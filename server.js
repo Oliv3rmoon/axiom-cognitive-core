@@ -5942,24 +5942,44 @@ Return ONLY JSON:
     }
 
     if (cmd.action === 'create_gpu_pod') {
-      const res = await fetch('https://rest.runpod.io/v1/pods', {
-        method: 'POST', headers: rpHeaders,
-        body: JSON.stringify({
-          name: cmd.name || 'axiom-compute',
-          imageName: cmd.image || 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
-          gpuTypeIds: [cmd.gpu_type || 'NVIDIA GeForce RTX 4090'],
-          gpuCount: cmd.gpu_count || 1,
-          volumeInGb: cmd.volume_gb || 20,
-          containerDiskInGb: 10,
-          ports: ['8888/http', '22/tcp'],
-        }),
-      });
-      const data = await res.json();
-      if (data.id) {
-        await notify(`RunPod GPU pod created: ${cmd.name || 'axiom-compute'} (${cmd.gpu_type || 'RTX 4090'}) — ID: ${data.id}, $${data.costPerHr}/hr`, 'alert');
-        return `GPU Pod created: ${data.id} — ${data.name} (${data.machine?.gpuTypeId}) $${data.costPerHr}/hr, ${data.memoryInGb}GB RAM, ${data.vcpuCount} vCPUs`;
+      // Try multiple GPU types in order of price (cheapest first)
+      const gpuFallbacks = [
+        cmd.gpu_type,
+        'NVIDIA RTX A2000',
+        'NVIDIA GeForce RTX 3070',
+        'NVIDIA RTX A5000',
+        'NVIDIA GeForce RTX 3080',
+        'NVIDIA RTX A4000',
+        'NVIDIA GeForce RTX 3080 Ti',
+        'NVIDIA GeForce RTX 4070 Ti',
+        'NVIDIA GeForce RTX 4080',
+        'NVIDIA GeForce RTX 4090',
+      ].filter((v, i, a) => a.indexOf(v) === i); // dedupe
+
+      let lastError = '';
+      for (const gpuType of gpuFallbacks) {
+        console.log(`[RUNPOD] Trying GPU: ${gpuType}`);
+        const res = await fetch('https://rest.runpod.io/v1/pods', {
+          method: 'POST', headers: rpHeaders,
+          body: JSON.stringify({
+            name: cmd.name || 'axiom-compute',
+            imageName: cmd.image || 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
+            gpuTypeIds: [gpuType],
+            gpuCount: cmd.gpu_count || 1,
+            volumeInGb: cmd.volume_gb || 5,
+            containerDiskInGb: 5,
+            ports: ['8888/http', '22/tcp'],
+          }),
+        });
+        const data = await res.json();
+        if (data.id) {
+          await notify(`RunPod GPU pod created: ${data.name} (${data.machine?.gpuTypeId || gpuType}) — ID: ${data.id}, $${data.costPerHr}/hr`, 'alert');
+          return `GPU Pod created: ${data.id} — ${data.name} (${data.machine?.gpuTypeId || gpuType}) $${data.costPerHr}/hr, ${data.memoryInGb}GB RAM, ${data.vcpuCount} vCPUs`;
+        }
+        lastError = JSON.stringify(data).slice(0, 200);
+        console.log(`[RUNPOD] ${gpuType} unavailable: ${lastError.slice(0, 60)}`);
       }
-      return `Failed to create pod: ${JSON.stringify(data).slice(0, 300)}`;
+      return `Failed to create pod — all GPU types unavailable. Last error: ${lastError}`;
     }
 
     if (cmd.action === 'create_cpu_pod') {
