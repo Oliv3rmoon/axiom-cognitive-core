@@ -1,0 +1,49 @@
+{
+  "metadata": {
+    "source": "runpod_api",
+    "created_at": "2024-01-01T00:00:00Z",
+    "last_updated": "2024-01-01T00:00:00Z",
+    "description": "RunPod GPU inventory and pricing information",
+    "version": "1.0.0"
+  },
+  "gpu_types": [],
+  "indexed_by_id": {},
+  "indexed_by_name": {},
+  "statistics": {
+    "total_gpu_types": 0,
+    "available_instances": 0,
+    "lowest_price_per_hour": null,
+    "highest_price_per_hour": null
+  },
+  "query_filters": {
+    "by_availability": {
+      "available": [],
+      "unavailable": []
+    },
+    "by_price_range": {
+      "budget": [],
+      "mid_range": [],
+      "high_end": []
+    },
+    "by_memory": {
+      "low": [],
+      "medium": [],
+      "high": [],
+      "ultra": []
+    }
+  },
+  "recommendations": {
+    "best_value": null,
+    "most_powerful": null,
+    "development": null,
+    "production": null,
+    "inference": null,
+    "training": null
+  },
+  "notes": [
+    "This file is automatically updated via the runpod action",
+    "Prices are in USD per hour",
+    "Availability changes in real-time",
+    "Use this as a reference for GPU selection in autonomous tasks"
+  ]
+}
