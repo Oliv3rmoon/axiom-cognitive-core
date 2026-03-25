@@ -6368,11 +6368,19 @@ Available actions (as a JSON sequence):
 - {"action":"click","text":"Button Text"} — click by visible text
 - {"action":"click","selector":"#id"} — click by CSS selector
 - {"action":"type","selector":"input[name=q]","text":"search query"} — type into input
+- {"action":"fill","selector":"input[name=q]","value":"set value directly"} — set value (faster than type)
+- {"action":"select","selector":"select[name=size]","value":"M"} — select dropdown option
 - {"action":"wait","ms":2000} — wait
+- {"action":"wait","selector":".results"} — wait for element to appear
 - {"action":"extract"} — get page text
 - {"action":"extract","selector":".results"} — get specific element text
+- {"action":"screenshot"} — take a screenshot of the current page
+- {"action":"scroll","direction":"down"} — scroll the page (down/up/bottom/top)
+- {"action":"press","key":"Enter"} — press a keyboard key
+- {"action":"solve_captcha","type":"recaptcha"} — solve a CAPTCHA (recaptcha or hcaptcha)
+- {"action":"save_cookies"} — persist cookies for this domain
 
-Return a JSON array of 1-5 steps: {"steps":[...]}`;
+Return a JSON array of 1-15 steps: {"steps":[...]}`;
 
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
