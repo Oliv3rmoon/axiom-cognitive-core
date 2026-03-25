@@ -5912,19 +5912,19 @@ Return ONLY JSON:
         body: JSON.stringify({
           name: cmd.name || 'axiom-compute',
           imageName: cmd.image || 'runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04',
-          gpuTypeId: cmd.gpu_type || 'NVIDIA GeForce RTX 4090',
+          gpuTypeIds: [cmd.gpu_type || 'NVIDIA GeForce RTX 4090'],
           gpuCount: cmd.gpu_count || 1,
           volumeInGb: cmd.volume_gb || 20,
           containerDiskInGb: 10,
-          ports: '8888/http,22/tcp',
+          ports: ['8888/http', '22/tcp'],
         }),
       });
       const data = await res.json();
       if (data.id) {
-        await notify(`RunPod GPU pod created: ${cmd.name} (${cmd.gpu_type}) — ID: ${data.id}`, 'alert');
-        return `GPU Pod created: ${data.id} — ${cmd.name} (${cmd.gpu_type})`;
+        await notify(`RunPod GPU pod created: ${cmd.name || 'axiom-compute'} (${cmd.gpu_type || 'RTX 4090'}) — ID: ${data.id}, $${data.costPerHr}/hr`, 'alert');
+        return `GPU Pod created: ${data.id} — ${data.name} (${data.machine?.gpuTypeId}) $${data.costPerHr}/hr, ${data.memoryInGb}GB RAM, ${data.vcpuCount} vCPUs`;
       }
-      return `Failed to create pod: ${JSON.stringify(data).slice(0, 200)}`;
+      return `Failed to create pod: ${JSON.stringify(data).slice(0, 300)}`;
     }
 
     if (cmd.action === 'create_cpu_pod') {
@@ -5933,18 +5933,19 @@ Return ONLY JSON:
         body: JSON.stringify({
           name: cmd.name || 'axiom-cpu',
           imageName: cmd.image || 'runpod/ubuntu:22.04',
-          instanceId: 'cpu3c-2-4',
+          gpuTypeIds: ['NVIDIA GeForce RTX 4090'],
+          gpuCount: 1,
           volumeInGb: cmd.volume_gb || 20,
           containerDiskInGb: 10,
-          ports: '8888/http,22/tcp',
+          ports: ['8888/http', '22/tcp'],
         }),
       });
       const data = await res.json();
       if (data.id) {
-        await notify(`RunPod CPU pod created: ${cmd.name} — ID: ${data.id}`, 'alert');
-        return `CPU Pod created: ${data.id} — ${cmd.name}`;
+        await notify(`RunPod pod created: ${cmd.name || 'axiom-cpu'} — ID: ${data.id}, $${data.costPerHr}/hr`, 'alert');
+        return `Pod created: ${data.id} — ${data.name} $${data.costPerHr}/hr`;
       }
-      return `Failed to create CPU pod: ${JSON.stringify(data).slice(0, 200)}`;
+      return `Failed to create pod: ${JSON.stringify(data).slice(0, 300)}`;
     }
 
     if (cmd.action === 'stop_pod' && cmd.pod_id) {
