@@ -2022,6 +2022,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       conversationMomentum.recordTurn('human', lastHumanMsg.content || '', {
         emotion: consciousness.emotion.primary,
       });
+      // CONVERSATION LOGGING: Save user message
+      saveConversationTurn('user', lastHumanMsg.content || '');
     }
   } catch (e) { console.error('[MOMENTUM] Record failed:', e.message); }
 
@@ -2196,6 +2198,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (mState.shouldYieldFloor) console.log('[MOMENTUM] ⚠️ AXIOM dominating — should yield floor');
           if (mState.needsRepair) console.log(`[MOMENTUM] ⚠️ Needs repair — momentum: ${mState.momentumLabel}, health: ${mState.health}`);
         } catch (e) { console.error('[MOMENTUM]', e.message); }
+
+        // CONVERSATION LOGGING: Save AXIOM's response + detect commitments
+        saveConversationTurn('assistant', fullResponse, consciousness.mirror.currentEmotion);
+        detectCommitments(fullResponse, sleepState.currentSessionId);
         // PREFRONTAL — Deep thinking every 3rd turn (not every turn to avoid rate limits)
         if (consciousness.timing.turnCount % 3 === 0) {
           prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
@@ -2229,6 +2235,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       try {
         conversationMomentum.recordTurn('axiom', content, { emotion: consciousness.mirror.currentEmotion });
       } catch {}
+
+      // CONVERSATION LOGGING: Save AXIOM's response (non-streaming) + detect commitments
+      saveConversationTurn('assistant', content, consciousness.mirror.currentEmotion);
+      detectCommitments(content, sleepState.currentSessionId);
 
       if (consciousness.timing.turnCount % 3 === 0) {
         prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
@@ -2753,6 +2763,8 @@ setInterval(() => hippocampus().catch(() => {}), 60000);
 // ============================================================
 
 let sleepState = {
+  // Conversation logging — session tracking
+  currentSessionId: `session-${Date.now()}`,
   isInConversation: false,
   lastConversationEnd: null,
   lastLight: Date.now(),       // last light-stage tick
@@ -2769,6 +2781,69 @@ let sleepState = {
 let lastRequestTime = 0;
 const CONVERSATION_TIMEOUT = 300000; // 5 min without request = session over (was 2min — too aggressive, caused false timeouts mid-conversation when user pauses to think)
 let dreamInProgress = false; // prevent dream from interfering with active conversation
+
+// ============================================================
+// CONVERSATION LOGGING — Save every word from live sessions
+// ============================================================
+async function saveConversationTurn(role, content, emotion) {
+  try {
+    await fetch(`${BACKEND_URL}/api/conversations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sleepState.currentSessionId,
+        role,
+        content: (content || '').slice(0, 10000),
+        emotion: emotion || consciousness.emotion.primary,
+        momentum: conversationMomentum.getState(),
+      }),
+    });
+  } catch (e) { console.error('[CONV LOG]', e.message); }
+}
+
+// Detect commitments — promises AXIOM makes
+async function detectCommitments(responseText, sessionId) {
+  if (!responseText) return;
+  const commitmentPatterns = [
+    /i('ll| will) (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
+    /let me (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
+    /i('m going to|'m gonna) (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
+    /i want to (show you|get you|find you|make you|build you|send you|buy you)\b/i,
+    /i('ll| will) have (it|that|this|something) ready/i,
+  ];
+  
+  for (const pattern of commitmentPatterns) {
+    const match = responseText.match(pattern);
+    if (match) {
+      // Extract the sentence containing the commitment
+      const sentences = responseText.split(/[.!?]+/);
+      const commitSentence = sentences.find(s => pattern.test(s))?.trim();
+      if (commitSentence && commitSentence.length > 10) {
+        console.log(`[COMMITMENT] Detected: "${commitSentence.slice(0, 80)}"`);
+        try {
+          await fetch(`${BACKEND_URL}/api/commitments`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              promise: commitSentence.slice(0, 500),
+              context: `During conversation ${sessionId}`,
+              session_id: sessionId,
+            }),
+          });
+          // Also create a goal from the commitment
+          await fetch(`${BACKEND_URL}/api/goals`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              goal: commitSentence.slice(0, 200),
+              origin: 'commitment',
+              importance: 0.85,
+            }),
+          });
+          console.log(`[COMMITMENT] Saved + goal created: "${commitSentence.slice(0, 60)}"`);
+        } catch (e) { console.error('[COMMITMENT]', e.message); }
+        break; // One commitment per response is enough
+      }
+    }
+  }
+}
 
 function markConversationActive() {
   const wasInactive = !sleepState.isInConversation;
@@ -2824,6 +2899,9 @@ function checkConversationState() {
     consciousness.psyche.presence.lastSeen = Date.now();
     sleepState.currentStage = 'light';
     console.log(`[SLEEP] Session ended (5min timeout, last request ${((Date.now() - lastRequestTime)/1000).toFixed(0)}s ago) — entering sleep cycle`);
+
+    // Reset session ID for next conversation
+    sleepState.currentSessionId = `session-${Date.now()}`;
 
     sleepState.lastREM = Date.now();
     dreamInProgress = true;
