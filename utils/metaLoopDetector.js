@@ -168,4 +168,10 @@ class MetaLoopDetector {
    * Manually reset the detector
    */
   reset() {
-    this.consecutiveTool
+    this.consecutiveToolCalls = 0;
+    this.lastResponseType = null;
+    this.loopHistory = [];
+  }
+}
+
+module.exports = MetaLoopDetector;

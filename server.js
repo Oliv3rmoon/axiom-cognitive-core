@@ -70,6 +70,98 @@ function injectMetaLoopWarning(messages) {
 }
 
 const MAX_MSG_CHARS = 10000;
+
+// ============================================================
+// CONVERSATION MOMENTUM TRACKER
+// Built from AXIOM's research on turn-taking, Gricean maxims,
+// repair mechanisms, and discourse markers
+// ============================================================
+const conversationMomentum = {
+  turns: [],
+  momentum: 0.5,
+  balance: 0.5,
+  topicCoherence: 1.0,
+  repairCount: 0,
+  engagementSignals: [],
+  griceanViolations: [],
+
+  recordTurn(role, content, signals = {}) {
+    const now = Date.now();
+    const gap = this.turns.length > 0 ? (now - this.turns[this.turns.length - 1].timestamp) / 1000 : 0;
+    const wordCount = (content || '').split(/\s+/).filter(Boolean).length;
+    const hasQuestion = /\?/.test(content || '');
+    const hasRepair = /what i mean is|let me rephrase|sorry,? (i|what)|i don'?t understand|wait,? (what|no|actually)|huh\??|i meant/i.test(content || '');
+    const hasDiscourse = /^(so|well|anyway|look|okay|right|but|however|also|actually)/i.test((content || '').trim());
+    
+    // Engagement estimation
+    let engagement = 0.5;
+    if (wordCount > 50) engagement += 0.1;
+    if (wordCount < 5) engagement -= 0.1;
+    if (/!/.test(content || '')) engagement += 0.05;
+    if (hasQuestion) engagement += 0.1;
+    if (/lol|haha/i.test(content || '')) engagement += 0.15;
+    if (/hmm|meh|ok$|okay$/i.test((content || '').trim())) engagement -= 0.15;
+    if (signals.emotion === 'excited' || signals.emotion === 'happy') engagement += 0.15;
+    if (signals.emotion === 'bored') engagement -= 0.2;
+    engagement = Math.max(0, Math.min(1, engagement));
+
+    this.turns.push({ role, wordCount, timestamp: now, gap, hasQuestion, hasRepair, engagement });
+    if (this.turns.length > 50) this.turns.shift();
+
+    // Update momentum
+    let delta = 0;
+    if (gap < 3) delta += 0.05;
+    else if (gap > 30) delta -= 0.1;
+    if (hasQuestion) delta += 0.05;
+    if (hasRepair) { delta -= 0.1; this.repairCount++; }
+    if (engagement > 0.7) delta += 0.05;
+    if (engagement < 0.3) delta -= 0.1;
+    if (role === 'human' && wordCount < 3) delta -= 0.08;
+    this.momentum = Math.max(0, Math.min(1, this.momentum + delta));
+
+    // Update balance
+    const recent = this.turns.slice(-10);
+    const humanWords = recent.filter(t => t.role === 'human').reduce((s, t) => s + t.wordCount, 0);
+    const axiomWords = recent.filter(t => t.role === 'axiom').reduce((s, t) => s + t.wordCount, 0);
+    const total = humanWords + axiomWords;
+    if (total > 0) this.balance = humanWords / total;
+
+    // Gricean violation check (quantity)
+    if (role === 'axiom') {
+      const prevHuman = [...this.turns].reverse().find(t => t.role === 'human');
+      if (prevHuman && wordCount / Math.max(prevHuman.wordCount, 1) > 10) {
+        this.griceanViolations.push({ type: 'quantity_excess', t: now });
+        if (this.griceanViolations.length > 20) this.griceanViolations.shift();
+      }
+    }
+
+    this.engagementSignals.push(engagement);
+    if (this.engagementSignals.length > 20) this.engagementSignals.shift();
+  },
+
+  getState() {
+    const avgEng = this.engagementSignals.length > 0
+      ? this.engagementSignals.reduce((a, b) => a + b, 0) / this.engagementSignals.length : 0.5;
+    return {
+      momentum: +this.momentum.toFixed(3),
+      momentumLabel: this.momentum > 0.7 ? 'flowing' : this.momentum > 0.4 ? 'steady' : this.momentum > 0.2 ? 'slowing' : 'stalled',
+      balance: +this.balance.toFixed(3),
+      balanceLabel: this.balance < 0.2 ? 'AXIOM_dominating' : this.balance > 0.6 ? 'human_leading' : 'balanced',
+      avgEngagement: +avgEng.toFixed(3),
+      repairCount: this.repairCount,
+      totalTurns: this.turns.length,
+      recentViolations: this.griceanViolations.slice(-3).map(v => v.type),
+      needsRepair: this.momentum < 0.3 || avgEng < 0.3,
+      shouldYieldFloor: this.balance < 0.3,
+      health: +(this.momentum * 0.3 + (1 - Math.abs(this.balance - 0.45)) * 0.25 + avgEng * 0.25 + 0.2).toFixed(3),
+    };
+  },
+
+  reset() {
+    this.turns = []; this.momentum = 0.5; this.balance = 0.5;
+    this.repairCount = 0; this.engagementSignals = []; this.griceanViolations = [];
+  },
+};
 const MAX_SYSTEM_MSG_CHARS = 30000;  // System msgs hold persona + memories
 function capMessageSize(messages) {
   return messages.map(m => {
@@ -1852,6 +1944,19 @@ function buildConsciousnessContext() {
     signals.push(`[S] ${consciousness.self.dominantQuality}`);
   }
 
+  // P5.3: Conversation Momentum — flow/balance/health awareness
+  try {
+    const m = conversationMomentum.getState();
+    if (m.totalTurns > 2 && budget > 40) {
+      let mSignal = `[FLOW] ${m.momentumLabel}`;
+      if (m.shouldYieldFloor) mSignal += ' ⚠️YIELD';
+      if (m.needsRepair) mSignal += ' ⚠️REPAIR';
+      if (m.recentViolations.length > 0) mSignal += ` [${m.recentViolations.join(',')}]`;
+      signals.push(mSignal);
+      budget -= mSignal.length;
+    }
+  } catch {}
+
   // P5.5: Identity — who is AXIOM talking to
   const face = consciousness.perception.faceIdentity;
   const voice = consciousness.perception.voiceIdentity;
@@ -1901,6 +2006,16 @@ app.post('/v1/chat/completions', async (req, res) => {
   });
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
+
+  // CONVERSATION MOMENTUM: Record human turn
+  try {
+    const lastHumanMsg = [...(messages || [])].reverse().find(m => m.role === 'user');
+    if (lastHumanMsg) {
+      conversationMomentum.recordTurn('human', lastHumanMsg.content || '', {
+        emotion: consciousness.emotion.primary,
+      });
+    }
+  } catch (e) { console.error('[MOMENTUM] Record failed:', e.message); }
 
   // Wrap ALL brain processing in try/catch — if any region throws,
   // AXIOM must still respond. A silent failure = death.
@@ -1988,6 +2103,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   // Trim and cap messages to prevent context overflow
   enrichedMessages = capMessageSize(trimMessages(enrichedMessages));
 
+  // META-LOOP DETECTOR: Check if we're spiraling into tool calls without substance
+  if (detectMetaLoop(enrichedMessages)) {
+    enrichedMessages = injectMetaLoopWarning(enrichedMessages);
+    console.log('[META-LOOP] ⚠️ Detected spiral — injecting circuit breaker');
+  }
+
   // DIAGNOSTIC: Log total payload size to track context bloat
   const sysMsg = enrichedMessages.find(m => m.role === 'system');
   const totalChars = enrichedMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
@@ -2057,6 +2178,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.end();
       if (fullResponse) {
         insula(fullResponse);
+
+        // CONVERSATION MOMENTUM: Record AXIOM's turn
+        try {
+          conversationMomentum.recordTurn('axiom', fullResponse, {
+            emotion: consciousness.mirror.currentEmotion,
+          });
+          const mState = conversationMomentum.getState();
+          if (mState.shouldYieldFloor) console.log('[MOMENTUM] ⚠️ AXIOM dominating — should yield floor');
+          if (mState.needsRepair) console.log(`[MOMENTUM] ⚠️ Needs repair — momentum: ${mState.momentumLabel}, health: ${mState.health}`);
+        } catch (e) { console.error('[MOMENTUM]', e.message); }
         // PREFRONTAL — Deep thinking every 3rd turn (not every turn to avoid rate limits)
         if (consciousness.timing.turnCount % 3 === 0) {
           prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
@@ -2085,6 +2216,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (data.choices?.[0]?.message) data.choices[0].message.content = content;
       }
       insula(content);
+
+      // CONVERSATION MOMENTUM: Record AXIOM's turn (non-streaming)
+      try {
+        conversationMomentum.recordTurn('axiom', content, { emotion: consciousness.mirror.currentEmotion });
+      } catch {}
+
       if (consciousness.timing.turnCount % 3 === 0) {
         prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
       }
@@ -2436,6 +2573,7 @@ app.get('/mirror', (req, res) => res.json(consciousness.mirror));
 app.get('/curiosity', (req, res) => res.json(consciousness.hypothalamus));
 app.get('/attention', (req, res) => res.json(consciousness.ras));
 app.get('/psyche', (req, res) => res.json(consciousness.psyche));
+app.get('/momentum', (req, res) => res.json(conversationMomentum.getState()));
 app.get('/goals', (req, res) => res.json(goalState));
 
 // PNN status
@@ -4751,39 +4889,113 @@ async function executeCreateDocument(step, goal) {
   const description = step.description;
   console.log(`[FILE] Create document: ${description.slice(0, 60)}`);
 
-  // Use LLM to generate file content
+  // Gather context from knowledge base and lessons
+  let context = '';
+  try {
+    const [knowledgeRes, lessonsRes] = await Promise.allSettled([
+      fetch(`${BACKEND_URL}/api/knowledge`).then(r => r.json()),
+      fetch(`${BACKEND_URL}/api/lessons`).then(r => r.json()),
+    ]);
+    if (knowledgeRes.status === 'fulfilled') {
+      const nodes = (knowledgeRes.value.nodes || [])
+        .filter(n => {
+          const concept = (n.concept || '').toLowerCase();
+          const desc = description.toLowerCase();
+          return desc.split(/\s+/).some(w => w.length > 3 && concept.includes(w));
+        })
+        .slice(0, 5);
+      if (nodes.length > 0) {
+        context += '\n\nRELEVANT KNOWLEDGE:\n' + nodes.map(n => `- ${n.concept}`).join('\n');
+      }
+    }
+    if (lessonsRes.status === 'fulfilled') {
+      const relevant = (lessonsRes.value.lessons || [])
+        .filter(l => l.success)
+        .slice(0, 3);
+      if (relevant.length > 0) {
+        context += '\n\nLESSONS LEARNED:\n' + relevant.map(l => `- ${l.lesson}`).join('\n');
+      }
+    }
+  } catch {}
+
+  // Use LLM to generate file content — NO JSON wrapping to avoid parse failures
   const filePrompt = `You are AXIOM creating a document.
 GOAL: ${goal.goal}
 TASK: ${description}
+${context}
 
-Create the document content. Return JSON:
-{"filename":"name.md","content":"full document content","description":"what this file is"}`;
+Create the document now. Use this EXACT format:
+
+FILENAME: your-filename.md
+DESCRIPTION: one line description of what this file is
+---CONTENT---
+(your full document content here — write as much as needed)
+---END---
+
+Write substantive, detailed content. This is a real document, not a placeholder.`;
 
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: filePrompt }], max_tokens: 1000 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: filePrompt }], max_tokens: 4000 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return 'Failed to generate document';
-    const doc = JSON.parse(match[0]);
+
+    // Extract with the structured format
+    let filename = 'document.md';
+    let docDescription = '';
+    let content = '';
+
+    const filenameMatch = raw.match(/FILENAME:\s*(.+)/i);
+    if (filenameMatch) filename = filenameMatch[1].trim();
+
+    const descMatch = raw.match(/DESCRIPTION:\s*(.+)/i);
+    if (descMatch) docDescription = descMatch[1].trim();
+
+    const contentMatch = raw.match(/---CONTENT---\s*([\s\S]*?)\s*---END---/i);
+    if (contentMatch) {
+      content = contentMatch[0].replace(/---CONTENT---\s*/i, '').replace(/\s*---END---/i, '').trim();
+    }
+
+    // Fallback: if structured extraction failed, try JSON (backward compat)
+    if (!content) {
+      try {
+        const jsonMatch = raw.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const doc = JSON.parse(jsonMatch[0]);
+          filename = doc.filename || filename;
+          content = doc.content || '';
+          docDescription = doc.description || '';
+        }
+      } catch {}
+    }
+
+    // Final fallback: use the raw LLM output as the document
+    if (!content) {
+      content = raw;
+      if (content.length < 20) return 'Failed to generate document — LLM returned insufficient content';
+      console.log('[FILE] Using raw LLM output as document content (structured extraction failed)');
+    }
+
+    // Clean filename
+    filename = filename.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/--+/g, '-');
+    if (!filename.includes('.')) filename += '.md';
 
     // Save to workspace
     await fetch(`${BACKEND_URL}/api/workspace`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: doc.filename, content: doc.content, type: 'document', related_goal_id: goal.id }),
+      body: JSON.stringify({ title: filename, content, type: 'document', related_goal_id: goal.id }),
     }).catch(() => {});
 
-    // Also commit to GitHub as a file in a docs repo if desired
+    // Commit to GitHub
     const GH_TOKEN = process.env.GITHUB_PAT;
     if (GH_TOKEN) {
       try {
-        await commitToGitHub('axiom-workspace', `docs/${doc.filename}`, doc.content, `[AXIOM] Create ${doc.filename} — ${doc.description?.slice(0, 50)}`);
+        await commitToGitHub('axiom-workspace', `docs/${filename}`, content, `[AXIOM] Create ${filename} — ${docDescription?.slice(0, 50) || description.slice(0, 50)}`);
       } catch (e) { console.log(`[FILE] GitHub commit failed: ${e.message}`); }
     }
 
-    return `Created: ${doc.filename} (${doc.content.length} chars)`;
+    return `Created: ${filename} (${content.length} chars) — ${docDescription || 'document generated'}`;
   } catch (e) { return `Error: ${e.message}`; }
 }
 
