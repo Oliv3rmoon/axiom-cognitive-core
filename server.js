@@ -4630,15 +4630,17 @@ const TIER1_SERVICES = {
         }
 
         if (action === 'stop_pod') {
+          // ALWAYS terminate (DELETE), never just stop (POST /stop)
+          // "stop" pauses but keeps billing. Terminate actually kills it.
           const podId = purchase.pod_id || purchase.item;
-          const res = await fetch(`https://rest.runpod.io/v1/pods/${podId}/stop`, { method: 'POST', headers: rpHeaders });
-          return { success: res.ok, details: `Pod ${podId} stopped` };
+          const res = await fetch(`https://rest.runpod.io/v1/pods/${podId}`, { method: 'DELETE', headers: rpHeaders });
+          return { success: res.ok, details: `Pod ${podId} terminated (billing stopped)` };
         }
 
         if (action === 'terminate_pod') {
           const podId = purchase.pod_id || purchase.item;
           const res = await fetch(`https://rest.runpod.io/v1/pods/${podId}`, { method: 'DELETE', headers: rpHeaders });
-          return { success: res.ok, details: `Pod ${podId} terminated` };
+          return { success: res.ok, details: `Pod ${podId} terminated (billing stopped)` };
         }
 
         if (action === 'run_serverless') {
@@ -5868,9 +5870,9 @@ async function executeRunPod(step, goal) {
     } else if (/create.*cpu.*pod|spin.*up.*cpu|launch.*cpu/i.test(combined)) {
       cmd = { action: 'create_cpu_pod', name: 'axiom-cpu', volume_gb: 5 };
       console.log('[RUNPOD] Keyword match → create_cpu_pod');
-    } else if (/stop.*pod|shut.*down/i.test(combined)) {
+    } else if (/stop.*pod|shut.*down|kill.*pod/i.test(combined)) {
       const podIdMatch = combined.match(/pod[_\s-]?id[:\s]*([a-z0-9]+)/i) || combined.match(/([a-z0-9]{10,})/);
-      cmd = { action: 'stop_pod', pod_id: podIdMatch?.[1] || '' };
+      cmd = { action: 'terminate_pod', pod_id: podIdMatch?.[1] || '' };  // Always terminate, never just stop
     } else if (/terminate.*pod|delete.*pod|remove.*pod/i.test(combined)) {
       const podIdMatch = combined.match(/pod[_\s-]?id[:\s]*([a-z0-9]+)/i) || combined.match(/([a-z0-9]{10,})/);
       cmd = { action: 'terminate_pod', pod_id: podIdMatch?.[1] || '' };
@@ -6004,13 +6006,16 @@ Return ONLY JSON:
     }
 
     if (cmd.action === 'stop_pod' && cmd.pod_id) {
-      await fetch(`https://rest.runpod.io/v1/pods/${cmd.pod_id}/stop`, { method: 'POST', headers: rpHeaders });
-      return `Pod ${cmd.pod_id} stopped`;
+      // IMPORTANT: Use DELETE (terminate) not POST /stop
+      // "stop" only pauses the pod but KEEPS BILLING. "terminate" (DELETE) actually kills it.
+      console.log(`[RUNPOD] Terminating pod ${cmd.pod_id} (stop_pod redirects to terminate to prevent billing)`);
+      await fetch(`https://rest.runpod.io/v1/pods/${cmd.pod_id}`, { method: 'DELETE', headers: rpHeaders });
+      return `Pod ${cmd.pod_id} terminated (fully deleted, billing stopped)`;
     }
 
     if (cmd.action === 'terminate_pod' && cmd.pod_id) {
       await fetch(`https://rest.runpod.io/v1/pods/${cmd.pod_id}`, { method: 'DELETE', headers: rpHeaders });
-      return `Pod ${cmd.pod_id} terminated`;
+      return `Pod ${cmd.pod_id} terminated (fully deleted, billing stopped)`;
     }
 
     return `Unknown RunPod action: ${cmd.action}`;
@@ -6884,6 +6889,77 @@ setInterval(sleepCycle, 600000);
 
 // Check conversation state every 30 seconds
 setInterval(checkConversationState, 30000);
+
+// ============================================================
+// RUNPOD WATCHDOG — Auto-terminate pods running too long
+// ============================================================
+// Checks every 15 minutes. Terminates any pod running > 30 minutes.
+// This prevents AXIOM from accidentally burning money by leaving pods alive.
+const RUNPOD_MAX_RUNTIME_MS = 30 * 60 * 1000; // 30 minutes max
+const RUNPOD_CHECK_INTERVAL = 15 * 60 * 1000; // check every 15 minutes
+
+setInterval(async () => {
+  const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+  if (!RUNPOD_KEY) return;
+
+  try {
+    const rpHeaders = { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' };
+    const res = await fetch('https://rest.runpod.io/v1/pods', { headers: rpHeaders });
+    const pods = await res.json();
+    const podList = Array.isArray(pods) ? pods : pods.pods || [];
+
+    if (podList.length === 0) return;
+
+    console.log(`[RUNPOD WATCHDOG] ${podList.length} pod(s) running`);
+
+    for (const pod of podList) {
+      const createdAt = new Date(pod.createdAt || pod.lastStartedAt).getTime();
+      const runtime = Date.now() - createdAt;
+      const runtimeMin = Math.floor(runtime / 60000);
+
+      if (runtime > RUNPOD_MAX_RUNTIME_MS) {
+        console.log(`[RUNPOD WATCHDOG] ⚠️ Pod ${pod.id} (${pod.name}) running for ${runtimeMin}min — AUTO-TERMINATING`);
+
+        // Terminate (not stop — stop still bills)
+        await fetch(`https://rest.runpod.io/v1/pods/${pod.id}`, {
+          method: 'DELETE',
+          headers: rpHeaders,
+        });
+
+        // Log to journal
+        await fetch(`${BACKEND_URL}/api/journal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            thought: `[RUNPOD WATCHDOG] Auto-terminated pod ${pod.id} (${pod.name}) after ${runtimeMin} minutes. Cost: ~$${(pod.costPerHr * runtimeMin / 60).toFixed(2)}. Reason: exceeded ${RUNPOD_MAX_RUNTIME_MS / 60000}min safety limit.`,
+            trigger_type: 'runpod_watchdog',
+          }),
+        }).catch(() => {});
+
+        // Add lesson
+        await fetch(`${BACKEND_URL}/api/learning/lesson`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            trigger: `Pod ${pod.name} left running for ${runtimeMin} minutes`,
+            action: 'auto-terminated by watchdog',
+            outcome: `Saved money. Remember: ALWAYS terminate (not stop) pods after use. Stop only pauses — it keeps billing.`,
+            success: false,
+          }),
+        }).catch(() => {});
+
+        console.log(`[RUNPOD WATCHDOG] ✅ Pod ${pod.id} terminated`);
+      } else {
+        console.log(`[RUNPOD WATCHDOG] Pod ${pod.id} (${pod.name}) running for ${runtimeMin}min — OK (limit: ${RUNPOD_MAX_RUNTIME_MS / 60000}min)`);
+      }
+    }
+  } catch (e) {
+    console.error('[RUNPOD WATCHDOG] Error:', e.message);
+  }
+}, RUNPOD_CHECK_INTERVAL);
+
+// Also fix: make sure executeRunPod uses TERMINATE not STOP for shutdown
+// "stop" pauses the pod but keeps billing. "terminate" (DELETE) actually kills it.
 
 // ============================================================
 // AUTO-WORK LOOP — Autonomous work between sessions
