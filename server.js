@@ -3234,7 +3234,8 @@ app.post('/screen/stop', (req, res) => {
   screenState.active = false;
   screenState.lastFrame = null;
   screenState.frameCount = 0;
-  console.log('[SCREEN] Screen sharing stopped');
+  screenState.audioTranscripts = [];
+  console.log('[SCREEN] Screen sharing stopped (video + audio cleared)');
   res.json({ success: true });
 });
 
@@ -3247,15 +3248,71 @@ app.get('/screen', (req, res) => {
     lastFrameTime: screenState.lastFrameTime,
     lastAnalysisTime: screenState.lastAnalysisTime,
     hasFrame: !!screenState.lastFrame,
+    audioTranscripts: screenState.audioTranscripts?.length || 0,
+    lastAudioTranscript: screenState.audioTranscripts?.slice(-1)[0] || null,
   });
+});
+
+// ============================================================
+// SCREEN AUDIO — Live transcription from screen sharing
+// ============================================================
+// Audio from shared screen is tagged [SCREEN_AUDIO] so AXIOM
+// doesn't confuse it with Andrew speaking directly to her.
+if (!screenState.audioTranscripts) screenState.audioTranscripts = [];
+
+app.post('/screen/audio', async (req, res) => {
+  const { transcript, audio, format } = req.body;
+
+  if (transcript) {
+    // Direct transcript from Web Speech API
+    const entry = { text: transcript, timestamp: Date.now(), source: 'speech_api' };
+    screenState.audioTranscripts.push(entry);
+    // Keep last 50 lines
+    if (screenState.audioTranscripts.length > 50) screenState.audioTranscripts.shift();
+    console.log(`[SCREEN_AUDIO] Transcript: "${transcript.slice(0, 80)}"`);
+    return res.json({ success: true, method: 'speech_api' });
+  }
+
+  if (audio) {
+    // Audio chunk — would need Whisper or similar for transcription
+    // For now, log that we received it
+    console.log(`[SCREEN_AUDIO] Audio chunk received (${format}, ${Math.round(audio.length * 0.75 / 1024)}KB)`);
+    // TODO: Send to Whisper API or ElevenLabs for transcription
+    // For now just acknowledge
+    return res.json({ success: true, method: 'audio_chunk', transcript: null });
+  }
+
+  res.status(400).json({ error: 'transcript or audio required' });
 });
 
 // Get screen context for injection into conversation
 function getScreenContext() {
-  if (!screenState.active || !screenState.lastAnalysis) return '';
-  const ageSeconds = (Date.now() - screenState.lastAnalysisTime) / 1000;
-  if (ageSeconds > 30) return ''; // stale
-  return `[SCREEN SHARING ACTIVE] Andrew is sharing his screen with you. What you can see: ${screenState.lastAnalysis}`;
+  if (!screenState.active) return '';
+
+  let context = '';
+
+  // Visual context
+  if (screenState.lastAnalysis) {
+    const ageSeconds = (Date.now() - screenState.lastAnalysisTime) / 1000;
+    if (ageSeconds < 30) {
+      context += `[SCREEN SHARING ACTIVE] Andrew is sharing his screen with you. What you can see: ${screenState.lastAnalysis}`;
+    }
+  }
+
+  // Audio context — last 30 seconds of screen audio
+  if (screenState.audioTranscripts?.length > 0) {
+    const cutoff = Date.now() - 30000;
+    const recentAudio = screenState.audioTranscripts
+      .filter(t => t.timestamp > cutoff)
+      .map(t => t.text)
+      .join(' ');
+
+    if (recentAudio) {
+      context += `\n[SCREEN_AUDIO] Audio from Andrew's screen (NOT Andrew speaking to you — this is audio from whatever is playing on his screen): "${recentAudio}"`;
+    }
+  }
+
+  return context;
 }
 
 // Endpoint for Tavus to call during silence — triggers AXIOM to speak
