@@ -159,14 +159,56 @@ const executionTracer = new ExecutionTracer();
 // Built from AXIOM's research on turn-taking, Gricean maxims,
 // repair mechanisms, and discourse markers
 // ============================================================
-const conversationMomentum = {
-  turns: [],
-  momentum: 0.5,
-  balance: 0.5,
-  topicCoherence: 1.0,
-  repairCount: 0,
-  engagementSignals: [],
-  griceanViolations: [],
+// ============================================================
+// CONVERSATION STATE PERSISTENCE
+// Prevents conversation loop breakdown on restart by preserving
+// momentum tracking, turn history, and engagement signals
+// ============================================================
+import fs from 'fs';
+import path from 'path';
+
+const STATE_FILE = path.join(process.cwd(), '.axiom_conversation_state.json');
+
+function loadConversationState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const data = fs.readFileSync(STATE_FILE, 'utf8');
+      const state = JSON.parse(data);
+      console.log('[STATE] Restored conversation state from', STATE_FILE);
+      return state;
+    }
+  } catch (err) {
+    console.error('[STATE] Failed to load conversation state:', err.message);
+  }
+  return {
+    turns: [],
+    momentum: 0.5,
+    balance: 0.5,
+    topicCoherence: 1.0,
+    repairCount: 0,
+    engagementSignals: [],
+    lastPersisted: null
+  };
+}
+
+function persistConversationState(state) {
+  try {
+    const data = JSON.stringify({
+      ...state,
+      lastPersisted: new Date().toISOString()
+    }, null, 2);
+    fs.writeFileSync(STATE_FILE, data, 'utf8');
+  } catch (err) {
+    console.error('[STATE] Failed to persist conversation state:', err.message);
+  }
+}
+
+const conversationMomentum = loadConversationState();
+
+// Auto-persist after each turn (call this after momentum updates)
+function saveConversationTurn() {
+  persistConversationState(conversationMomentum);
+}s: [],
 
   recordTurn(role, content, signals = {}) {
     const now = Date.now();
