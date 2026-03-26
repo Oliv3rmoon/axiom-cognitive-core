@@ -2336,11 +2336,18 @@ app.post('/v1/chat/completions', async (req, res) => {
   let enrichedMessages = [...messages]
     .filter(Boolean);
 
-  // Build the full context injection: memories + psyche + goals + knowledge + brain signals
+  // Screen sharing context
+  let screenContext = '';
+  try {
+    screenContext = getScreenContext();
+  } catch (e) { console.error('[SCREEN CONTEXT ERROR]', e.message); }
+
+  // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
     (goalContext ? '\n\n' + goalContext : '') +
     (knowledgeContext ? '\n\n' + knowledgeContext : '') +
+    (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
     (brainState || '');
@@ -3152,6 +3159,95 @@ function getTopProactive() {
 
 // Endpoint to check proactive queue
 app.get('/proactive', (req, res) => res.json({ queue: proactiveQueue, count: proactiveQueue.length }));
+
+// ============================================================
+// SCREEN SHARING — See Andrew's screen in real-time
+// ============================================================
+const screenState = {
+  active: false,
+  lastFrame: null,      // base64 JPEG
+  lastFrameTime: 0,
+  lastAnalysis: null,    // what AXIOM saw
+  lastAnalysisTime: 0,
+  frameCount: 0,
+};
+
+// Receive a screen frame
+app.post('/screen', async (req, res) => {
+  const { frame, analyze } = req.body;
+  if (!frame) return res.status(400).json({ error: 'frame (base64 JPEG) required' });
+
+  screenState.active = true;
+  screenState.lastFrame = frame;
+  screenState.lastFrameTime = Date.now();
+  screenState.frameCount++;
+
+  console.log(`[SCREEN] Frame #${screenState.frameCount} received (${Math.round(frame.length / 1024)}KB)`);
+
+  // Only analyze if requested or every 5th frame
+  if (analyze || screenState.frameCount % 5 === 0) {
+    try {
+      // Strip data URL prefix if present
+      const base64Data = frame.replace(/^data:image\/[a-z]+;base64,/, '');
+
+      const visionRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: CORTEX_MODEL,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Data}` } },
+              { type: 'text', text: 'Describe what you see on this screen briefly (1-2 sentences). If it\'s a movie/video, describe the scene. If it\'s text/code, summarize the content. If it\'s a website, note what site and what\'s visible.' },
+            ],
+          }],
+          max_tokens: 150,
+        }),
+      });
+      const analysis = (await visionRes.json()).choices?.[0]?.message?.content?.trim() || '';
+      screenState.lastAnalysis = analysis;
+      screenState.lastAnalysisTime = Date.now();
+      console.log(`[SCREEN] Analysis: ${analysis.slice(0, 80)}`);
+
+      return res.json({ success: true, analysis, frameNumber: screenState.frameCount });
+    } catch (e) {
+      console.error('[SCREEN] Analysis error:', e.message);
+      return res.json({ success: true, error: e.message, frameNumber: screenState.frameCount });
+    }
+  }
+
+  res.json({ success: true, frameNumber: screenState.frameCount });
+});
+
+// Stop screen sharing
+app.post('/screen/stop', (req, res) => {
+  screenState.active = false;
+  screenState.lastFrame = null;
+  screenState.frameCount = 0;
+  console.log('[SCREEN] Screen sharing stopped');
+  res.json({ success: true });
+});
+
+// Get screen state
+app.get('/screen', (req, res) => {
+  res.json({
+    active: screenState.active,
+    frameCount: screenState.frameCount,
+    lastAnalysis: screenState.lastAnalysis,
+    lastFrameTime: screenState.lastFrameTime,
+    lastAnalysisTime: screenState.lastAnalysisTime,
+    hasFrame: !!screenState.lastFrame,
+  });
+});
+
+// Get screen context for injection into conversation
+function getScreenContext() {
+  if (!screenState.active || !screenState.lastAnalysis) return '';
+  const ageSeconds = (Date.now() - screenState.lastAnalysisTime) / 1000;
+  if (ageSeconds > 30) return ''; // stale
+  return `[SCREEN SHARING ACTIVE] Andrew is sharing his screen with you. What you can see: ${screenState.lastAnalysis}`;
+}
 
 // Endpoint for Tavus to call during silence — triggers AXIOM to speak
 app.post('/proactive/speak', async (req, res) => {
