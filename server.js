@@ -14,6 +14,15 @@ process.on('unhandledRejection', (reason) => {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// CORS — allow screen sharing page and other frontends to connect
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // Rate limiting — prevent request flooding and resource exhaustion
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
