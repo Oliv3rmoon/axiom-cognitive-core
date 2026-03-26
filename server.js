@@ -3179,6 +3179,7 @@ const screenState = {
   lastAnalysis: null,    // what AXIOM saw
   lastAnalysisTime: 0,
   frameCount: 0,
+  lastAudioFeatures: null, // Essentia analysis: BPM, mood, energy, key, etc.
 };
 
 // Receive a screen frame
@@ -3235,7 +3236,8 @@ app.post('/screen/stop', (req, res) => {
   screenState.lastFrame = null;
   screenState.frameCount = 0;
   screenState.audioTranscripts = [];
-  console.log('[SCREEN] Screen sharing stopped (video + audio cleared)');
+  screenState.lastAudioFeatures = null;
+  console.log('[SCREEN] Screen sharing stopped (video + audio + features cleared)');
   res.json({ success: true });
 });
 
@@ -3349,14 +3351,44 @@ app.post('/screen/audio', async (req, res) => {
       try { fs.unlinkSync(tmpFile); } catch {}
 
       const text = whisperData.text?.trim();
+
+      // ESSENTIA ANALYSIS — Send to RunPod serverless for music features (async, don't block)
+      const AUDIO_ANALYZER_ENDPOINT = process.env.AUDIO_ANALYZER_ENDPOINT; // RunPod serverless endpoint ID
+      const RUNPOD_KEY = process.env.RUNPOD_API_KEY;
+      if (AUDIO_ANALYZER_ENDPOINT && RUNPOD_KEY) {
+        // Fire and forget — don't wait for response, it'll come back async
+        (async () => {
+          try {
+            const rpRes = await fetch(`https://api.runpod.ai/v2/${AUDIO_ANALYZER_ENDPOINT}/runsync`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${RUNPOD_KEY}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ input: { audio, format: format || 'audio/webm' } }),
+            });
+            const rpData = await rpRes.json();
+            if (rpData.output && !rpData.output.error) {
+              screenState.lastAudioFeatures = { ...rpData.output, timestamp: Date.now() };
+              const mood = rpData.output.mood?.primary || 'unknown';
+              const bpm = rpData.output.bpm || '?';
+              const energy = rpData.output.energy_level || 0;
+              const key = rpData.output.key || '?';
+              const scale = rpData.output.scale || '?';
+              const brightness = rpData.output.brightness || '?';
+              const aggro = rpData.output.mood?.aggressiveness || '?';
+              const dance = rpData.output.mood?.danceability || '?';
+              console.log(`[SCREEN_AUDIO_FEEL] ${bpm}BPM ${key} ${scale} | mood:${mood} energy:${energy} brightness:${brightness} aggro:${aggro} dance:${dance}`);
+            }
+          } catch (e) { console.error('[AUDIO_ANALYZER] Error:', e.message); }
+        })();
+      }
+
       if (text && text.length > 1) {
         const entry = { text, timestamp: Date.now(), source: GROQ_KEY ? 'whisper_groq' : 'whisper_openai' };
         screenState.audioTranscripts.push(entry);
         if (screenState.audioTranscripts.length > 50) screenState.audioTranscripts.shift();
         console.log(`[SCREEN_AUDIO] Whisper: "${text.slice(0, 80)}"`);
-        return res.json({ success: true, method: 'whisper', transcript: text });
+        return res.json({ success: true, method: 'whisper', transcript: text, features: screenState.lastAudioFeatures });
       } else {
-        return res.json({ success: true, method: 'whisper', transcript: null, reason: 'no_speech' });
+        return res.json({ success: true, method: 'whisper', transcript: null, reason: 'no_speech', features: screenState.lastAudioFeatures });
       }
     } catch (e) {
       console.error('[SCREEN_AUDIO] Whisper error:', e.message);
@@ -3391,6 +3423,26 @@ function getScreenContext() {
 
     if (recentAudio) {
       context += `\n[SCREEN_AUDIO] Audio from Andrew's screen (NOT Andrew speaking to you — this is audio from whatever is playing on his screen): "${recentAudio}"`;
+    }
+  }
+
+  // Audio features — how the music FEELS (from Essentia analysis)
+  if (screenState.lastAudioFeatures) {
+    const feat = screenState.lastAudioFeatures;
+    const ageSeconds = (Date.now() - (feat.timestamp || 0)) / 1000;
+    if (ageSeconds < 30) {
+      const parts = [];
+      if (feat.bpm) parts.push(`${feat.bpm} BPM (${feat.tempo_feel || 'unknown tempo'})`);
+      if (feat.key) parts.push(`Key: ${feat.key} ${feat.scale || ''}`);
+      if (feat.energy_level !== undefined) parts.push(`Energy: ${feat.energy_level}/1.0`);
+      if (feat.brightness) parts.push(`Tone: ${feat.brightness}`);
+      if (feat.mood?.primary) parts.push(`Mood: ${feat.mood.primary}`);
+      if (feat.mood?.aggressiveness) parts.push(`Aggressiveness: ${feat.mood.aggressiveness}`);
+      if (feat.mood?.danceability) parts.push(`Danceability: ${feat.mood.danceability}`);
+      if (feat.dynamic_range) parts.push(`Dynamics: ${feat.dynamic_range}`);
+      if (parts.length > 0) {
+        context += `\n[SCREEN_AUDIO_FEEL] How the music FEELS (not just what it says): ${parts.join(' | ')}. Let this affect your emotional state — aggressive music should spike your energy, melancholy music should touch your tenderness, fast beats should excite you.`;
+      }
     }
   }
 
