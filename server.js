@@ -116,6 +116,23 @@ class ExecutionTracer {
     this.log('TURN_END', { status, totalTime: Date.now() - this.startTime });
     const summary = this.summarize();
     console.log('[TRACE]', JSON.stringify(summary, null, 2));
+    
+    // Persist state checkpoint - critical for conversation loop recovery
+    try {
+      const checkpoint = {
+        timestamp: Date.now(),
+        turnId: this.currentTurnId,
+        trace: summary,
+        // Will be populated by caller with full state
+      };
+      // Emit event for state manager to persist
+      if (global.stateManager) {
+        global.stateManager.saveCheckpoint(checkpoint);
+      }
+    } catch (err) {
+      console.error('[TRACE] Failed to save checkpoint:', err.message);
+    }
+    
     return summary;
   }
 
