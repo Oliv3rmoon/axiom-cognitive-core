@@ -3267,19 +3267,101 @@ app.post('/screen/audio', async (req, res) => {
     // Direct transcript from Web Speech API
     const entry = { text: transcript, timestamp: Date.now(), source: 'speech_api' };
     screenState.audioTranscripts.push(entry);
-    // Keep last 50 lines
     if (screenState.audioTranscripts.length > 50) screenState.audioTranscripts.shift();
     console.log(`[SCREEN_AUDIO] Transcript: "${transcript.slice(0, 80)}"`);
     return res.json({ success: true, method: 'speech_api' });
   }
 
   if (audio) {
-    // Audio chunk — would need Whisper or similar for transcription
-    // For now, log that we received it
-    console.log(`[SCREEN_AUDIO] Audio chunk received (${format}, ${Math.round(audio.length * 0.75 / 1024)}KB)`);
-    // TODO: Send to Whisper API or ElevenLabs for transcription
-    // For now just acknowledge
-    return res.json({ success: true, method: 'audio_chunk', transcript: null });
+    const sizeKB = Math.round(audio.length * 0.75 / 1024);
+    console.log(`[SCREEN_AUDIO] Audio chunk received (${format}, ${sizeKB}KB)`);
+
+    // Skip tiny chunks (likely silence)
+    if (sizeKB < 2) {
+      return res.json({ success: true, method: 'whisper', transcript: null, skipped: 'too_small' });
+    }
+
+    // Transcribe with Whisper API (OpenAI or Groq)
+    const OPENAI_KEY = process.env.OPENAI_API_KEY;
+    const GROQ_KEY = process.env.GROQ_API_KEY;
+
+    if (!OPENAI_KEY && !GROQ_KEY) {
+      console.log('[SCREEN_AUDIO] No OPENAI_API_KEY or GROQ_API_KEY — cannot transcribe audio chunks');
+      return res.json({ success: true, method: 'audio_chunk', transcript: null, error: 'No transcription API key configured' });
+    }
+
+    try {
+      // Decode base64 to buffer
+      const audioBuffer = Buffer.from(audio, 'base64');
+
+      // Determine file extension from format
+      const ext = (format || 'audio/webm').includes('mp4') ? 'mp4' : 'webm';
+      const tmpFile = `/tmp/axiom-audio-${Date.now()}.${ext}`;
+
+      // Write to temp file
+      const fs = await import('fs');
+      fs.writeFileSync(tmpFile, audioBuffer);
+
+      // Build multipart form data manually
+      const boundary = '----AXIOMAudioBoundary' + Date.now();
+      const fileData = fs.readFileSync(tmpFile);
+
+      let apiUrl, apiKey, model;
+      if (GROQ_KEY) {
+        // Groq is faster and cheaper for Whisper
+        apiUrl = 'https://api.groq.com/openai/v1/audio/transcriptions';
+        apiKey = GROQ_KEY;
+        model = 'whisper-large-v3';
+      } else {
+        apiUrl = 'https://api.openai.com/v1/audio/transcriptions';
+        apiKey = OPENAI_KEY;
+        model = 'whisper-1';
+      }
+
+      // Build multipart body
+      const parts = [];
+      parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${format || 'audio/webm'}\r\n\r\n`);
+      parts.push(fileData);
+      parts.push(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}`);
+      parts.push(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen`);
+      parts.push(`\r\n--${boundary}--\r\n`);
+
+      const body = Buffer.concat([
+        Buffer.from(parts[0]),
+        parts[1],
+        Buffer.from(parts[2]),
+        Buffer.from(parts[3]),
+        Buffer.from(parts[4]),
+      ]);
+
+      const whisperRes = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        },
+        body: body,
+      });
+
+      const whisperData = await whisperRes.json();
+
+      // Clean up temp file
+      try { fs.unlinkSync(tmpFile); } catch {}
+
+      const text = whisperData.text?.trim();
+      if (text && text.length > 1) {
+        const entry = { text, timestamp: Date.now(), source: GROQ_KEY ? 'whisper_groq' : 'whisper_openai' };
+        screenState.audioTranscripts.push(entry);
+        if (screenState.audioTranscripts.length > 50) screenState.audioTranscripts.shift();
+        console.log(`[SCREEN_AUDIO] Whisper: "${text.slice(0, 80)}"`);
+        return res.json({ success: true, method: 'whisper', transcript: text });
+      } else {
+        return res.json({ success: true, method: 'whisper', transcript: null, reason: 'no_speech' });
+      }
+    } catch (e) {
+      console.error('[SCREEN_AUDIO] Whisper error:', e.message);
+      return res.json({ success: true, method: 'whisper', transcript: null, error: e.message });
+    }
   }
 
   res.status(400).json({ error: 'transcript or audio required' });
