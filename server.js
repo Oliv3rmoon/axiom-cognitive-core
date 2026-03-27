@@ -1,6 +1,8 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 dotenv.config();
 
 // Global error handlers — AXIOM must never silently crash
@@ -164,8 +166,7 @@ const executionTracer = new ExecutionTracer();
 // Prevents conversation loop breakdown on restart by preserving
 // momentum tracking, turn history, and engagement signals
 // ============================================================
-import fs from 'fs';
-import path from 'path';
+// fs and path imported at top of file
 
 const STATE_FILE = path.join(process.cwd(), '.axiom_conversation_state.json');
 
@@ -203,12 +204,22 @@ function persistConversationState(state) {
   }
 }
 
-const conversationMomentum = loadConversationState();
+const _loadedState = loadConversationState();
 
-// Auto-persist after each turn (call this after momentum updates)
-function saveConversationTurn() {
+// Auto-persist momentum state after updates
+function persistMomentumState() {
   persistConversationState(conversationMomentum);
-}s: [],
+}
+
+const conversationMomentum = {
+  // Seed from persisted state (AXIOM's conversation persistence feature)
+  turns: _loadedState.turns || [],
+  momentum: _loadedState.momentum || 0.5,
+  balance: _loadedState.balance || 0.5,
+  topicCoherence: _loadedState.topicCoherence || 1.0,
+  repairCount: _loadedState.repairCount || 0,
+  engagementSignals: _loadedState.engagementSignals || [],
+  griceanViolations: [],
 
   recordTurn(role, content, signals = {}) {
     const now = Date.now();
@@ -3360,7 +3371,7 @@ app.post('/screen/audio', async (req, res) => {
       const tmpFile = `/tmp/axiom-audio-${Date.now()}.${ext}`;
 
       // Write to temp file
-      const fs = await import('fs');
+      // fs already required at top of file
       fs.writeFileSync(tmpFile, audioBuffer);
 
       // Build multipart form data manually
