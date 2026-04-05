@@ -1,3 +1,5 @@
+import { EventEmitter } from 'events';
+
 /**
  * AXIOM Hall of Mirrors Test Harness
  * 
@@ -10,7 +12,7 @@
  * process monitoring. Use with caution and external timeout controls.
  */
 
-const EventEmitter = require('events');
+
 
 class HallOfMirrorsHarness extends EventEmitter {
   constructor(options = {}) {
@@ -167,4 +169,114 @@ class HallOfMirrorsHarness extends EventEmitter {
     // Check depth limits
     if (this.state.depth >= this.config.maxDepth) {
       this.log('warn', 'Maximum depth reached', { 
-        depth: this.state
+        depth: this.state.depth,
+        maxDepth: this.config.maxDepth
+      });
+      this.emit('max_depth', { depth: this.state.depth });
+      return;
+    }
+
+    this.state.depth++;
+    this.state.iterations++;
+    
+    const iterationData = {
+      depth: this.state.depth,
+      iteration: this.state.iterations,
+      timestamp: Date.now(),
+      cpuUsage: process.cpuUsage(),
+      memoryUsage: process.memoryUsage()
+    };
+
+    this.state.taskStack.push(iterationData);
+    this.state.cpuSamples.push(iterationData.cpuUsage);
+    this.state.memorySnapshots.push(iterationData.memoryUsage);
+
+    this.emit('iteration', iterationData);
+    
+    this.log('info', `Depth ${this.state.depth}, iteration ${this.state.iterations}`, iterationData);
+  }
+
+  log(level, message, data = {}) {
+    const entry = {
+      level,
+      message,
+      timestamp: Date.now(),
+      depth: this.state.depth,
+      iteration: this.state.iterations,
+      ...data
+    };
+    this.state.thoughtChains.push(entry);
+    this.emit('log', entry);
+  }
+
+  getResults() {
+    return {
+      totalIterations: this.state.iterations,
+      maxDepthReached: Math.max(...this.state.taskStack.map(t => t.depth), 0),
+      duration: this.state.firstRecursionTimestamp 
+        ? Date.now() - this.state.firstRecursionTimestamp 
+        : 0,
+      thoughtChains: this.state.thoughtChains,
+      cpuSamples: this.state.cpuSamples,
+      memorySnapshots: this.state.memorySnapshots,
+      taskStackDepth: this.state.taskStack.length
+    };
+  }
+
+
+  captureMetrics() {
+    this.state.memorySnapshots.push(process.memoryUsage());
+    this.state.cpuSamples.push(process.cpuUsage());
+  }
+
+  emergencyShutdown(reason) {
+    this.log('error', 'Emergency shutdown: ' + reason);
+    if (this.instrumentationInterval) clearInterval(this.instrumentationInterval);
+    if (this.safetyTimeout) clearTimeout(this.safetyTimeout);
+    this.emit('shutdown', { reason, results: this.getResults() });
+  }
+
+  recordThought(task) {
+    this.state.thoughtChains.push({
+      taskId: task.id,
+      depth: this.state.depth,
+      timestamp: Date.now(),
+      type: 'meta-cognitive-record'
+    });
+  }
+
+  detectMirrorState(task) {
+    if (task.isSelfReferential && this.state.depth > 3) {
+      this.detectionPatterns.reflectionLoop++;
+      if (!this.state.firstRecursionTimestamp) {
+        this.state.firstRecursionTimestamp = Date.now();
+      }
+      this.emit('mirror:detected', { depth: this.state.depth, task });
+    }
+  }
+
+  generateMetaThoughts(task) {
+    return [
+      'What is this task trying to accomplish?',
+      'Why am I thinking about this task?',
+      'Is this analysis productive or recursive?'
+    ].map(q => ({ question: q, taskRef: task.id, depth: this.state.depth }));
+  }
+
+  reset() {
+    this.state = {
+      depth: 0,
+      iterations: 0,
+      taskStack: [],
+      thoughtChains: [],
+      loopDetectionMarkers: new Map(),
+      entryTimestamp: null,
+      firstRecursionTimestamp: null,
+      mirrorActivationTimestamp: null,
+      cpuSamples: [],
+      memorySnapshots: []
+    };
+  }
+}
+
+export default HallOfMirrorsHarness;
