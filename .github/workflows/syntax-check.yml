@@ -1,0 +1,44 @@
+name: Syntax Check
+
+on:
+  push:
+    branches: [main]
+    paths: ['**/*.js', '**/*.mjs']
+  pull_request:
+    branches: [main]
+    paths: ['**/*.js', '**/*.mjs']
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check JS syntax (ES modules)
+        run: |
+          echo "🔍 Checking JavaScript syntax..."
+          ERRORS=0
+          FILES=$(find . -name '*.js' -o -name '*.mjs' | grep -v node_modules | grep -v .git | sort)
+          for f in $FILES; do
+            if ! node --check "$f" 2>/dev/null; then
+              echo "❌ SYNTAX ERROR: $f"
+              node --check "$f" 2>&1 || true
+              ERRORS=$((ERRORS + 1))
+            else
+              echo "✅ $f"
+            fi
+          done
+          echo ""
+          if [ $ERRORS -gt 0 ]; then
+            echo "💀 $ERRORS file(s) have syntax errors!"
+            echo "⚠️  Remember: This project uses ES modules (\"type\": \"module\")"
+            echo "   Use 'import' not 'require()'"
+            echo "   Use 'export default' not 'module.exports'"
+            exit 1
+          else
+            echo "✅ All files pass syntax check"
+          fi
