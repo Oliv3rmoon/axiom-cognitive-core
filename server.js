@@ -86,19 +86,48 @@ const MAX_MSG_CHARS = 10000;
 // EXECUTION TRACER FOR CONVERSATION TURNS
 // Instruments every function call, state transition, and timing
 // to map complete tool-calling execution flow
+// NOW SUPPORTS: external intervention during processing
 // ============================================================
 class ExecutionTracer {
   constructor() {
     this.traces = [];
     this.startTime = null;
     this.currentTurnId = null;
+    this.paused = false;
+    this.injectedContext = [];
+    this.redirectTarget = null;
   }
 
   startTurn(turnId) {
     this.currentTurnId = turnId;
     this.startTime = Date.now();
     this.traces = [];
+    this.paused = false;
+    this.injectedContext = [];
+    this.redirectTarget = null;
     this.log('TURN_START', { turnId });
+  }
+
+  // Check if processing should pause (called by conversation loop)
+  async checkPause() {
+    while (this.paused) {
+      this.log('PAUSED', { waiting: true });
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  // Retrieve any context injected during processing
+  getInjectedContext() {
+    const context = [...this.injectedContext];
+    this.injectedContext = [];
+    return context;
+  }
+
+  // Check if execution should redirect to different path
+  getRedirect() {
+    const redirect = this.redirectTarget;
+    this.redirectTarget = null;
+    return redirect;
   }
 
   log(event, data = {}) {
