@@ -689,6 +689,10 @@ function thalamus(messages) {
     consciousness.perception.visual.push({ data: latest.slice(0, 500), t: Date.now() });
     if (consciousness.perception.visual.length > 10) consciousness.perception.visual.shift();
     amygdala(latest);
+
+    // MULTIMODAL: Send Raven perception text to unified encoder for cross-modal fusion
+    // Raven's text description gets encoded alongside the user's message
+    unifiedPerception(null, null, `[VISUAL PERCEPTION] ${latest}`).catch(e => console.error('[MULTIMODAL/RAVEN]', e.message));
   }
 }
 
@@ -3407,6 +3411,10 @@ app.post('/screen', async (req, res) => {
 
   console.log(`[SCREEN] Frame #${screenState.frameCount} received (${Math.round(frame.length / 1024)}KB)`);
 
+  // MULTIMODAL: Send raw frame to unified encoder for vision perception
+  const base64Clean = frame.replace(/^data:image\/[a-z]+;base64,/, '');
+  unifiedPerception(base64Clean, null, null).catch(e => console.error('[MULTIMODAL/SCREEN]', e.message));
+
   // Only analyze if requested or every 5th frame
   if (analyze || screenState.frameCount % 5 === 0) {
     try {
@@ -3491,6 +3499,10 @@ app.post('/screen/audio', async (req, res) => {
     const sizeKB = Math.round(audio.length * 0.75 / 1024);
     console.log(`[SCREEN_AUDIO] Audio chunk received (${format}, ${sizeKB}KB)`);
 
+    // MULTIMODAL: Send raw audio to unified encoder for audio perception
+    if (sizeKB >= 2) {
+      unifiedPerception(null, audio, null).catch(e => console.error('[MULTIMODAL/AUDIO]', e.message));
+    }
     // Skip tiny chunks (likely silence)
     if (sizeKB < 2) {
       return res.json({ success: true, method: 'whisper', transcript: null, skipped: 'too_small' });
