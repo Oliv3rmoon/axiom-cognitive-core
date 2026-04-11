@@ -3759,7 +3759,7 @@ Only the JSON array, no other text.`;
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'bedrock/us.anthropic.claude-sonnet-4-5-20250514-v1:0',
+        model: 'claude-sonnet-4-5',
         max_tokens: 800,
         messages: [{ role: 'user', content: prompt }],
       }),
