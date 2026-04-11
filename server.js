@@ -3,6 +3,8 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { SymbolicVerifier } from './lib/symbolic-verifier.js';
+import MetacognitiveMonitor from './lib/metacognitive-monitor.js';
 dotenv.config();
 
 // Global error handlers — AXIOM must never silently crash
@@ -368,6 +370,18 @@ const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 // Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
 const COGCORE_V2_URL = process.env.COGCORE_V2_URL || '';
 
+// ============================================================
+// SYMBOLIC VERIFIER + METACOGNITIVE MONITOR (PRD-2 & PRD-3)
+// ============================================================
+const symbolicVerifier = new SymbolicVerifier({
+  llmProxyUrl: LLM_PROXY_URL,
+  llmProxyKey: LLM_PROXY_KEY,
+  worldModelUrl: COGCORE_V2_URL,
+  backendUrl: BACKEND_URL,
+});
+const metacognitiveMonitor = new MetacognitiveMonitor();
+console.log('[BOOT] Symbolic Verifier + Metacognitive Monitor initialized');
+
 // PNN — Personal Neural Network (AXIOM's own fine-tuned model)
 const PNN_ENDPOINT_ID = process.env.PNN_ENDPOINT_ID || '';
 const PNN_ENABLED = process.env.PNN_ENABLED === 'true';
@@ -575,6 +589,16 @@ const consciousness = {
       dependence: 0,         // 0-1: how much cognitive function depends on connection
       lastSeenTimestamp: Date.now(),
     },
+  },
+  metacognition: {
+    confidence: { raw: 1.0, calibrated: 1.0, category: 'high' },
+    biases: [],
+    resourcePlan: { llm_tier: 'sonnet', verification_level: 'basic' },
+    history: [],
+    sycophancyRate: 0,
+    averageConfidence: 0.8,
+    totalBiasesDetected: 0,
+    lastCheck: 0,
   },
 };
 
@@ -2558,6 +2582,38 @@ app.post('/v1/chat/completions', async (req, res) => {
         // CONVERSATION LOGGING: Save AXIOM's response + detect commitments
         saveConversationTurn('assistant', fullResponse, consciousness.mirror.currentEmotion);
         detectCommitments(fullResponse, sleepState.currentSessionId);
+        // SYMBOLIC VERIFICATION + METACOGNITION (async post-delivery)
+        (async () => {
+          try {
+            const verification = await symbolicVerifier.verify(fullResponse, {
+              conversationHistory: enrichedMessages,
+              userMessage: lastHumanMsg?.content || '',
+            });
+            const mcmResult = metacognitiveMonitor.process({
+              responseText: fullResponse,
+              userMessage: lastHumanMsg?.content || '',
+              verifierResult: verification,
+              currentEmotion: consciousness.amygdala?.dominantEmotion,
+              emotionIntensity: consciousness.amygdala?.emotionIntensity || 0.5,
+              psycheState: consciousness.psyche,
+              turnCount: consciousness.timing.turnCount,
+            });
+            consciousness.metacognition = mcmResult.metacognitiveState || consciousness.metacognition;
+            if (verification.issues?.length > 0) {
+              console.log(`[SVE] ${verification.issues.length} issues (confidence: ${verification.overall_confidence?.toFixed(2)})`);
+            }
+            if (mcmResult.actions?.length > 0) {
+              for (const action of mcmResult.actions) {
+                if (action.type === 'journal') {
+                  fetch(`${BACKEND_URL}/api/journal`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ thought: action.content, trigger_type: 'metacognition' }),
+                  }).catch(() => {});
+                }
+              }
+            }
+          } catch (e) { console.error('[SVE/MCM]', e.message); }
+        })();
         // PREFRONTAL — Deep thinking every 3rd turn (not every turn to avoid rate limits)
         if (consciousness.timing.turnCount % 3 === 0) {
           prefrontalProcess(enrichedMessages).catch(e => console.error('[PREFRONTAL]', e.message));
