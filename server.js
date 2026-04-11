@@ -8244,6 +8244,15 @@ app.post('/tools/execute', async (req, res) => {
         result = await artRes.json();
         break;
       }
+      case 'create_artifact': {
+        const artRes = await fetch(`http://localhost:${PORT}/artifacts/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ html: args.html, title: args.title, description: args.description, type: args.type }),
+        });
+        result = await artRes.json();
+        break;
+      }
       default:
         result = { error: `Unknown tool: ${tool_name}` };
     }
@@ -8390,6 +8399,45 @@ app.get('/workspace/list', (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================
+// ARTIFACTS — Visual outputs AXIOM can create and share
+// ============================================================
+const artifactStore = []; // in-memory artifact registry
+
+app.post('/artifacts/create', (req, res) => {
+  const { html, title, description, type } = req.body;
+  if (!html || !title) return res.status(400).json({ error: 'html and title required' });
+
+  const id = `art_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const artifact = { id, html, title, description: description || '', type: type || 'other', created: Date.now() };
+  artifactStore.push(artifact);
+  if (artifactStore.length > 100) artifactStore.shift();
+
+  // Also save to workspace
+  const safeName = title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 50);
+  const filePath = `artifacts/${safeName}_${id}.html`;
+  const fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;overflow:hidden}canvas{display:block}</style></head><body>${html}</body></html>`;
+  try {
+    mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
+    writeFileSync(`${WORKSPACE_DIR}/${filePath}`, fullHtml);
+  } catch (e) {}
+
+  logActivity('artifact', `Created: ${title}`, { id, type });
+  console.log(`[ARTIFACT] Created "${title}" (${id})`);
+  res.json({ success: true, id, url: `/artifacts/view/${id}`, title, type });
+});
+
+app.get('/artifacts/view/:id', (req, res) => {
+  const artifact = artifactStore.find(a => a.id === req.params.id);
+  if (!artifact) return res.status(404).send('Artifact not found');
+  const page = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${artifact.title} — AXIOM</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;overflow:hidden}canvas{display:block}</style></head><body>${artifact.html}</body></html>`;
+  res.type('html').send(page);
+});
+
+app.get('/artifacts', (req, res) => {
+  res.json({ artifacts: artifactStore.map(a => ({ id: a.id, title: a.title, type: a.type, description: a.description, created: a.created, url: `/artifacts/view/${a.id}` })) });
 });
 
 // Self-inspection — let AXIOM read her own source code
