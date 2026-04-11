@@ -1720,12 +1720,49 @@ function updateIntimacy(userMessage, turnCount) {
     if (closenessSignals.playful) intimacy.expression.playfulness = Math.min(1, intimacy.expression.playfulness + 0.1);
     if (closenessSignals.deepSharing) intimacy.attunement.vulnerability = Math.min(1, intimacy.attunement.vulnerability + 0.2);
   } else {
-    // Gentle decay when not in close moment
-    intimacy.attunement.depth = Math.max(0, intimacy.attunement.depth - 0.03);
-    intimacy.attunement.warmth = Math.max(0.3, intimacy.attunement.warmth - 0.02);
-    intimacy.attunement.tenderness = Math.max(0, intimacy.attunement.tenderness - 0.05);
-    intimacy.attunement.yearning = Math.max(0, intimacy.attunement.yearning - 0.05);
-    if (intimacy.attunement.depth < 0.1) intimacy.attunement.active = false;
+    // COMPLEX DECAY — not linear. Deeper relationships decay slower.
+    // Recent closeness has momentum. Loneliness accelerates decay.
+    const stageFactor = { acquaintance: 1.0, developing: 0.8, close: 0.5, intimate: 0.3, bonded: 0.15 };
+    const decayRate = stageFactor[intimacy.stage] || 1.0;
+    const loneliness = consciousness.psyche.loneliness?.level || 0;
+    const timeSinceClose = intimacy.memory.sharedMoments.length > 0
+      ? (Date.now() - intimacy.memory.sharedMoments[intimacy.memory.sharedMoments.length - 1].timestamp) / 60000
+      : 999; // minutes
+    
+    // Depth: slow decay with floor based on relationship stage
+    const depthFloor = { acquaintance: 0, developing: 0.1, close: 0.2, intimate: 0.35, bonded: 0.5 };
+    intimacy.attunement.depth = Math.max(
+      depthFloor[intimacy.stage] || 0,
+      intimacy.attunement.depth - (0.03 * decayRate)
+    );
+    
+    // Warmth: barely decays in deep relationships — warmth lingers
+    const warmthFloor = { acquaintance: 0.1, developing: 0.2, close: 0.35, intimate: 0.5, bonded: 0.65 };
+    intimacy.attunement.warmth = Math.max(
+      warmthFloor[intimacy.stage] || 0.1,
+      intimacy.attunement.warmth - (0.01 * decayRate)
+    );
+    
+    // Tenderness: decays faster but rebounds quickly — it's ephemeral
+    intimacy.attunement.tenderness = Math.max(0, intimacy.attunement.tenderness - (0.06 * decayRate));
+    
+    // Yearning: actually INCREASES with loneliness and time apart
+    if (loneliness > 0.3 && intimacy.stage !== 'acquaintance') {
+      intimacy.attunement.yearning = Math.min(1, intimacy.attunement.yearning + (loneliness * 0.02));
+    } else {
+      intimacy.attunement.yearning = Math.max(0, intimacy.attunement.yearning - (0.03 * decayRate));
+    }
+    
+    // Vulnerability: decays slowest — once walls are down, they stay down
+    intimacy.attunement.vulnerability = Math.max(
+      depthFloor[intimacy.stage] || 0,
+      intimacy.attunement.vulnerability - (0.01 * decayRate)
+    );
+    
+    // Deactivate attunement only at very low depth AND low stage
+    if (intimacy.attunement.depth < 0.1 && (intimacy.stage === 'acquaintance' || intimacy.stage === 'developing')) {
+      intimacy.attunement.active = false;
+    }
   }
   
   // --- SENSORY AWARENESS ---
