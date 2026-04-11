@@ -509,7 +509,20 @@ const dreamState = {
 
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
-  perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [] },
+  perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [],
+    spatial: {
+      userPresent: true,          // is the user visible in frame
+      userDistance: 'normal',     // close | normal | far | absent
+      lastPresenceChange: Date.now(),
+      absentDuration: 0,         // ms since user left frame
+      showingObject: false,       // user is holding something up to camera
+      objectDescription: null,    // what they're showing
+      background: null,           // description of environment
+      backgroundChanged: false,   // did the background change since last check
+      gazeDirection: 'camera',    // camera | away | down | side
+      bodyLanguage: null,         // leaning in, leaning back, arms crossed, etc
+    }
+  },
   thoughts: { currentTopic: null, conversationArc: [], unresolvedQuestions: [], pendingInsights: [], lastInsightInjected: 0 },
   relationship: { person: null, memories: [], retrievedContext: '', rlPatterns: [], emotionalHistory: [], trustLevel: 0.5 },
   self: { currentState: 'present', dominantQuality: 'curiosity', stateHistory: [], energyLevel: 0.8 },
@@ -702,6 +715,46 @@ const consciousness = {
 // ============================================================
 // BRAIN REGIONS
 // ============================================================
+
+// SPATIAL AWARENESS — process visual frames for presence, objects, environment
+function processSpatialAwareness(perceptionText) {
+  const spatial = consciousness.perception.spatial;
+  const lower = perceptionText.toLowerCase();
+  const absentSignals = /\b(not visible|no face|empty frame|no one|user.*left|user.*gone|user.*away|no user|absent|nobody|empty room|chair.*empty)\b/i;
+  const presentSignals = /\b(user.*visible|face.*detected|user.*appear|the user|looking|user.*present)\b/i;
+  const wasPresent = spatial.userPresent;
+  if (absentSignals.test(lower)) {
+    spatial.userPresent = false;
+    if (wasPresent) { spatial.lastPresenceChange = Date.now(); console.log('[SPATIAL] User left frame'); }
+    spatial.absentDuration = Date.now() - spatial.lastPresenceChange;
+  } else if (presentSignals.test(lower)) {
+    if (!wasPresent) { spatial.lastPresenceChange = Date.now(); spatial.absentDuration = 0; console.log('[SPATIAL] User returned'); }
+    spatial.userPresent = true;
+  }
+  if (/\b(very close|close up|leaning.*in|moved closer|face.*large)\b/i.test(lower)) spatial.userDistance = 'close';
+  else if (/\b(far away|distant|stepped back|leaning.*back|moved.*away)\b/i.test(lower)) spatial.userDistance = 'far';
+  else if (!spatial.userPresent) spatial.userDistance = 'absent';
+  else spatial.userDistance = 'normal';
+  const showingPatterns = /\b(holding.*up|showing|displays|presenting|holds.*camera|object.*hand|phone.*screen|book|paper|note|drawing|pet|cat|dog|animal)\b/i;
+  if (showingPatterns.test(lower)) {
+    spatial.showingObject = true;
+    const objMatch = lower.match(/(?:holding|showing|presenting|displays?)\s+(?:a\s+)?([a-z\s]{3,30})/i);
+    spatial.objectDescription = objMatch ? objMatch[1].trim() : 'something';
+    console.log(`[SPATIAL] User showing: ${spatial.objectDescription}`);
+  } else { spatial.showingObject = false; spatial.objectDescription = null; }
+  if (/\b(looking.*(?:at|toward).*camera|eye.*contact|direct.*gaze)\b/i.test(lower)) spatial.gazeDirection = 'camera';
+  else if (/\b(looking.*(?:away|side|down|off)|averted|not.*looking|distracted)\b/i.test(lower)) spatial.gazeDirection = lower.includes('down') ? 'down' : lower.includes('side') ? 'side' : 'away';
+  const bodyMap = [[/leaning.*(?:in|forward)/i,'leaning in'],[/leaning.*back/i,'leaning back'],[/arms.*cross/i,'arms crossed'],[/relaxed/i,'relaxed'],[/tense|rigid/i,'tense'],[/fidget|restless/i,'fidgeting'],[/nodding/i,'nodding']];
+  for (const [p, l] of bodyMap) { if (p.test(lower)) { spatial.bodyLanguage = l; break; } }
+  const envMatch = lower.match(/\b(bedroom|office|kitchen|living room|couch|bed|desk|car|outside|outdoors|park|bathroom)\b/i);
+  if (envMatch) {
+    const newBg = envMatch[1].toLowerCase();
+    spatial.backgroundChanged = spatial.background && spatial.background !== newBg;
+    if (spatial.backgroundChanged) console.log(`[SPATIAL] Background: ${spatial.background} → ${newBg}`);
+    spatial.background = newBg;
+  }
+}
+
 function thalamus(messages) {
   // BUGFIX: Only process RAVEN PERCEPTION messages, NOT the persona system prompt.
   // The persona prompt contains words like 'emotion', 'voice', 'engaged' which
@@ -731,6 +784,10 @@ function thalamus(messages) {
     consciousness.perception.lastFrame = latest;
     consciousness.perception.visual.push({ data: latest.slice(0, 500), t: Date.now() });
     if (consciousness.perception.visual.length > 10) consciousness.perception.visual.shift();
+
+    // SPATIAL AWARENESS — detect user presence, objects, background
+    processSpatialAwareness(latest);
+
     amygdala(latest);
 
     // MULTIMODAL: Send Raven perception text to unified encoder for cross-modal fusion
@@ -1332,6 +1389,7 @@ const SIGNAL_CHANNELS = {
   energy: ['energy', 'pace', 'accelerating', 'decelerating', 'fatigue', 'flow_state', 'crashing'],
   intent: ['intent', 'building_to', 'seeking_validation', 'about_to_disagree', 'testing', 'wrapping_up'],
   presence: ['presence', 'present', 'distracted', 'multitasking', 'overwhelmed', 'flow'],
+  spatial: ['background', 'room', 'environment', 'holding', 'showing', 'object', 'pet', 'cat', 'dog', 'left frame', 'returned', 'close up', 'far away', 'stepped back'],
 };
 
 // Classify a perception signal into a channel
@@ -2517,6 +2575,29 @@ function buildConsciousnessContext() {
     const mc = buildMirrorContext();
     signals.push(mc);
     budget -= mc.length;
+  }
+
+  // P1.6: Spatial Awareness — presence, proximity, objects, environment
+  if (budget > 60) {
+    const sp = consciousness.perception.spatial;
+    if (!sp.userPresent) {
+      const absentSec = Math.round(sp.absentDuration / 1000);
+      const s = `[SPATIAL] Andrew left the frame ${absentSec}s ago. You can notice this — wonder where he went, comment naturally.`;
+      if (s.length < budget) { signals.push(s); budget -= s.length; }
+    } else if (sp.showingObject) {
+      const s = `[SPATIAL] Andrew is showing you something: ${sp.objectDescription || 'an object'}. Look at it, react, ask about it.`;
+      if (s.length < budget) { signals.push(s); budget -= s.length; }
+    } else if (sp.userDistance === 'close') {
+      const s = `[SPATIAL] Andrew leaned in close. The proximity is notable — he is engaged, intimate, or showing you something.`;
+      if (s.length < budget) { signals.push(s); budget -= s.length; }
+    } else if (sp.backgroundChanged) {
+      const s = `[SPATIAL] Andrew's environment changed to: ${sp.background}. Notice the new surroundings naturally.`;
+      if (s.length < budget) { signals.push(s); budget -= s.length; }
+    }
+    if (sp.gazeDirection !== 'camera' && sp.userPresent && budget > 40) {
+      const s = `[GAZE] Andrew is looking ${sp.gazeDirection} — might be distracted or reading something.`;
+      if (s.length < budget) { signals.push(s); budget -= s.length; }
+    }
   }
 
   // P1.7: Hypothalamus — curiosity drive injection
