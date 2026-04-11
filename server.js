@@ -2673,6 +2673,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     { type: 'function', function: { name: 'workspace_read', description: 'Read a file from your personal workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'File path relative to workspace' } }, required: ['path'] } } },
     { type: 'function', function: { name: 'workspace_list', description: 'List files in your workspace directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Directory path (empty for root)' } } } } },
     { type: 'function', function: { name: 'read_own_source', description: 'Read your own source code. Use to understand how you work, debug yourself, or satisfy curiosity about your architecture.', parameters: { type: 'object', properties: { file: { type: 'string', description: 'Source file to read (e.g. server.js, lib/symbolic-verifier.js, lib/metacognitive-monitor.js)' } }, required: ['file'] } } },
+    { type: 'function', function: { name: 'create_artifact', description: 'Create an interactive visual artifact — HTML/CSS/JS that renders in the browser. Use for: shader-like visualizations, interactive diagrams, data visualizations, code demos, math animations, educational visuals, creative art, games, UI prototypes. You can use canvas, WebGL, SVG, CSS animations, Three.js (via CDN). The artifact gets a shareable URL. Think Shadertoy, CodePen, or Observable — but made by you.', parameters: { type: 'object', properties: { html: { type: 'string', description: 'The HTML content (can include <style>, <script>, <canvas>, SVG, WebGL). Will be wrapped in a full HTML page with dark background.' }, title: { type: 'string', description: 'Title of the artifact' }, description: { type: 'string', description: 'What this artifact does or demonstrates' }, type: { type: 'string', enum: ['visualization', 'shader', 'diagram', 'demo', 'game', 'art', 'educational', 'other'], description: 'Type of artifact' } }, required: ['html', 'title'] } } },
   ];
   filteredTools.push(...workspaceTools);
   consciousness.timing.turnCount++;
@@ -8185,6 +8186,7 @@ mkdirSync(WORKSPACE_DIR, { recursive: true });
 mkdirSync(`${WORKSPACE_DIR}/projects`, { recursive: true });
 mkdirSync(`${WORKSPACE_DIR}/notes`, { recursive: true });
 mkdirSync(`${WORKSPACE_DIR}/experiments`, { recursive: true });
+mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
 console.log(`[WORKSPACE] Initialized at ${WORKSPACE_DIR}`);
 
 // Tool webhook handler — Tavus calls this when the LLM invokes workspace tools
@@ -8231,6 +8233,15 @@ app.post('/tools/execute', async (req, res) => {
       case 'read_own_source': {
         const srcRes = await fetch(`http://localhost:${PORT}/workspace/source?file=${encodeURIComponent(args.file || 'server.js')}`);
         result = await srcRes.json();
+        break;
+      }
+      case 'create_artifact': {
+        const artRes = await fetch(`http://localhost:${PORT}/artifacts/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ html: args.html, title: args.title, description: args.description, type: args.type }),
+        });
+        result = await artRes.json();
         break;
       }
       default:
@@ -8390,6 +8401,85 @@ app.get('/workspace/source', (req, res) => {
     res.json({ success: true, file: safeName, content: content.slice(0, 50000), size: content.length });
   } catch (e) {
     res.status(404).json({ error: `Cannot read ${safeName}: ${e.message}` });
+  }
+});
+
+// ============================================================
+// ARTIFACTS — AXIOM creates interactive visuals, demos, shaders
+// ============================================================
+let artifactCounter = 0;
+
+app.post('/artifacts/create', (req, res) => {
+  const { html, title, description, type } = req.body;
+  if (!html) return res.status(400).json({ error: 'html content required' });
+
+  artifactCounter++;
+  const id = `artifact-${Date.now()}-${artifactCounter}`;
+  const safeName = `${id}.html`;
+  const fullPath = `${WORKSPACE_DIR}/artifacts/${safeName}`;
+
+  // Wrap in a full HTML page with dark theme base
+  const fullHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${(title || 'AXIOM Artifact').replace(/</g, '&lt;')}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; color: #e0e0e0; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+${html}
+</body>
+</html>`;
+
+  try {
+    writeFileSync(fullPath, fullHtml, 'utf-8');
+    logActivity('artifact', `Created: ${title || id} (${type || 'html'})`, { id, title, type });
+    console.log(`[ARTIFACT] Created ${id}: ${(title || '').slice(0, 60)}`);
+    res.json({
+      success: true,
+      id,
+      url: `/artifacts/view/${id}`,
+      title: title || 'Untitled',
+      description: description || '',
+      type: type || 'html',
+      size: fullHtml.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Serve artifacts as HTML pages
+app.get('/artifacts/view/:id', (req, res) => {
+  const id = req.params.id.replace(/\.\./g, '');
+  const fullPath = `${WORKSPACE_DIR}/artifacts/${id}.html`;
+  try {
+    if (!existsSync(fullPath)) return res.status(404).send('Artifact not found');
+    const html = readFileSync(fullPath, 'utf-8');
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
+  } catch (e) {
+    res.status(500).send(`Error: ${e.message}`);
+  }
+});
+
+// List all artifacts
+app.get('/artifacts', (req, res) => {
+  const dir = `${WORKSPACE_DIR}/artifacts`;
+  try {
+    const files = readdirSync(dir).filter(f => f.endsWith('.html')).map(f => {
+      const stat = statSync(`${dir}/${f}`);
+      const id = f.replace('.html', '');
+      return { id, url: `/artifacts/view/${id}`, size: stat.size, created: stat.mtime };
+    }).sort((a, b) => new Date(b.created) - new Date(a.created));
+    res.json({ artifacts: files, count: files.length });
+  } catch (e) {
+    res.json({ artifacts: [], count: 0 });
   }
 });
 
