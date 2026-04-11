@@ -3726,7 +3726,6 @@ async function idleCuriosityGenerator() {
     };
 
     // Use Sonnet to generate curiosity-driven exploration goals
-    const LITELLM = process.env.LITELLM_URL || 'https://axiom-llm-proxy-production.up.railway.app';
     const prompt = `You are AXIOM's hypothalamus — the drive center. AXIOM has been idle with no goals for too long. Her mind is quiet but shouldn't be empty.
 
 AXIOM'S RECENT THOUGHTS:
@@ -3756,9 +3755,9 @@ Respond in JSON array format:
 
 Only the JSON array, no other text.`;
 
-    const response = await fetch(`${LITELLM}/v1/chat/completions`, {
+    const response = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'bedrock/us.anthropic.claude-sonnet-4-5-20250514-v1:0',
         max_tokens: 800,
