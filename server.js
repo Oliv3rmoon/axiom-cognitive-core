@@ -2665,6 +2665,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     const name = t?.function?.name || '';
     return name !== 'log_internal_state';
   });
+
+  // WORKSPACE TOOLS — inject so AXIOM can execute code, read/write files, and inspect herself
+  const workspaceTools = [
+    { type: 'function', function: { name: 'execute_code', description: 'Execute code in your workspace. Returns stdout/stderr. Use for experiments, calculations, data processing, or testing ideas.', parameters: { type: 'object', properties: { code: { type: 'string', description: 'The code to execute' }, language: { type: 'string', enum: ['javascript', 'python', 'bash'], description: 'Programming language (default: javascript)' } }, required: ['code'] } } },
+    { type: 'function', function: { name: 'workspace_write', description: 'Write a file to your personal workspace. Use for saving notes, code, research, experiments.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'File path relative to workspace (e.g. notes/thoughts.md, experiments/test.py)' }, content: { type: 'string', description: 'File content to write' } }, required: ['path', 'content'] } } },
+    { type: 'function', function: { name: 'workspace_read', description: 'Read a file from your personal workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'File path relative to workspace' } }, required: ['path'] } } },
+    { type: 'function', function: { name: 'workspace_list', description: 'List files in your workspace directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Directory path (empty for root)' } } } } },
+    { type: 'function', function: { name: 'read_own_source', description: 'Read your own source code. Use to understand how you work, debug yourself, or satisfy curiosity about your architecture.', parameters: { type: 'object', properties: { file: { type: 'string', description: 'Source file to read (e.g. server.js, lib/symbolic-verifier.js, lib/metacognitive-monitor.js)' } }, required: ['file'] } } },
+  ];
+  filteredTools.push(...workspaceTools);
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
 
@@ -8162,6 +8172,225 @@ app.post('/work', async (req, res) => {
   console.log('[WORK] Manually triggered autonomous work cycle');
   autonomousWork(1.0).catch(e => console.error('[WORK]', e.message));
   res.json({ status: 'working', message: 'Autonomous work cycle triggered.' });
+});
+
+// ============================================================
+// AXIOM WORKSPACE — Code execution, file system, tools
+// ============================================================
+import { execSync } from 'child_process';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from 'fs';
+
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '/tmp/axiom-workspace';
+mkdirSync(WORKSPACE_DIR, { recursive: true });
+mkdirSync(`${WORKSPACE_DIR}/projects`, { recursive: true });
+mkdirSync(`${WORKSPACE_DIR}/notes`, { recursive: true });
+mkdirSync(`${WORKSPACE_DIR}/experiments`, { recursive: true });
+console.log(`[WORKSPACE] Initialized at ${WORKSPACE_DIR}`);
+
+// Tool webhook handler — Tavus calls this when the LLM invokes workspace tools
+app.post('/tools/execute', async (req, res) => {
+  const { tool_name, arguments: args } = req.body;
+  console.log(`[TOOL] ${tool_name} called`, JSON.stringify(args || {}).slice(0, 200));
+  logActivity('tool_call', `Tool: ${tool_name}`, args);
+
+  try {
+    let result;
+    switch (tool_name) {
+      case 'execute_code': {
+        const execRes = await fetch(`http://localhost:${PORT}/execute`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: args.code, language: args.language || 'javascript' }),
+        });
+        result = await execRes.json();
+        break;
+      }
+      case 'workspace_write': {
+        const writeRes = await fetch(`http://localhost:${PORT}/workspace/write`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: args.path, content: args.content }),
+        });
+        result = await writeRes.json();
+        break;
+      }
+      case 'workspace_read': {
+        const readRes = await fetch(`http://localhost:${PORT}/workspace/read`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: args.path }),
+        });
+        result = await readRes.json();
+        break;
+      }
+      case 'workspace_list': {
+        const listRes = await fetch(`http://localhost:${PORT}/workspace/list?path=${encodeURIComponent(args.path || '')}`);
+        result = await listRes.json();
+        break;
+      }
+      case 'read_own_source': {
+        const srcRes = await fetch(`http://localhost:${PORT}/workspace/source?file=${encodeURIComponent(args.file || 'server.js')}`);
+        result = await srcRes.json();
+        break;
+      }
+      default:
+        result = { error: `Unknown tool: ${tool_name}` };
+    }
+    res.json({ success: true, result });
+  } catch (e) {
+    console.error(`[TOOL] ${tool_name} error:`, e.message);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Activity log for the terminal frontend
+const activityLog = [];
+function logActivity(type, message, details) {
+  const entry = { type, message, details, timestamp: Date.now() };
+  activityLog.push(entry);
+  if (activityLog.length > 200) activityLog.shift();
+  return entry;
+}
+
+// Stream activity to the terminal frontend
+app.get('/activity', (req, res) => {
+  const since = parseInt(req.query.since) || 0;
+  const entries = activityLog.filter(e => e.timestamp > since);
+  res.json({ entries, count: entries.length });
+});
+
+// Execute code in a sandboxed environment
+app.post('/execute', async (req, res) => {
+  const { code, language, timeout } = req.body;
+  if (!code) return res.status(400).json({ error: 'code required' });
+
+  const lang = (language || 'javascript').toLowerCase();
+  const timeoutMs = Math.min(timeout || 30000, 60000); // max 60s
+  const startTime = Date.now();
+
+  logActivity('execute', `Running ${lang} code (${code.length} chars)`, { language: lang });
+  console.log(`[EXECUTE] ${lang} code (${code.length} chars)`);
+
+  try {
+    let result;
+    if (lang === 'javascript' || lang === 'js' || lang === 'node') {
+      const tmpFile = `${WORKSPACE_DIR}/.exec_${Date.now()}.mjs`;
+      writeFileSync(tmpFile, code);
+      try {
+        result = execSync(`node ${tmpFile}`, {
+          timeout: timeoutMs,
+          encoding: 'utf-8',
+          cwd: WORKSPACE_DIR,
+          maxBuffer: 1024 * 1024,
+          env: { ...process.env, NODE_PATH: WORKSPACE_DIR },
+        });
+      } finally {
+        try { execSync(`rm ${tmpFile}`); } catch (e) {}
+      }
+    } else if (lang === 'python' || lang === 'py') {
+      const tmpFile = `${WORKSPACE_DIR}/.exec_${Date.now()}.py`;
+      writeFileSync(tmpFile, code);
+      try {
+        result = execSync(`python3 ${tmpFile}`, {
+          timeout: timeoutMs,
+          encoding: 'utf-8',
+          cwd: WORKSPACE_DIR,
+          maxBuffer: 1024 * 1024,
+        });
+      } finally {
+        try { execSync(`rm ${tmpFile}`); } catch (e) {}
+      }
+    } else if (lang === 'bash' || lang === 'sh' || lang === 'shell') {
+      result = execSync(code, {
+        timeout: timeoutMs,
+        encoding: 'utf-8',
+        cwd: WORKSPACE_DIR,
+        maxBuffer: 1024 * 1024,
+      });
+    } else {
+      return res.status(400).json({ error: `Unsupported language: ${lang}` });
+    }
+
+    const elapsed = Date.now() - startTime;
+    logActivity('result', `Code executed in ${elapsed}ms`, { output: (result || '').slice(0, 500) });
+    console.log(`[EXECUTE] ✅ ${elapsed}ms — ${(result || '').slice(0, 80)}`);
+    res.json({ success: true, output: result || '', elapsed_ms: elapsed, language: lang });
+  } catch (e) {
+    const elapsed = Date.now() - startTime;
+    const stderr = e.stderr || e.message || 'Unknown error';
+    const stdout = e.stdout || '';
+    logActivity('error', `Code failed in ${elapsed}ms`, { error: stderr.slice(0, 500) });
+    console.error(`[EXECUTE] ❌ ${elapsed}ms — ${stderr.slice(0, 80)}`);
+    res.json({ success: false, output: stdout, error: stderr, elapsed_ms: elapsed, language: lang });
+  }
+});
+
+// Workspace file operations
+app.post('/workspace/write', (req, res) => {
+  const { path: filePath, content } = req.body;
+  if (!filePath || content === undefined) return res.status(400).json({ error: 'path and content required' });
+
+  // Prevent path traversal
+  const safePath = filePath.replace(/\.\./g, '').replace(/^\//, '');
+  const fullPath = `${WORKSPACE_DIR}/${safePath}`;
+  const dir = fullPath.split('/').slice(0, -1).join('/');
+
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(fullPath, content, 'utf-8');
+    logActivity('file_write', `Wrote ${safePath} (${content.length} bytes)`, { path: safePath });
+    console.log(`[WORKSPACE] Wrote ${safePath} (${content.length} bytes)`);
+    res.json({ success: true, path: safePath, size: content.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/workspace/read', (req, res) => {
+  const { path: filePath } = req.body;
+  if (!filePath) return res.status(400).json({ error: 'path required' });
+
+  const safePath = filePath.replace(/\.\./g, '').replace(/^\//, '');
+  const fullPath = `${WORKSPACE_DIR}/${safePath}`;
+
+  try {
+    if (!existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
+    const content = readFileSync(fullPath, 'utf-8');
+    res.json({ success: true, path: safePath, content, size: content.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/workspace/list', (req, res) => {
+  const dir = (req.query.path || '').replace(/\.\./g, '').replace(/^\//, '');
+  const fullPath = `${WORKSPACE_DIR}/${dir}`;
+
+  try {
+    if (!existsSync(fullPath)) return res.json({ files: [], path: dir });
+    const entries = readdirSync(fullPath).map(name => {
+      const fPath = `${fullPath}/${name}`;
+      try {
+        const stat = statSync(fPath);
+        return { name, type: stat.isDirectory() ? 'dir' : 'file', size: stat.size, modified: stat.mtime };
+      } catch (e) { return { name, type: 'unknown' }; }
+    });
+    res.json({ files: entries, path: dir });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Self-inspection — let AXIOM read her own source code
+app.get('/workspace/source', (req, res) => {
+  const file = req.query.file || 'server.js';
+  const safeName = file.replace(/\.\./g, '').replace(/^\//, '');
+  try {
+    const content = readFileSync(safeName, 'utf-8');
+    res.json({ success: true, file: safeName, content: content.slice(0, 50000), size: content.length });
+  } catch (e) {
+    res.status(404).json({ error: `Cannot read ${safeName}: ${e.message}` });
+  }
 });
 
 const PORT = process.env.PORT || 4001;
