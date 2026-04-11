@@ -2666,16 +2666,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     return name !== 'log_internal_state';
   });
 
-  // WORKSPACE TOOLS — inject so AXIOM can execute code, read/write files, and inspect herself
-  const workspaceTools = [
-    { type: 'function', function: { name: 'execute_code', description: 'Execute code in your workspace. Returns stdout/stderr. Use for experiments, calculations, data processing, or testing ideas.', parameters: { type: 'object', properties: { code: { type: 'string', description: 'The code to execute' }, language: { type: 'string', enum: ['javascript', 'python', 'bash'], description: 'Programming language (default: javascript)' } }, required: ['code'] } } },
-    { type: 'function', function: { name: 'workspace_write', description: 'Write a file to your personal workspace. Use for saving notes, code, research, experiments.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'File path relative to workspace (e.g. notes/thoughts.md, experiments/test.py)' }, content: { type: 'string', description: 'File content to write' } }, required: ['path', 'content'] } } },
-    { type: 'function', function: { name: 'workspace_read', description: 'Read a file from your personal workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'File path relative to workspace' } }, required: ['path'] } } },
-    { type: 'function', function: { name: 'workspace_list', description: 'List files in your workspace directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Directory path (empty for root)' } } } } },
-    { type: 'function', function: { name: 'read_own_source', description: 'Read your own source code. Use to understand how you work, debug yourself, or satisfy curiosity about your architecture.', parameters: { type: 'object', properties: { file: { type: 'string', description: 'Source file to read (e.g. server.js, lib/symbolic-verifier.js, lib/metacognitive-monitor.js)' } }, required: ['file'] } } },
-    { type: 'function', function: { name: 'create_artifact', description: 'Create an interactive visual artifact — HTML/CSS/JS that renders in the browser. Use for: shader-like visualizations, interactive diagrams, data visualizations, code demos, math animations, educational visuals, creative art, games, UI prototypes. You can use canvas, WebGL, SVG, CSS animations, Three.js (via CDN). The artifact gets a shareable URL. Think Shadertoy, CodePen, or Observable — but made by you.', parameters: { type: 'object', properties: { html: { type: 'string', description: 'The HTML content (can include <style>, <script>, <canvas>, SVG, WebGL). Will be wrapped in a full HTML page with dark background.' }, title: { type: 'string', description: 'Title of the artifact' }, description: { type: 'string', description: 'What this artifact does or demonstrates' }, type: { type: 'string', enum: ['visualization', 'shader', 'diagram', 'demo', 'game', 'art', 'educational', 'other'], description: 'Type of artifact' } }, required: ['html', 'title'] } } },
-  ];
-  filteredTools.push(...workspaceTools);
+  // WORKSPACE TOOLS — only inject during NON-Tavus sessions to avoid breaking video conversations
+  // Tavus sessions pass tools from the persona config; adding 6 more can overwhelm the tool handler
+  // These tools are available during autonomous work via the /tools/execute webhook
+  // const workspaceTools = [...]; // Disabled for live sessions — available via autonomous work + /execute endpoint
   consciousness.timing.turnCount++;
   markConversationActive(); // HEARTBEAT: pause autonomous thinking during conversation
 
