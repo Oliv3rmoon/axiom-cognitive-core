@@ -382,6 +382,60 @@ const symbolicVerifier = new SymbolicVerifier({
 const metacognitiveMonitor = new MetacognitiveMonitor();
 console.log('[BOOT] Symbolic Verifier + Metacognitive Monitor initialized');
 
+// ============================================================
+// MULTIMODAL ENCODER (PRD-1) — Unified perception
+// ============================================================
+const MULTIMODAL_URL = process.env.MULTIMODAL_URL || '';
+
+async function unifiedPerception(frameBase64, audioChunk, userText) {
+  if (!MULTIMODAL_URL) return null;
+  try {
+    const body = {};
+    if (frameBase64) body.vision = frameBase64;
+    if (audioChunk) body.audio = audioChunk;
+    if (userText) body.text = userText;
+    if (!body.vision && !body.audio && !body.text) return null;
+
+    const res = await fetch(`${MULTIMODAL_URL}/encode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+
+    // Update consciousness with unified perception
+    consciousness.perception = {
+      unified_embedding: data.unified_embedding,
+      interpretation: data.interpretation,
+      modality_weights: data.modality_weights,
+      last_updated: Date.now(),
+    };
+
+    // Feed to amygdala
+    if (data.interpretation?.primary_emotion) {
+      consciousness.amygdala.dominantEmotion = data.interpretation.primary_emotion;
+      consciousness.amygdala.emotionIntensity = data.interpretation.emotion_confidence || 0.5;
+    }
+
+    // Feed mismatches to cingulate
+    if (data.interpretation?.mismatch_detected) {
+      consciousness.cingulate.contradictions.push({
+        type: 'cross_modal_mismatch',
+        description: data.interpretation.mismatch_description,
+        timestamp: Date.now(),
+      });
+      console.log(`[MULTIMODAL] Mismatch detected: ${data.interpretation.mismatch_description}`);
+    }
+
+    return data;
+  } catch (e) {
+    console.error('[MULTIMODAL]', e.message);
+    return null;
+  }
+}
+console.log(`[BOOT] Multimodal Encoder: ${MULTIMODAL_URL || 'not configured (set MULTIMODAL_URL)'}`);
+
+
 // PNN — Personal Neural Network (AXIOM's own fine-tuned model)
 const PNN_ENDPOINT_ID = process.env.PNN_ENDPOINT_ID || '';
 const PNN_ENABLED = process.env.PNN_ENABLED === 'true';
@@ -2420,6 +2474,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     hypothalamusProcess(lastUserMsg?.content || '');
   } catch (e) { console.error('[HYPOTHALAMUS ERROR]', e.message); }
 
+  // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
+  unifiedPerception(null, null, lastUserMsg?.content || '').catch(e => console.error('[MULTIMODAL]', e.message));
+
   try {
     psycheProcess(lastUserMsg?.content || '', consciousness.timing.turnCount);
   } catch (e) { console.error('[PSYCHE ERROR]', e.message); }
@@ -3010,6 +3067,7 @@ app.get('/health', (req, res) => {
     },
     goals: { active: goalState.activeGoals.length },
     cogcore_v2: COGCORE_V2_URL ? { url: COGCORE_V2_URL, connected: true } : { connected: false },
+    multimodal: MULTIMODAL_URL ? { url: MULTIMODAL_URL, connected: true } : { connected: false },
   });
 });
 
