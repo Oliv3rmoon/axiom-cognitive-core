@@ -5345,7 +5345,20 @@ Return ONLY JSON:
     const text = data.choices?.[0]?.message?.content?.trim() || '';
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
-      const parsed = JSON.parse(match[0]);
+      // Repair common LLM JSON issues: trailing commas, truncated arrays/objects
+      let jsonStr = match[0]
+        .replace(/,\s*([\]}])/g, '$1')       // remove trailing commas
+        .replace(/}\s*{/g, '},{')             // fix missing comma between objects
+        .replace(/"\s*"/g, '","');            // fix missing comma between strings
+      // If JSON is truncated (missing closing brackets), try to close it
+      const opens = (jsonStr.match(/{/g) || []).length;
+      const closes = (jsonStr.match(/}/g) || []).length;
+      const arrOpens = (jsonStr.match(/\[/g) || []).length;
+      const arrCloses = (jsonStr.match(/\]/g) || []).length;
+      for (let i = 0; i < arrOpens - arrCloses; i++) jsonStr += ']';
+      for (let i = 0; i < opens - closes; i++) jsonStr += '}';
+      
+      const parsed = JSON.parse(jsonStr);
       const steps = parsed.steps || [];
       if (steps.length > 0) {
         await fetch(`${BACKEND_URL}/api/plans`, {
