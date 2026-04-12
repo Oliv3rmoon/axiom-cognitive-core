@@ -1,163 +1,84 @@
-const EventEmitter = require('events');
+// Conversation Quality Monitor (ES Module)
+// Tracks response quality, tool loop risk, and engagement depth
 
-/**
- * Conversation Quality Monitor
- * Tracks repetition patterns, tool-calling loops, and connection quality metrics
- * in real-time during AXIOM's conversation processing.
- */
-class ConversationQualityMonitor extends EventEmitter {
-  constructor(config = {}) {
-    super();
-    
-    this.config = {
-      // N-gram analysis thresholds
-      ngramSize: config.ngramSize || 5,
-      repetitionThreshold: config.repetitionThreshold || 0.3, // 30% repeated n-grams
-      
-      // Tool-calling loop detection
-      maxConsecutiveToolCalls: config.maxConsecutiveToolCalls || 5,
-      toolCallProgressWindow: config.toolCallProgressWindow || 3,
-      minProgressTokens: config.minProgressTokens || 20,
-      
-      // Connection quality thresholds
-      coherenceThreshold: config.coherenceThreshold || 0.6,
-      contextDriftThreshold: config.contextDriftThreshold || 0.7,
-      responseTimeThreshold: config.responseTimeThreshold || 5000, // ms
-      
-      // Alert configuration
-      alertCooldown: config.alertCooldown || 30000, // 30 seconds between similar alerts
-      enableRealTimeAlerts: config.enableRealTimeAlerts !== false,
-      
-      ...config
-    };
-    
-    // State tracking
-    this.conversationState = {
-      tokenCount: 0,
-      messageHistory: [],
-      ngramCache: new Map(),
-      toolCallHistory: [],
-      lastAlerts: new Map(),
-      coherenceScores: [],
-      contextVectors: [],
-      startTime: Date.now()
-    };
-    
+class ConversationQualityMonitor {
+  constructor() {
     this.metrics = {
-      repetitionScore: 0,
+      totalEntries: 0,
+      qualityScores: [],
       toolLoopRisk: 0,
-      coherenceScore: 1.0,
-      contextDrift: 0,
-      responseTime: 0,
-      alertsTriggered: []
+      engagementDepth: 0,
+      repetitionCount: 0,
+      uniqueTopics: new Set(),
+    };
+    this.recentResponses = [];
+  }
+
+  processEntry(entry) {
+    this.metrics.totalEntries++;
+    const thought = entry.thought || '';
+    const triggerType = entry.trigger_type || '';
+
+    if (triggerType === 'conversation' || triggerType === 'micro') {
+      this.recentResponses.push(thought.slice(0, 200));
+      if (this.recentResponses.length > 20) this.recentResponses.shift();
+    }
+
+    // Track unique topics
+    const words = thought.toLowerCase().split(/\s+/).filter(w => w.length > 5);
+    words.slice(0, 5).forEach(w => this.metrics.uniqueTopics.add(w));
+
+    // Detect repetition
+    const repetitionRatio = this._calculateRepetition();
+    const progressFactor = this.metrics.uniqueTopics.size / Math.max(this.metrics.totalEntries, 1);
+    this.metrics.toolLoopRisk = (repetitionRatio * 0.6) + ((1 - progressFactor) * 0.4);
+
+    // Quality score
+    const quality = this._scoreQuality(thought, triggerType);
+    this.metrics.qualityScores.push(quality);
+    if (this.metrics.qualityScores.length > 50) this.metrics.qualityScores.shift();
+  }
+
+  _calculateRepetition() {
+    if (this.recentResponses.length < 3) return 0;
+    let matches = 0;
+    for (let i = 1; i < this.recentResponses.length; i++) {
+      const similarity = this._similarity(this.recentResponses[i], this.recentResponses[i - 1]);
+      if (similarity > 0.7) matches++;
+    }
+    return matches / (this.recentResponses.length - 1);
+  }
+
+  _similarity(a, b) {
+    if (!a || !b) return 0;
+    const setA = new Set(a.toLowerCase().split(/\s+/));
+    const setB = new Set(b.toLowerCase().split(/\s+/));
+    const intersection = [...setA].filter(x => setB.has(x)).length;
+    const union = new Set([...setA, ...setB]).size;
+    return union > 0 ? intersection / union : 0;
+  }
+
+  _scoreQuality(thought, type) {
+    let score = 0.5;
+    if (thought.length > 100) score += 0.1;
+    if (thought.length > 300) score += 0.1;
+    if (/\?/.test(thought)) score += 0.05;
+    if (type === 'micro') score += 0.1;
+    if (type === 'autonomous_plan_step') score += 0.15;
+    return Math.min(1, score);
+  }
+
+  generateReport() {
+    const avg = this.metrics.qualityScores.length > 0
+      ? this.metrics.qualityScores.reduce((a, b) => a + b, 0) / this.metrics.qualityScores.length : 0;
+    return {
+      totalEntries: this.metrics.totalEntries,
+      averageQuality: avg.toFixed(3),
+      toolLoopRisk: this.metrics.toolLoopRisk.toFixed(3),
+      uniqueTopics: this.metrics.uniqueTopics.size,
+      recentResponseCount: this.recentResponses.length,
     };
   }
+}
 
-  /**
-   * Process a new message in the conversation
-   */
-  processMessage(message, metadata = {}) {
-    const timestamp = Date.now();
-    
-    this.conversationState.messageHistory.push({
-      content: message,
-      timestamp,
-      role: metadata.role || 'assistant',
-      tokenCount: metadata.tokenCount || this._estimateTokens(message)
-    });
-    
-    this.conversationState.tokenCount += metadata.tokenCount || this._estimateTokens(message);
-    
-    // Run quality checks
-    this._analyzeRepetition(message);
-    this._updateCoherence(message, metadata);
-    this._updateContextDrift(message, metadata);
-    
-    // Check for quality issues
-    this._evaluateQuality();
-    
-    return this.getMetrics();
-  }
-
-  /**
-   * Record a tool call for loop detection
-   */
-  recordToolCall(toolName, params = {}, result = null) {
-    const toolCall = {
-      name: toolName,
-      timestamp: Date.now(),
-      params,
-      result,
-      resultTokens: result ? this._estimateTokens(JSON.stringify(result)) : 0
-    };
-    
-    this.conversationState.toolCallHistory.push(toolCall);
-    
-    // Analyze for tool-calling loops
-    this._analyzeToolLoops();
-    
-    // Check quality after tool call
-    this._evaluateQuality();
-    
-    return this.getMetrics();
-  }
-
-  /**
-   * Analyze n-gram repetition patterns
-   */
-  _analyzeRepetition(message) {
-    const tokens = this._tokenize(message);
-    const ngrams = this._extractNgrams(tokens, this.config.ngramSize);
-    
-    let totalNgrams = ngrams.length;
-    let repeatedCount = 0;
-    
-    ngrams.forEach(ngram => {
-      const key = ngram.join('_');
-      const count = this.conversationState.ngramCache.get(key) || 0;
-      
-      if (count > 0) {
-        repeatedCount++;
-      }
-      
-      this.conversationState.ngramCache.set(key, count + 1);
-    });
-    
-    // Calculate repetition score
-    this.metrics.repetitionScore = totalNgrams > 0 
-      ? repeatedCount / totalNgrams 
-      : 0;
-    
-    // Check threshold
-    if (this.metrics.repetitionScore > this.config.repetitionThreshold) {
-      this._triggerAlert('HIGH_REPETITION', {
-        score: this.metrics.repetitionScore,
-        threshold: this.config.repetitionThreshold,
-        message: `Detected ${(this.metrics.repetitionScore * 100).toFixed(1)}% repeated n-grams`
-      });
-    }
-  }
-
-  /**
-   * Analyze tool-calling loops
-   */
-  _analyzeToolLoops() {
-    const recentCalls = this.conversationState.toolCallHistory.slice(-this.config.maxConsecutiveToolCalls);
-    
-    if (recentCalls.length < this.config.maxConsecutiveToolCalls) {
-      this.metrics.toolLoopRisk = 0;
-      return;
-    }
-    
-    // Check for consecutive tool calls without progress
-    const windowCalls = recentCalls.slice(-this.config.toolCallProgressWindow);
-    const totalProgress = windowCalls.reduce((sum, call) => sum + call.resultTokens, 0);
-    
-    // Check for repeated tool patterns
-    const toolNames = recentCalls.map(c => c.name);
-    const uniqueTools = new Set(toolNames);
-    const repetitionRatio = 1 - (uniqueTools.size / toolNames.length);
-    
-    // Calculate loop risk
-    const progressFactor = totalProgress < this.config.minProgressTokens ? 1 : 0;
-    this.metrics.toolLoopRisk = (repetitionRatio * 0.6) + (progressF
+export default ConversationQualityMonitor;
