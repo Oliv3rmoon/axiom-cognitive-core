@@ -412,7 +412,11 @@ console.log('[BOOT] Symbolic Verifier + Metacognitive Monitor initialized');
 // ============================================================
 // MULTIMODAL ENCODER (PRD-1) — Unified perception
 // ============================================================
-const MULTIMODAL_URL = process.env.MULTIMODAL_URL || '';
+let MULTIMODAL_URL = process.env.MULTIMODAL_URL || '';
+// Ensure URL has protocol prefix
+if (MULTIMODAL_URL && !MULTIMODAL_URL.startsWith('http')) {
+  MULTIMODAL_URL = `https://${MULTIMODAL_URL}`;
+}
 
 async function unifiedPerception(frameBase64, audioChunk, userText) {
   if (!MULTIMODAL_URL) return null;
