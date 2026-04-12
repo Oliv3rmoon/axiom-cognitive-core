@@ -98,6 +98,9 @@ class ExecutionTracer {
     this.paused = false;
     this.injectedContext = [];
     this.redirectTarget = null;
+    this.estimatedTokens = 0;
+    this.tokenBudget = 4000; // Conservative budget for response generation
+    this.tokenWarningThreshold = 0.8; // Warn at 80% capacity
   }
 
   startTurn(turnId) {
@@ -107,7 +110,31 @@ class ExecutionTracer {
     this.paused = false;
     this.injectedContext = [];
     this.redirectTarget = null;
+    this.estimatedTokens = 0;
     this.log('TURN_START', { turnId });
+  }
+
+  // Rough token estimation (4 chars ≈ 1 token)
+  estimateTokens(text) {
+    return Math.ceil((text?.length || 0) / 4);
+  }
+
+  trackTokenUsage(content) {
+    this.estimatedTokens += this.estimateTokens(content);
+    this.log('TOKEN_USAGE', { 
+      estimated: this.estimatedTokens, 
+      budget: this.tokenBudget,
+      utilization: (this.estimatedTokens / this.tokenBudget * 100).toFixed(1) + '%'
+    });
+    return this.estimatedTokens;
+  }
+
+  isApproachingBudget() {
+    return this.estimatedTokens >= (this.tokenBudget * this.tokenWarningThreshold);
+  }
+
+  shouldForceCompletion() {
+    return this.estimatedTokens >= this.tokenBudget;
   }
 
   // Check if processing should pause (called by conversation loop)
