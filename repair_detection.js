@@ -1,149 +1,156 @@
-/**
- * AXIOM Cognitive Core - Conversation Repair Detection Module
- * 
- * Based on Schegloff's conversation analysis framework for repair sequences:
- * - Self-initiated self-repair (SISR)
- * - Other-initiated self-repair (OISR)
- * - Self-initiated other-repair (SIOR)
- * - Other-initiated other-repair (OIOR)
- * 
- * Monitors conversation state for trouble sources and understanding breakdowns,
- * triggering explicit recalibration requests before conversational spiraling occurs.
- */
-
 const EventEmitter = require('events');
 
-class RepairDetectionSystem extends EventEmitter {
-  constructor(config = {}) {
+/**
+ * Conversation Repair Detection Module
+ * 
+ * Based on Emanuel Schegloff's research on conversation repair sequences,
+ * particularly the concepts of:
+ * - Self-initiated self-repair (SISR)
+ * - Other-initiated repair (OIR)
+ * - Trouble sources and repair initiators
+ * - Next Turn Repair Initiators (NTRIs)
+ * 
+ * References:
+ * - Schegloff, E. A., Jefferson, G., & Sacks, H. (1977). "The preference for self-correction"
+ * - Schegloff, E. A. (1992). "Repair after next turn"
+ * - Schegloff, E. A. (2000). "When 'others' initiate repair"
+ */
+
+class RepairDetector extends EventEmitter {
+  constructor(options = {}) {
     super();
     
     this.config = {
-      longGapThresholdMs: config.longGapThresholdMs || 120000, // 2 minutes
-      repeatedQuestionWindow: config.repeatedQuestionWindow || 5,
-      vagueConfirmationPatterns: config.vagueConfirmationPatterns || [
-        /^(okay|ok|sure|right|yeah|yes|mhm|uh-?huh)\.?$/i,
-        /^i (see|understand|get it)\.?$/i,
-        /^that makes sense\.?$/i,
-        /^got it\.?$/i
-      ],
-      topicDriftThreshold: config.topicDriftThreshold || 0.3,
-      hedgingPatterns: config.hedgingPatterns || [
-        /\b(maybe|perhaps|possibly|i think|i guess|kind of|sort of|probably)\b/gi,
-        /\b(not sure|unclear|confused|lost)\b/gi,
-        /\?\?+/g
-      ],
-      repairTriggerThreshold: config.repairTriggerThreshold || 3,
-      minTurnsBeforeRepair: config.minTurnsBeforeRepair || 3
+      // Turn-level thresholds
+      maxResponseTime: options.maxResponseTime || 10000, // milliseconds
+      minResponseLength: options.minResponseLength || 20, // characters
+      
+      // Pattern detection windows
+      repetitionWindow: options.repetitionWindow || 5, // turns
+      topicDriftWindow: options.topicDriftWindow || 10, // turns
+      
+      // Sensitivity thresholds
+      vagueConfirmationThreshold: options.vagueConfirmationThreshold || 0.7,
+      semanticDriftThreshold: options.semanticDriftThreshold || 0.4,
+      repetitionThreshold: options.repetitionThreshold || 2, // occurrences
+      
+      // Repair initiation
+      repairCooldown: options.repairCooldown || 30000, // ms between repair attempts
+      maxRepairsPerSession: options.maxRepairsPerSession || 5,
     };
-
-    // Conversation state tracking
-    this.conversationState = {
-      turnHistory: [],
-      lastUserMessageTime: null,
-      lastAssistantMessageTime: null,
+    
+    this.state = {
+      conversationHistory: [],
       topicVector: null,
-      recentQuestions: [],
-      breakdownMarkers: [],
-      consecutiveVagueResponses: 0,
-      lastRepairAttemptTurn: -1,
-      currentTurnIndex: 0
+      lastRepairTimestamp: 0,
+      repairCount: 0,
+      troubleSourceAccumulator: [],
     };
-
-    // Repair strategies repository
-    this.repairStrategies = {
-      long_gap: this.createLongGapRepair.bind(this),
-      repeated_question: this.createRepeatedQuestionRepair.bind(this),
-      vague_confirmation: this.createVagueConfirmationRepair.bind(this),
-      topic_drift: this.createTopicDriftRepair.bind(this),
-      hedging_cluster: this.createHedgingClusterRepair.bind(this),
-      comprehension_failure: this.createComprehensionFailureRepair.bind(this)
+    
+    // Schegloff's repair initiators - markers that signal understanding problems
+    this.repairInitiatorPatterns = {
+      // Open class repair initiators
+      openClass: [
+        /^(what|huh|pardon|sorry)\??$/i,
+        /^come again\??$/i,
+        /^say (what|that again)\??$/i,
+      ],
+      
+      // Specific question words indicating confusion
+      specificQuestions: [
+        /^(who|when|where)\??$/i,
+        /which (one|part|thing)/i,
+      ],
+      
+      // Partial repeat + question word (strongest repair signal)
+      partialRepeat: [
+        /you (said|mean) (.*?)\?/i,
+        /did you (say|mean) (.*?)\?/i,
+      ],
+      
+      // Metalinguistic markers
+      metalinguistic: [
+        /i don'?t (understand|follow|get it)/i,
+        /that doesn'?t make sense/i,
+        /i'?m (confused|lost)/i,
+        /can you (clarify|explain|rephrase)/i,
+        /what do you mean( by)?/i,
+      ],
+    };
+    
+    // Vague acknowledgment tokens (potential trouble indicators)
+    this.vagueTokens = [
+      /^(ok|okay|sure|right|yeah|yep|uh-?huh|mm-?hmm|i see)\.?$/i,
+      /^got it\.?$/i,
+      /^makes sense\.?$/i,
+    ];
+  }
+  
+  /**
+   * Process a new turn in the conversation
+   * @param {Object} turn - Turn object with speaker, text, timestamp, metadata
+   */
+  processTurn(turn) {
+    const enrichedTurn = this._enrichTurn(turn);
+    this.state.conversationHistory.push(enrichedTurn);
+    
+    // Keep history manageable
+    if (this.state.conversationHistory.length > 50) {
+      this.state.conversationHistory.shift();
+    }
+    
+    // Detect trouble sources
+    const troubleMarkers = this._detectTroubleMarkers(enrichedTurn);
+    
+    if (troubleMarkers.length > 0) {
+      this.state.troubleSourceAccumulator.push({
+        turn: enrichedTurn,
+        markers: troubleMarkers,
+        timestamp: Date.now(),
+      });
+      
+      this.emit('trouble-detected', {
+        turn: enrichedTurn,
+        markers: troubleMarkers,
+      });
+    }
+    
+    // Evaluate if repair is needed
+    const repairAssessment = this._assessRepairNeed();
+    
+    if (repairAssessment.shouldRepair) {
+      this._initiateRepair(repairAssessment);
+    }
+    
+    return {
+      troubleMarkers,
+      repairAssessment,
     };
   }
-
+  
   /**
-   * Main entry point: analyze turn and detect if repair is needed
+   * Enrich turn with analytical metadata
    */
-  analyzeTurn(userMessage, assistantResponse, metadata = {}) {
-    const timestamp = Date.now();
+  _enrichTurn(turn) {
+    const text = turn.text || '';
+    const timestamp = turn.timestamp || Date.now();
     
-    const turn = {
-      index: this.conversationState.currentTurnIndex++,
-      userMessage,
-      assistantResponse,
+    return {
+      ...turn,
       timestamp,
-      metadata
+      length: text.length,
+      wordCount: text.split(/\s+/).filter(w => w.length > 0).length,
+      semanticVector: this._computeSemanticVector(text),
+      isVague: this._isVagueResponse(text),
+      hasHedging: this._hasHedgingLanguage(text),
+      questionWords: this._extractQuestionWords(text),
     };
-
-    this.conversationState.turnHistory.push(turn);
-    this.conversationState.lastUserMessageTime = timestamp;
-
-    // Run all detection heuristics
-    const markers = this.detectBreakdownMarkers(turn);
-    
-    if (markers.length > 0) {
-      this.conversationState.breakdownMarkers.push(...markers);
-      this.emit('markers_detected', { markers, turn });
-    }
-
-    // Evaluate if repair threshold reached
-    const repairDecision = this.evaluateRepairNeed();
-    
-    if (repairDecision.needed) {
-      this.emit('repair_needed', repairDecision);
-      return repairDecision;
-    }
-
-    return { needed: false, markers };
   }
-
+  
   /**
-   * Detect breakdown markers using multiple heuristics
+   * Detect trouble markers in current turn
+   * Based on Schegloff's repair sequence taxonomy
    */
-  detectBreakdownMarkers(turn) {
+  _detectTroubleMarkers(turn) {
     const markers = [];
-
-    // 1. Long gap detection (Schegloff: silence as trouble indicator)
-    if (this.detectLongGap(turn)) {
-      markers.push({
-        type: 'long_gap',
-        severity: 'medium',
-        turn: turn.index,
-        description: 'Significant time gap detected between turns'
-      });
-    }
-
-    // 2. Repeated question detection (OISR: other-initiated repair)
-    const repeatedQuestion = this.detectRepeatedQuestion(turn);
-    if (repeatedQuestion) {
-      markers.push({
-        type: 'repeated_question',
-        severity: 'high',
-        turn: turn.index,
-        description: 'User asking similar question again',
-        details: repeatedQuestion
-      });
-    }
-
-    // 3. Vague confirmation detection (possible fake understanding)
-    if (this.detectVagueConfirmation(turn)) {
-      this.conversationState.consecutiveVagueResponses++;
-      markers.push({
-        type: 'vague_confirmation',
-        severity: this.conversationState.consecutiveVagueResponses > 2 ? 'high' : 'low',
-        turn: turn.index,
-        description: 'Minimal acknowledgment without substantive engagement'
-      });
-    } else {
-      this.conversationState.consecutiveVagueResponses = 0;
-    }
-
-    // 4. Topic drift detection (loss of coherence)
-    const topicDrift = this.detectTopicDrift(turn);
-    if (topicDrift.isDrift) {
-      markers.push({
-        type: 'topic_drift',
-        severity: 'medium',
-        turn: turn.index,
-        description: 'Conversation topic has drifted significantly',
-        details: topicDrift
-      });
+    const text = turn.text || '';
