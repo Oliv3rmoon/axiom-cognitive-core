@@ -400,6 +400,16 @@ const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 // Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
 let COGCORE_V2_URL = ensureProtocol(process.env.COGCORE_V2_URL || '');
 
+// Safe JSON fetch — returns null instead of crashing on non-JSON responses
+async function safeFetchJSON(url, options) {
+  try {
+    const r = await fetch(url, options);
+    if (!r.ok) return null;
+    const text = await r.text();
+    try { return JSON.parse(text); } catch { return null; }
+  } catch { return null; }
+}
+
 // ============================================================
 // SYMBOLIC VERIFIER + METACOGNITIVE MONITOR (PRD-2 & PRD-3)
 // ============================================================
@@ -4900,7 +4910,7 @@ async function autonomousWork(gapHours) {
             action: step.action,
             action_details: step.description,
           }),
-        }).then(r => r.json());
+        }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
         predictionId = pred.prediction_id;
         step._predicted_success = pred.predicted_success_probability;
         console.log(`[WORLD MODEL] Prediction: ${(pred.predicted_success_probability * 100).toFixed(0)}% success, confidence ${(pred.confidence * 100).toFixed(0)}%`);
@@ -5033,7 +5043,7 @@ async function autonomousWork(gapHours) {
 
     // COGCORE V2: Update world model with actual outcome
     if (COGCORE_V2_URL && predictionId) {
-      fetch(`${COGCORE_V2_URL}/world-model/update`, {
+      safeFetchJSON(`${COGCORE_V2_URL}/world-model/update`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prediction_id: predictionId,
@@ -5041,8 +5051,8 @@ async function autonomousWork(gapHours) {
           was_successful: !isFailed,
           action: step.action,
         }),
-      }).then(r => r.json()).then(d => {
-        if (d.prediction_error !== undefined) {
+      }).then(d => {
+        if (d && d.prediction_error !== undefined) {
           console.log(`[WORLD MODEL] Prediction error: ${(d.prediction_error * 100).toFixed(1)}% | Curiosity: ${(d.curiosity_signal * 100).toFixed(1)}%`);
         }
       }).catch(e => console.error('[WORLD MODEL] Update failed:', e.message));
