@@ -389,13 +389,16 @@ const BROWSER_URL = process.env.BROWSER_URL || 'https://axiom-browser-production
 const BROWSER_KEY = process.env.BROWSER_KEY || 'axiom-browser-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 
+// Ensure all external URLs have protocol prefix
+function ensureProtocol(url) { return url && !url.startsWith('http') ? `https://${url}` : url; }
+
 // DUAL BRAIN CONFIGURATION
 const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 
 // Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
-const COGCORE_V2_URL = process.env.COGCORE_V2_URL || '';
+let COGCORE_V2_URL = ensureProtocol(process.env.COGCORE_V2_URL || '');
 
 // ============================================================
 // SYMBOLIC VERIFIER + METACOGNITIVE MONITOR (PRD-2 & PRD-3)
@@ -412,11 +415,7 @@ console.log('[BOOT] Symbolic Verifier + Metacognitive Monitor initialized');
 // ============================================================
 // MULTIMODAL ENCODER (PRD-1) — Unified perception
 // ============================================================
-let MULTIMODAL_URL = process.env.MULTIMODAL_URL || '';
-// Ensure URL has protocol prefix
-if (MULTIMODAL_URL && !MULTIMODAL_URL.startsWith('http')) {
-  MULTIMODAL_URL = `https://${MULTIMODAL_URL}`;
-}
+let MULTIMODAL_URL = ensureProtocol(process.env.MULTIMODAL_URL || '');
 
 async function unifiedPerception(frameBase64, audioChunk, userText) {
   if (!MULTIMODAL_URL) return null;
