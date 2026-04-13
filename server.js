@@ -111,7 +111,15 @@ class ExecutionTracer {
     this.injectedContext = [];
     this.redirectTarget = null;
     this.estimatedTokens = 0;
-    this.log('TURN_START', { turnId });
+    this.log('TURN_START', { 
+    turnId,
+    timestamp: new Date().toISOString(),
+    thoughtContext: {
+      triggerType: 'user_message',
+      priorState: 'idle',
+      intentionChain: ['receive_input', 'classify_request', 'plan_response']
+    }
+  });
   }
 
   // Rough token estimation (4 chars ≈ 1 token)
