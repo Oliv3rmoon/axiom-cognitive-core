@@ -17,6 +17,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const app = express();
+app.set('trust proxy', 1); // Railway runs behind a reverse proxy
 app.use(express.json({ limit: '10mb' }));
 
 // CORS — allow screen sharing page and other frontends to connect
