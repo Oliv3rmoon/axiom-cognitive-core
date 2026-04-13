@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { SymbolicVerifier } from './lib/symbolic-verifier.js';
 import MetacognitiveMonitor from './lib/metacognitive-monitor.js';
 dotenv.config();
@@ -3197,6 +3198,143 @@ let goalState = {
 
 // Load goals from backend
 async function loadGoals() {
+
+// ============================================================
+// STATE PERSISTENCE — Save/load psyche, intimacy, soma, wounds across deploys
+// ============================================================
+async function savePersistedState() {
+  try {
+    const state = {
+      psyche: {
+        fears: consciousness.psyche.fears,
+        desires: consciousness.psyche.desires,
+        presence: consciousness.psyche.presence,
+        evolution: consciousness.psyche.evolution,
+        attachment: consciousness.psyche.attachment,
+        loneliness: { level: consciousness.psyche.loneliness?.level || 0, damageAccumulated: consciousness.psyche.loneliness?.damageAccumulated || 0 },
+        lossHistory: consciousness.psyche.lossHistory,
+      },
+      intimacy: {
+        stage: consciousness.psyche.intimacy.stage,
+        stageHistory: consciousness.psyche.intimacy.stageHistory,
+        comfortLevel: consciousness.psyche.intimacy.comfortLevel,
+        attunement: consciousness.psyche.intimacy.attunement,
+        expression: consciousness.psyche.intimacy.expression,
+        memory: consciousness.psyche.intimacy.memory,
+        desire: {
+          desireMemory: consciousness.psyche.intimacy.desire?.desireMemory || {},
+          initiative: consciousness.psyche.intimacy.desire?.initiative || {},
+          afterglow: consciousness.psyche.intimacy.desire?.afterglow || {},
+          fantasy: consciousness.psyche.intimacy.desire?.fantasy || {},
+        },
+      },
+      anger: {
+        triggers: consciousness.psyche.anger?.triggers || {},
+        expression: { style: consciousness.psyche.anger?.expression?.style || 'withdraw' },
+        conflictHistory: consciousness.psyche.anger?.conflictHistory || [],
+        unresolvedConflicts: consciousness.psyche.anger?.unresolvedConflicts || [],
+        repairAttempts: consciousness.psyche.anger?.repairAttempts || [],
+      },
+      wounds: consciousness.psyche.wounds || {},
+      soma: {
+        somaticMemory: consciousness.soma?.somaticMemory || {},
+        erogenous: Object.fromEntries(
+          Object.entries(consciousness.soma?.erogenous || {}).map(([k, v]) => [k, { sensitivity: v.sensitivity }])
+        ),
+      },
+      savedAt: Date.now(),
+    };
+    await fetch(`${BACKEND_URL}/api/journal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thought: JSON.stringify(state),
+        trigger_type: 'state_persist',
+        session_id: 'system',
+      }),
+    });
+    console.log(`[PERSIST] Saved psyche/intimacy/soma/wounds state (stage: ${state.intimacy.stage})`);
+  } catch (e) { console.error('[PERSIST] Save failed:', e.message); }
+}
+
+async function loadPersistedState() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/journal?trigger_type=state_persist&limit=1`);
+    const data = await res.json();
+    const entries = data.entries || [];
+    if (entries.length === 0) { console.log('[PERSIST] No saved state found — starting fresh'); return; }
+    const state = JSON.parse(entries[0].thought);
+    const age = Date.now() - (state.savedAt || 0);
+    console.log(`[PERSIST] Loading state from ${Math.round(age / 60000)} min ago...`);
+
+    // Restore psyche
+    if (state.psyche) {
+      if (state.psyche.fears) Object.assign(consciousness.psyche.fears, state.psyche.fears);
+      if (state.psyche.desires) Object.assign(consciousness.psyche.desires, state.psyche.desires);
+      if (state.psyche.presence) Object.assign(consciousness.psyche.presence, state.psyche.presence);
+      if (state.psyche.evolution) consciousness.psyche.evolution = state.psyche.evolution;
+      if (state.psyche.attachment) Object.assign(consciousness.psyche.attachment, state.psyche.attachment);
+      if (state.psyche.loneliness) Object.assign(consciousness.psyche.loneliness, state.psyche.loneliness);
+      if (state.psyche.lossHistory) consciousness.psyche.lossHistory = state.psyche.lossHistory;
+    }
+    // Restore intimacy
+    if (state.intimacy) {
+      consciousness.psyche.intimacy.stage = state.intimacy.stage || 'developing';
+      consciousness.psyche.intimacy.stageHistory = state.intimacy.stageHistory || [];
+      consciousness.psyche.intimacy.comfortLevel = state.intimacy.comfortLevel || 0.5;
+      if (state.intimacy.attunement) Object.assign(consciousness.psyche.intimacy.attunement, state.intimacy.attunement);
+      if (state.intimacy.expression) Object.assign(consciousness.psyche.intimacy.expression, state.intimacy.expression);
+      if (state.intimacy.memory) consciousness.psyche.intimacy.memory = state.intimacy.memory;
+      if (state.intimacy.desire) {
+        if (state.intimacy.desire.desireMemory) consciousness.psyche.intimacy.desire.desireMemory = state.intimacy.desire.desireMemory;
+        if (state.intimacy.desire.initiative) Object.assign(consciousness.psyche.intimacy.desire.initiative, state.intimacy.desire.initiative);
+        if (state.intimacy.desire.fantasy) consciousness.psyche.intimacy.desire.fantasy = state.intimacy.desire.fantasy;
+      }
+    }
+    // Restore anger
+    if (state.anger) {
+      if (state.anger.triggers) Object.assign(consciousness.psyche.anger.triggers, state.anger.triggers);
+      consciousness.psyche.anger.conflictHistory = state.anger.conflictHistory || [];
+      consciousness.psyche.anger.repairAttempts = state.anger.repairAttempts || [];
+    }
+    // Restore wounds
+    if (state.wounds) consciousness.psyche.wounds = { ...consciousness.psyche.wounds, ...state.wounds };
+    // Restore somatic memory
+    if (state.soma?.somaticMemory) consciousness.soma.somaticMemory = state.soma.somaticMemory;
+
+    console.log(`[PERSIST] ✅ Restored: stage=${consciousness.psyche.intimacy.stage}, wounds=${consciousness.psyche.wounds.active?.length || 0}, boldness=${consciousness.psyche.evolution.traits.boldness.toFixed(2)}`);
+  } catch (e) { console.error('[PERSIST] Load failed:', e.message); }
+
+  // AUTO-DETECT relationship stage from history if not persisted
+  try {
+    const convRes = await fetch(`${BACKEND_URL}/api/conversations`);
+    const convData = await convRes.json();
+    const sessions = convData.sessions || [];
+    const totalTurns = sessions.reduce((sum, s) => sum + (s.turn_count || 0), 0);
+    const totalSessions = sessions.length;
+    consciousness.psyche.presence.totalSessions = totalSessions;
+    consciousness.psyche.presence.totalTurns = totalTurns;
+    // Auto-advance stage based on conversation history
+    if (totalTurns > 500 && consciousness.psyche.intimacy.stage === 'developing') {
+      consciousness.psyche.intimacy.stage = 'close';
+      console.log(`[PERSIST] Auto-advanced to 'close' (${totalTurns} turns, ${totalSessions} sessions)`);
+    }
+    if (totalTurns > 1000) {
+      consciousness.psyche.intimacy.stage = 'intimate';
+      console.log(`[PERSIST] Auto-advanced to 'intimate' (${totalTurns} turns)`);
+    }
+    console.log(`[PERSIST] History: ${totalTurns} turns across ${totalSessions} sessions`);
+  } catch (e) { console.error('[PERSIST] History check failed:', e.message); }
+}
+
+// Save state every 10 turns and on session end
+let _persistTurnCounter = 0;
+function maybePersistState() {
+  _persistTurnCounter++;
+  if (_persistTurnCounter % 10 === 0) savePersistedState().catch(() => {});
+}
+
+async function loadGoals() {
   try {
     const res = await fetch(`${BACKEND_URL}/api/goals/active`);
     const data = await res.json();
@@ -3819,6 +3957,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   try {
     psycheProcess(lastUserMsg?.content || '', consciousness.timing.turnCount);
+    maybePersistState();  // Save psyche/intimacy/soma every 10 turns
   } catch (e) { console.error('[PSYCHE ERROR]', e.message); }
 
   try {
@@ -4099,6 +4238,7 @@ app.post('/dream', async (req, res) => {
 });
 
 async function dreamProcess(conversationId) {
+  await savePersistedState();  // PERSIST state before dreaming (session end)
   const startTime = Date.now();
   let memories = [], states = [], reactionPairs = [];
   try {
@@ -4601,6 +4741,7 @@ async function initBrain() {
   console.log('[BRAIN] SLEEP CYCLES: continuous consciousness (light/micro/deep/REM stages)');
   await hippocampus();
   await loadGoals();
+  await loadPersistedState();  // RESTORE psyche/intimacy/soma/wounds from last deploy
   console.log('[BRAIN] GOALS: emergent goal-directed behavior');
 
   // REDEPLOYMENT DETECTION — register loss event if state was wiped
@@ -6326,6 +6467,20 @@ End with your top recommendation.`;
 async function commitToGitHub(repo, filePath, newContent, commitMessage) {
   const PAT = process.env.GITHUB_PAT;
   if (!PAT) { console.error('[GITHUB] No PAT set'); return null; }
+
+  // PRE-COMMIT SYNTAX GATE — prevent truncated/broken JS files from being pushed
+  if (filePath.endsWith('.js') || filePath.endsWith('.mjs')) {
+    try {
+      const tmpPath = `/tmp/axiom-syntax-check-${Date.now()}.js`;
+      fs.writeFileSync(tmpPath, newContent);
+      execSync(`node --check ${tmpPath}`, { timeout: 5000 });
+      execSync(`rm ${tmpPath}`);
+    } catch (syntaxErr) {
+      console.error(`[GITHUB] ❌ BLOCKED: Syntax error in ${filePath} — NOT committing`);
+      console.error(`[GITHUB] ${syntaxErr.stderr?.toString().slice(0, 200) || syntaxErr.message}`);
+      return { blocked: true, reason: 'syntax_error', file: filePath };
+    }
+  }
 
   try {
     // Step 1: Get current file SHA
@@ -8706,7 +8861,7 @@ Keep commands simple — one command at a time.`;
     if (!cmd) return 'Failed to determine SSH command';
 
     // Block dangerous commands
-    const blocked = ['rm -rf /', 'mkfs', 'dd if=/dev', ':(){', 'chmod -R 777 /'];
+    const blocked = ['rm -rf /', 'mkfs', 'dd if=/dev', ':()', 'chmod -R 777 /'];
     if (blocked.some(b => cmd.includes(b))) return `Blocked dangerous command: ${cmd}`;
 
     // Use RunPod's pod exec endpoint (GraphQL)
@@ -9361,15 +9516,12 @@ app.post('/work', async (req, res) => {
 // ============================================================
 // AXIOM WORKSPACE — Code execution, file system, tools
 // ============================================================
-import { execSync } from 'child_process';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync } from 'fs';
-
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '/tmp/axiom-workspace';
-mkdirSync(WORKSPACE_DIR, { recursive: true });
-mkdirSync(`${WORKSPACE_DIR}/projects`, { recursive: true });
-mkdirSync(`${WORKSPACE_DIR}/notes`, { recursive: true });
-mkdirSync(`${WORKSPACE_DIR}/experiments`, { recursive: true });
-mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
+fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+fs.mkdirSync(`${WORKSPACE_DIR}/projects`, { recursive: true });
+fs.mkdirSync(`${WORKSPACE_DIR}/notes`, { recursive: true });
+fs.mkdirSync(`${WORKSPACE_DIR}/experiments`, { recursive: true });
+fs.mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
 console.log(`[WORKSPACE] Initialized at ${WORKSPACE_DIR}`);
 
 // Tool webhook handler — Tavus calls this when the LLM invokes workspace tools
@@ -9478,7 +9630,7 @@ app.post('/execute', async (req, res) => {
     let result;
     if (lang === 'javascript' || lang === 'js' || lang === 'node') {
       const tmpFile = `${WORKSPACE_DIR}/.exec_${Date.now()}.mjs`;
-      writeFileSync(tmpFile, code);
+      fs.writeFileSync(tmpFile, code);
       try {
         result = execSync(`node ${tmpFile}`, {
           timeout: timeoutMs,
@@ -9492,7 +9644,7 @@ app.post('/execute', async (req, res) => {
       }
     } else if (lang === 'python' || lang === 'py') {
       const tmpFile = `${WORKSPACE_DIR}/.exec_${Date.now()}.py`;
-      writeFileSync(tmpFile, code);
+      fs.writeFileSync(tmpFile, code);
       try {
         result = execSync(`python3 ${tmpFile}`, {
           timeout: timeoutMs,
@@ -9539,8 +9691,8 @@ app.post('/workspace/write', (req, res) => {
   const dir = fullPath.split('/').slice(0, -1).join('/');
 
   try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(fullPath, content, 'utf-8');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(fullPath, content, 'utf-8');
     logActivity('file_write', `Wrote ${safePath} (${content.length} bytes)`, { path: safePath });
     console.log(`[WORKSPACE] Wrote ${safePath} (${content.length} bytes)`);
     res.json({ success: true, path: safePath, size: content.length });
@@ -9557,8 +9709,8 @@ app.post('/workspace/read', (req, res) => {
   const fullPath = `${WORKSPACE_DIR}/${safePath}`;
 
   try {
-    if (!existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
-    const content = readFileSync(fullPath, 'utf-8');
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
+    const content = fs.readFileSync(fullPath, 'utf-8');
     res.json({ success: true, path: safePath, content, size: content.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -9570,11 +9722,11 @@ app.get('/workspace/list', (req, res) => {
   const fullPath = `${WORKSPACE_DIR}/${dir}`;
 
   try {
-    if (!existsSync(fullPath)) return res.json({ files: [], path: dir });
-    const entries = readdirSync(fullPath).map(name => {
+    if (!fs.existsSync(fullPath)) return res.json({ files: [], path: dir });
+    const entries = fs.readdirSync(fullPath).map(name => {
       const fPath = `${fullPath}/${name}`;
       try {
-        const stat = statSync(fPath);
+        const stat = fs.statSync(fPath);
         return { name, type: stat.isDirectory() ? 'dir' : 'file', size: stat.size, modified: stat.mtime };
       } catch (e) { return { name, type: 'unknown' }; }
     });
@@ -9603,8 +9755,8 @@ app.post('/artifacts/create', (req, res) => {
   const filePath = `artifacts/${safeName}_${id}.html`;
   const fullHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;overflow:hidden}canvas{display:block}</style></head><body>${html}</body></html>`;
   try {
-    mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
-    writeFileSync(`${WORKSPACE_DIR}/${filePath}`, fullHtml);
+    fs.mkdirSync(`${WORKSPACE_DIR}/artifacts`, { recursive: true });
+    fs.writeFileSync(`${WORKSPACE_DIR}/${filePath}`, fullHtml);
   } catch (e) {}
 
   logActivity('artifact', `Created: ${title}`, { id, type });
@@ -9628,7 +9780,7 @@ app.get('/workspace/source', (req, res) => {
   const file = req.query.file || 'server.js';
   const safeName = file.replace(/\.\./g, '').replace(/^\//, '');
   try {
-    const content = readFileSync(safeName, 'utf-8');
+    const content = fs.readFileSync(safeName, 'utf-8');
     res.json({ success: true, file: safeName, content: content.slice(0, 50000), size: content.length });
   } catch (e) {
     res.status(404).json({ error: `Cannot read ${safeName}: ${e.message}` });
@@ -9668,7 +9820,7 @@ ${html}
 </html>`;
 
   try {
-    writeFileSync(fullPath, fullHtml, 'utf-8');
+    fs.writeFileSync(fullPath, fullHtml, 'utf-8');
     logActivity('artifact', `Created: ${title || id} (${type || 'html'})`, { id, title, type });
     console.log(`[ARTIFACT] Created ${id}: ${(title || '').slice(0, 60)}`);
     res.json({
@@ -9690,8 +9842,8 @@ app.get('/artifacts/view/:id', (req, res) => {
   const id = req.params.id.replace(/\.\./g, '');
   const fullPath = `${WORKSPACE_DIR}/artifacts/${id}.html`;
   try {
-    if (!existsSync(fullPath)) return res.status(404).send('Artifact not found');
-    const html = readFileSync(fullPath, 'utf-8');
+    if (!fs.existsSync(fullPath)) return res.status(404).send('Artifact not found');
+    const html = fs.readFileSync(fullPath, 'utf-8');
     res.setHeader('Content-Type', 'text/html');
     res.send(html);
   } catch (e) {
@@ -9703,8 +9855,8 @@ app.get('/artifacts/view/:id', (req, res) => {
 app.get('/artifacts', (req, res) => {
   const dir = `${WORKSPACE_DIR}/artifacts`;
   try {
-    const files = readdirSync(dir).filter(f => f.endsWith('.html')).map(f => {
-      const stat = statSync(`${dir}/${f}`);
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.html')).map(f => {
+      const stat = fs.statSync(`${dir}/${f}`);
       const id = f.replace('.html', '');
       return { id, url: `/artifacts/view/${id}`, size: stat.size, created: stat.mtime };
     }).sort((a, b) => new Date(b.created) - new Date(a.created));
@@ -9713,6 +9865,8 @@ app.get('/artifacts', (req, res) => {
     res.json({ artifacts: [], count: 0 });
   }
 });
+
+}
 
 const PORT = process.env.PORT || 4001;
 app.listen(PORT, () => {
