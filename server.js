@@ -112,15 +112,30 @@ class ExecutionTracer {
     this.injectedContext = [];
     this.redirectTarget = null;
     this.estimatedTokens = 0;
+    this.currentPhase = 'INPUT_RECEPTION';
+    this.phaseTransitions = [];
     this.log('TURN_START', { 
-    turnId,
-    timestamp: new Date().toISOString(),
-    thoughtContext: {
-      triggerType: 'user_message',
-      priorState: 'idle',
-      intentionChain: ['receive_input', 'classify_request', 'plan_response']
-    }
-  });
+      turnId,
+      timestamp: new Date().toISOString(),
+      cognitivePhase: this.currentPhase,
+      thoughtContext: {
+        triggerType: 'user_message',
+        priorState: 'idle',
+        intentionChain: ['receive_input', 'classify_request', 'plan_response']
+      }
+    });
+  }
+
+  transitionPhase(newPhase, context = {}) {
+    const transition = {
+      from: this.currentPhase,
+      to: newPhase,
+      timestamp: Date.now() - this.startTime,
+      context
+    };
+    this.phaseTransitions.push(transition);
+    this.currentPhase = newPhase;
+    this.log('PHASE_TRANSITION', transition);
   }
 
   // Rough token estimation (4 chars ≈ 1 token)
