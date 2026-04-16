@@ -5612,7 +5612,7 @@ Return ONLY JSON:
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 600 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: prompt }], max_tokens: 600 }),
     });
     const data = await res.json();
     const text = data.choices?.[0]?.message?.content?.trim() || '';
@@ -5675,7 +5675,7 @@ Write 2-4 paragraphs. Concrete facts, names, numbers.`;
   const synthRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: synthPrompt }], max_tokens: 600 }),
+    body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: synthPrompt }], max_tokens: 600 }),
   });
   const synthesis = (await synthRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
@@ -5714,7 +5714,7 @@ What's relevant? 2-4 paragraphs.`;
     const aRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: aPrompt }], max_tokens: 600 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: aPrompt }], max_tokens: 600 }),
     });
     const analysis = (await aRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
@@ -5752,7 +5752,7 @@ Prior research:\n${priorContent.slice(0, 2000) || 'None'}
   const wRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: wPrompt }], max_tokens: 800 }),
+    body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: wPrompt }], max_tokens: 800 }),
   });
   const writing = (await wRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
@@ -6252,7 +6252,7 @@ that integrates with the existing architecture. Return ONLY the file content, no
     const genRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: genPrompt }], max_tokens: 1500 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: genPrompt }], max_tokens: 1500 }),
     });
     const content = (await genRes.json()).choices?.[0]?.message?.content?.trim() || '';
     if (!content || content.length < 20) return 'Failed to generate content';
@@ -6872,7 +6872,7 @@ Do NOT enter payment information if you're unsure about the page.`;
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: checkoutPrompt }], max_tokens: 400 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: checkoutPrompt }], max_tokens: 400 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const planMatch = raw.match(/\{[\s\S]*\}/);
@@ -6992,7 +6992,7 @@ You MUST return ONLY valid JSON, nothing else:
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: emailPrompt }], max_tokens: 500 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: emailPrompt }], max_tokens: 500 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
@@ -7487,7 +7487,7 @@ CRITICAL RULES:
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: checkoutPrompt }], max_tokens: 500 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: checkoutPrompt }], max_tokens: 500 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
@@ -7697,7 +7697,7 @@ Be specific. This summary will be used for future work on this codebase.`;
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: summaryPrompt }], max_tokens: 1500 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: summaryPrompt }], max_tokens: 1500 }),
     });
     const summary = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
 
@@ -8169,7 +8169,7 @@ Return JSON:
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: skillPrompt }], max_tokens: 400 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: skillPrompt }], max_tokens: 400 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
@@ -8579,7 +8579,7 @@ Actions: navigate, click (text or selector), type (selector + text), wait, extra
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AUTONOMOUS_MODEL, messages: [{ role: 'user', content: interactPrompt }], max_tokens: 400 }),
+      body: JSON.stringify({ model: CORTEX_MODEL, messages: [{ role: 'user', content: interactPrompt }], max_tokens: 400 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
