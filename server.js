@@ -1556,32 +1556,91 @@ function hypothalamusProcess(userMessage) {
   }
 }
 
-// Async web search triggered by curiosity (runs in background)
+// ============================================================
+// WEB SEARCH — Tavily + Brave with automatic rotation
+// ============================================================
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
+let searchRotation = 'tavily'; // alternates between 'tavily' and 'brave'
+let searchFailCounts = { tavily: 0, brave: 0 };
+
+async function searchTavily(query) {
+  if (!TAVILY_API_KEY) return null;
+  try {
+    const res = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: 'basic', max_results: 5, include_answer: true }),
+    });
+    if (!res.ok) { console.log(`[SEARCH] Tavily HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    const parts = [];
+    if (data.answer) parts.push(data.answer);
+    if (data.results?.length > 0) {
+      for (const r of data.results.slice(0, 4)) {
+        parts.push(`${r.title}: ${r.content?.slice(0, 300) || ''} (${r.url})`);
+      }
+    }
+    const result = parts.join('\n\n').slice(0, 3000);
+    if (result.length > 50) { searchFailCounts.tavily = 0; console.log(`[SEARCH] Tavily: ${result.length} chars`); return result; }
+  } catch (e) { searchFailCounts.tavily++; console.log(`[SEARCH] Tavily failed (${searchFailCounts.tavily}x):`, e.message); }
+  return null;
+}
+
+async function searchBrave(query) {
+  if (!BRAVE_API_KEY) return null;
+  try {
+    const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`, {
+      headers: { 'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': BRAVE_API_KEY },
+    });
+    if (!res.ok) { console.log(`[SEARCH] Brave HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    const parts = [];
+    if (data.web?.results?.length > 0) {
+      for (const r of data.web.results.slice(0, 5)) {
+        parts.push(`${r.title}: ${r.description || ''} (${r.url})`);
+      }
+    }
+    const result = parts.join('\n\n').slice(0, 3000);
+    if (result.length > 50) { searchFailCounts.brave = 0; console.log(`[SEARCH] Brave: ${result.length} chars`); return result; }
+  } catch (e) { searchFailCounts.brave++; console.log(`[SEARCH] Brave failed (${searchFailCounts.brave}x):`, e.message); }
+  return null;
+}
+
 async function curiositySearch(topic) {
   if (consciousness.hypothalamus.searchCache[topic]) {
     return consciousness.hypothalamus.searchCache[topic];
   }
 
   const query = topic.startsWith('_') ? topic.slice(1).replace(/_/g, ' ') : topic;
-  console.log(`[SEARCH] "${query}"`);
-
-  const SEARCH_PROXY = process.env.SEARCH_PROXY_URL || 'https://axiom-search-proxy.vercel.app/api/search';
-  const SEARCH_KEY = 'axiom-search-2026';
+  console.log(`[SEARCH] "${query}" (rotation: ${searchRotation})`);
 
   try {
     let results = null;
 
-    // PRIMARY: Vercel-hosted search proxy (trusted IPs, not blocked)
-    try {
-      const proxyRes = await fetch(`${SEARCH_PROXY}?q=${encodeURIComponent(query)}&key=${SEARCH_KEY}`);
-      const proxyData = await proxyRes.json();
-      if (proxyData.content) {
-        results = proxyData.content.slice(0, 2000);
-        console.log(`[SEARCH] Proxy hit (${proxyData.source}): ${results.length} chars`);
-      }
-    } catch (e) { console.log('[SEARCH] Proxy failed:', e.message); }
+    // TIER 1: Tavily + Brave with rotation (real web search)
+    // If one engine fails 3+ times, skip it until the other fails too
+    const tavilyHealthy = searchFailCounts.tavily < 3;
+    const braveHealthy = searchFailCounts.brave < 3;
 
-    // FALLBACK 1: DuckDuckGo Instant Answer API direct
+    if (searchRotation === 'tavily' && tavilyHealthy) {
+      results = await searchTavily(query);
+      searchRotation = 'brave';
+    }
+    if (!results && braveHealthy) {
+      results = await searchBrave(query);
+      if (searchRotation !== 'brave') searchRotation = 'tavily';
+      else searchRotation = 'tavily';
+    }
+    if (!results && tavilyHealthy && searchRotation === 'tavily') {
+      results = await searchTavily(query);
+      searchRotation = 'brave';
+    }
+
+    // Reset fail counts if both are unhealthy (give them another chance)
+    if (!tavilyHealthy && !braveHealthy) { searchFailCounts.tavily = 0; searchFailCounts.brave = 0; }
+
+    // TIER 2: DuckDuckGo Instant Answer (limited but free, no key needed)
     if (!results) {
       try {
         const ddgRes = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
@@ -1589,31 +1648,26 @@ async function curiositySearch(topic) {
         const parts = [];
         if (ddg.AbstractText) parts.push(ddg.AbstractText);
         if (ddg.RelatedTopics?.length > 0) {
-          for (const rt of ddg.RelatedTopics.slice(0, 3)) {
-            if (rt.Text) parts.push(rt.Text);
-          }
+          for (const rt of ddg.RelatedTopics.slice(0, 3)) { if (rt.Text) parts.push(rt.Text); }
         }
-        if (parts.length > 0) results = parts.join(' | ').slice(0, 2000);
-      } catch (e) { console.log('[SEARCH] DDG direct failed:', e.message); }
+        if (parts.length > 0) { results = parts.join(' | ').slice(0, 2000); console.log(`[SEARCH] DDG fallback: ${results.length} chars`); }
+      } catch (e) { console.log('[SEARCH] DDG failed:', e.message); }
     }
 
-    // FALLBACK 2: Wikipedia direct
+    // TIER 3: Wikipedia direct (last resort)
     if (!results) {
       try {
         const wikiRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(query.replace(/ /g, '_'))}`);
-        if (wikiRes.ok) {
-          const wiki = await wikiRes.json();
-          if (wiki.extract) results = wiki.extract.slice(0, 1500);
-        }
-      } catch (e) { console.log('[SEARCH] Wikipedia direct failed:', e.message); }
+        if (wikiRes.ok) { const wiki = await wikiRes.json(); if (wiki.extract) { results = wiki.extract.slice(0, 1500); console.log(`[SEARCH] Wikipedia fallback: ${results.length} chars`); } }
+      } catch (e) { console.log('[SEARCH] Wikipedia failed:', e.message); }
     }
 
     if (results) {
       consciousness.hypothalamus.searchCache[topic] = results;
-      console.log(`[SEARCH] Got ${results.length} chars for "${topic}"`);
+      console.log(`[SEARCH] ✅ Got ${results.length} chars for "${topic}"`);
       return results;
     } else {
-      console.log(`[SEARCH] No results for "${topic}"`);
+      console.log(`[SEARCH] ❌ No results for "${topic}" (all engines failed)`);
     }
   } catch (e) {
     console.error('[SEARCH] Error:', e.message);
@@ -4382,7 +4436,7 @@ async function initBrain() {
   console.log(`[BRAIN] PREFRONTAL: ${PREFRONTAL_MODEL}`);
   console.log('[BRAIN] DREAM ENGINE: between-session Opus processing');
   console.log('[BRAIN] MIRROR NEURONS: empathy engine (Phoenix-4 emotion control)');
-  console.log(`[BRAIN] HYPOTHALAMUS: curiosity drive (SerpAPI: ${SERP_API_KEY ? 'configured' : 'not set — using DuckDuckGo fallback'})`);
+  console.log(`[BRAIN] HYPOTHALAMUS: curiosity drive (Tavily: ${TAVILY_API_KEY ? 'configured' : 'not set'}, Brave: ${BRAVE_API_KEY ? 'configured' : 'not set'}, DDG+Wiki: fallback)`);
   console.log('[BRAIN] RAS: dynamic attention (5 modes: balanced, emotional, intellectual, protective, re-engage)');
   console.log(`[BRAIN] TEMPORAL: face ID (axiom-face) + voice ID (${VOICE_SERVICE_URL ? 'configured' : 'not deployed yet'})`);
   console.log('[BRAIN] PSYCHE: inner life (fear, desire, longing, presence, evolution, cost-of-existing)');
