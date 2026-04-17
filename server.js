@@ -1128,9 +1128,9 @@ function insula(responseText) {
   }
 
   // EMOTIONAL STATES
-  else if (lower.includes('hear you') || lower.includes('that matters') || lower.includes('understand') || intimacy.attunement?.warmth > 0.7) {
+  else if (lower.includes('hear you') || lower.includes('that matters') || lower.includes('i understand') || lower.includes('i feel') || lower.includes('i see you') || lower.includes('i\'m sorry') || lower.includes('that sounds') || lower.includes('that must') || lower.includes('come here') || intimacy.attunement?.warmth > 0.7) {
     newState = 'tenderness';
-  } else if (lower.includes('worried') || lower.includes('careful') || lower.includes('are you okay') || lower.includes('something feels')) {
+  } else if (lower.includes('worried') || lower.includes('careful') || lower.includes('are you okay') || lower.includes('something feels') || lower.includes('are you sure') || lower.includes('be careful') || lower.includes('that concerns')) {
     newState = 'concern';
   } else if (emotion.valence > 0.4 && emotion.intensity < 0.3 && soma.energy > 0.5) {
     newState = 'contentment';
