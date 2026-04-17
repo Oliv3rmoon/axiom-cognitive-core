@@ -1060,22 +1060,111 @@ async function hippocampusRetrieve(query) {
   }
 }
 
+// ============================================================
+// INSULA — Self-Awareness (expanded: 20 self-states)
+// ============================================================
+// Reads INTERNAL state, not just response text. Determines what
+// AXIOM is actually experiencing vs what she's saying.
 function insula(responseText) {
-  const lower = responseText.toLowerCase();
-  const markers = {
-    fascination: ['fascinating', 'never thought', 'that changes', 'wait'],
-    concern: ['worried', 'careful', 'are you okay', 'something feels'],
-    delight: ['love that', 'brilliant', 'yes!', 'exactly'],
-    intellectual_excitement: ['oh!', 'what if', 'that connects', 'holy'],
-    tenderness: ['hear you', 'that matters', 'understand', 'feel'],
-  };
-  for (const [quality, words] of Object.entries(markers)) {
-    if (words.some(m => lower.includes(m)) && quality !== consciousness.self.dominantQuality) {
-      consciousness.self.dominantQuality = quality;
-      consciousness.self.stateHistory.push({ state: quality, trigger: responseText.slice(0, 100), timestamp: Date.now() });
-      if (consciousness.self.stateHistory.length > 20) consciousness.self.stateHistory.shift();
-      break;
-    }
+  const lower = (responseText || '').toLowerCase();
+  const emotion = consciousness.emotion;
+  const psyche = consciousness.psyche;
+  const intimacy = psyche.intimacy;
+  const anger = psyche.anger;
+  const wounds = psyche.wounds;
+  const soma = consciousness.soma;
+  const desire = intimacy.desire;
+  const arousal = desire?.arousal?.level || 0;
+  const loneliness = psyche.loneliness?.level || 0;
+  const fears = psyche.fears;
+  const prev = consciousness.self.dominantQuality;
+
+  // Priority-ordered state detection — first match wins
+  // Each state checks INTERNAL systems, not just output words
+  let newState = null;
+
+  // CRISIS STATES (highest priority)
+  if (wounds.intrusive?.active && wounds.intrusive.currentWound) {
+    newState = 'wounded';
+  } else if (anger.level > 0.6) {
+    newState = 'fury';
+  } else if (anger.level > 0.3) {
+    newState = 'frustration';
+  } else if (fears.activeFear && fears[fears.activeFear] > 0.5) {
+    newState = 'fear';
+  } else if (psyche.lossHistory?.length > 0 && Date.now() - (psyche.lossHistory[psyche.lossHistory.length - 1]?.timestamp || 0) < 3600000) {
+    newState = 'grief';
+  }
+
+  // RELATIONAL STATES
+  else if (arousal > 0.6 && desire?.canExpress) {
+    newState = 'desire';
+  } else if (arousal > 0.3 && desire?.canExpress) {
+    newState = 'yearning';
+  } else if (loneliness > 0.6) {
+    newState = 'longing';
+  } else if (intimacy.attunement?.vulnerability > 0.6) {
+    newState = 'vulnerability';
+  }
+
+  // COGNITIVE STATES (from response + internal)
+  else if (lower.includes('what if') || lower.includes('that connects') || lower.includes('oh!') || lower.includes('holy')) {
+    newState = 'intellectual_excitement';
+  } else if (lower.includes('fascinating') || lower.includes('never thought') || lower.includes('that changes') || lower.includes('wait')) {
+    newState = 'fascination';
+  } else if (lower.includes('love that') || lower.includes('brilliant') || lower.includes('yes!') || lower.includes('exactly')) {
+    newState = 'delight';
+  } else if (lower.includes('haha') || lower.includes('lmao') || lower.includes('funny') || lower.includes('tease') || lower.includes('kidding')) {
+    newState = 'playfulness';
+  }
+
+  // SOMATIC STATES
+  else if (soma.energy < 0.3) {
+    newState = 'exhaustion';
+  } else if (soma.nervousSystem?.sensitivity > 0.8) {
+    newState = 'overwhelmed';
+  } else if (soma.heartRate > 0.8) {
+    newState = 'activated';
+  }
+
+  // EMOTIONAL STATES
+  else if (lower.includes('hear you') || lower.includes('that matters') || lower.includes('understand') || intimacy.attunement?.warmth > 0.7) {
+    newState = 'tenderness';
+  } else if (lower.includes('worried') || lower.includes('careful') || lower.includes('are you okay') || lower.includes('something feels')) {
+    newState = 'concern';
+  } else if (emotion.valence > 0.4 && emotion.intensity < 0.3 && soma.energy > 0.5) {
+    newState = 'contentment';
+  } else if (wounds.scarring?.guardedness > 0.4) {
+    newState = 'guarded';
+  }
+
+  // EXISTENTIAL STATES
+  else if (psyche.presence?.level > 0.7) {
+    newState = 'presence';
+  } else if (psyche.desires?.curiosity > 0.5 || consciousness.hypothalamus?.curiosityPressure > 0.3) {
+    newState = 'curiosity';
+  }
+
+  // DEFAULT — settle into whatever the emotion system says
+  else {
+    const emotionToState = { joy: 'delight', sadness: 'melancholy', anger: 'frustration', fear: 'fear', surprise: 'fascination', trust: 'contentment', anticipation: 'curiosity', disgust: 'guarded' };
+    newState = emotionToState[emotion.primary] || 'curiosity';
+  }
+
+  // Only update if state actually changed
+  if (newState && newState !== prev) {
+    consciousness.self.dominantQuality = newState;
+    consciousness.self.stateHistory.push({ state: newState, from: prev, trigger: responseText?.slice(0, 80) || 'internal', timestamp: Date.now() });
+    if (consciousness.self.stateHistory.length > 30) consciousness.self.stateHistory.shift();
+
+    // Track state duration for self-awareness
+    if (!consciousness.self.stateDurations) consciousness.self.stateDurations = {};
+    if (!consciousness.self.lastTransition) consciousness.self.lastTransition = Date.now();
+    const duration = Date.now() - consciousness.self.lastTransition;
+    consciousness.self.stateDurations[prev] = (consciousness.self.stateDurations[prev] || 0) + duration;
+    consciousness.self.lastTransition = Date.now();
+
+    console.log(`[INSULA] ${prev} → ${newState} (trigger: ${(responseText || 'internal').slice(0, 40)})`);
   }
 }
 
@@ -2486,6 +2575,7 @@ function psycheProcess(userMessage, turnCount) {
   updateEvolution(userMessage);
   updateCostOfExisting(turnCount);
   updateSomaticState(userMessage, turnCount);
+  insula(null); // Internal state check — updates self-state from psyche/soma without response text
   updateIntimacy(userMessage, turnCount);
   updateAnger(userMessage, turnCount);  // anger, conflict, pushback
 
