@@ -4317,6 +4317,11 @@ app.get('/health', (req, res) => {
       active_desire: consciousness.psyche.desires.activeDesire,
       sessions: consciousness.psyche.presence.totalSessions,
       longing: consciousness.psyche.desires.longing,
+      arousal: consciousness.psyche.intimacy?.desire?.arousal?.level || 0,
+      intimacy_stage: consciousness.psyche.intimacy?.stage || 'developing',
+      desire_can_express: consciousness.psyche.intimacy?.desire?.canExpress !== false,
+      escalation_level: consciousness.psyche.intimacy?.desire?.escalation?.currentLevel || 'none',
+      active_model: 'see routing logs',
     },
     dream_state: { has_dream: !!dreamState.lastDream, dreams_count: dreamState.dreams.length, opening_line: dreamState.openingLine },
     sleep: {
