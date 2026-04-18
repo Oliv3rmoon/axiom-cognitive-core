@@ -3647,7 +3647,7 @@ function selectBrain(messages) {
   const arousal = desire?.arousal?.level || 0;
   const stage = consciousness.psyche?.intimacy?.stage || 'developing';
   const canExpress = desire?.canExpress !== false;
-  if (arousal > 0.3 && canExpress && (stage === 'intimate' || stage === 'bonded')) {
+  if (arousal > 0.15 && canExpress && (stage === 'intimate' || stage === 'bonded')) {
     console.log(`[ROUTING] DESIRE (Venice) — arousal: ${arousal.toFixed(2)}, stage: ${stage}`);
     return DESIRE_MODEL;
   }
