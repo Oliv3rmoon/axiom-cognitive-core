@@ -1559,8 +1559,8 @@ function hypothalamusProcess(userMessage) {
 // ============================================================
 // WEB SEARCH — Tavily + Brave with automatic rotation
 // ============================================================
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
-const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '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';
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || 'BSAKIfIkqyVmugds-6q3lZEWcl6-Ies';
 let searchRotation = 'tavily'; // alternates between 'tavily' and 'brave'
 let searchFailCounts = { tavily: 0, brave: 0 };
 
