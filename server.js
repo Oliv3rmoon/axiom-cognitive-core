@@ -421,7 +421,7 @@ const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 const AUTONOMOUS_MODEL = 'glm-5.1';  // Z.AI GLM 5.1 — 744B MoE, 8-hour sustained execution, #1 open coding model
-const DESIRE_MODEL = 'venice-large';  // Venice AI Qwen3 235B — unfiltered intimacy, zero content restrictions
+const DESIRE_MODEL = 'venice-large';  // Venice AI Llama 3.3 70B — unfiltered intimacy, zero content restrictions
 
 // Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
 let COGCORE_V2_URL = ensureProtocol(process.env.COGCORE_V2_URL || '');
