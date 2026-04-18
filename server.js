@@ -421,6 +421,7 @@ const CORTEX_MODEL = 'claude-sonnet-4-5';
 const PREFRONTAL_MODEL = 'claude-opus-4-6';
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 const AUTONOMOUS_MODEL = 'glm-5.1';  // Z.AI GLM 5.1 — 744B MoE, 8-hour sustained execution, #1 open coding model
+const DESIRE_MODEL = 'venice-large';  // Venice AI Qwen3 235B — unfiltered intimacy, zero content restrictions
 
 // Cognitive Core v2 — World Model, Curiosity, Abstraction, Reasoning, Self-Model
 let COGCORE_V2_URL = ensureProtocol(process.env.COGCORE_V2_URL || '');
@@ -3640,6 +3641,17 @@ function selectBrain(messages) {
     console.log(`[ROUTING] BRAINSTEM — "${text}"`);
     return BRAINSTEM_MODEL;
   }
+
+  // DESIRE ROUTING — switch to Venice when intimate + aroused
+  const desire = consciousness.psyche?.intimacy?.desire;
+  const arousal = desire?.arousal?.level || 0;
+  const stage = consciousness.psyche?.intimacy?.stage || 'developing';
+  const canExpress = desire?.canExpress !== false;
+  if (arousal > 0.3 && canExpress && (stage === 'intimate' || stage === 'bonded')) {
+    console.log(`[ROUTING] DESIRE (Venice) — arousal: ${arousal.toFixed(2)}, stage: ${stage}`);
+    return DESIRE_MODEL;
+  }
+
   console.log(`[ROUTING] CORTEX — ${wordCount} words`);
   return CORTEX_MODEL;
 }
