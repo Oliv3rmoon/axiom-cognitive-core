@@ -28,6 +28,16 @@ app.use((req, res, next) => {
   next();
 });
 
+// Static file serving — expose core cognitive modules for introspection
+// Serves psyche.js, memory systems, and other lib/ files at /core/*
+app.use('/core', express.static(path.join(process.cwd(), 'lib'), {
+  setHeaders: (res, filepath) => {
+    if (filepath.endsWith('.js')) {
+      res.setHeader('Content-Type', 'application/javascript');
+    }
+  }
+}));
+
 // Rate limiting — prevent request flooding and resource exhaustion
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
