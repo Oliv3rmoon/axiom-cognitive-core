@@ -137,8 +137,46 @@ class ExecutionTracer {
   }
 
   transitionPhase(newPhase, context = {}) {
+    const previousPhase = this.currentPhase;
     const transition = {
-      from: this.currentPhase,
+      from: previousPhase,
+      to: newPhase,
+      timestamp: Date.now(),
+      elapsedMs: Date.now() - this.startTime,
+      context
+    };
+    
+    this.currentPhase = newPhase;
+    this.phaseTransitions.push(transition);
+    
+    // INTROSPECTION HOOK: Capture processing state at key cognitive transitions
+    const introspectionSnapshot = {
+      phase: newPhase,
+      previousPhase,
+      turnId: this.currentTurnId,
+      timestamp: transition.timestamp,
+      elapsedMs: transition.elapsedMs,
+      context,
+      estimatedTokens: this.estimatedTokens,
+      traces: this.traces.slice(-3), // Last 3 trace events for context
+      paused: this.paused,
+      hasInjectedContext: this.injectedContext.length > 0
+    };
+    
+    this.log('PHASE_TRANSITION', { transition, introspectionSnapshot });
+    
+    // Emit to introspection system if available (non-blocking)
+    if (global.introspectionCollector) {
+      try {
+        global.introspectionCollector.capture(introspectionSnapshot);
+      } catch (err) {
+        // Never let introspection break the cognitive loop
+        console.error('[INTROSPECTION] Capture failed:', err.message);
+      }
+    }
+    
+    return transition;
+  }m: this.currentPhase,
       to: newPhase,
       timestamp: Date.now() - this.startTime,
       context
