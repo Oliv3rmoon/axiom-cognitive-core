@@ -176,14 +176,6 @@ class ExecutionTracer {
     }
     
     return transition;
-  }m: this.currentPhase,
-      to: newPhase,
-      timestamp: Date.now() - this.startTime,
-      context
-    };
-    this.phaseTransitions.push(transition);
-    this.currentPhase = newPhase;
-    this.log('PHASE_TRANSITION', transition);
   }
 
   // Rough token estimation (4 chars ≈ 1 token)
