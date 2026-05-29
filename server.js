@@ -5634,7 +5634,7 @@ async function createPlanForGoal(goal) {
   let v2Context = '';
   if (COGCORE_V2_URL) {
     try {
-      const [abstraction, curiosity, selfModel, memory, aiPolicy] = await Promise.allSettled([
+      const [abstraction, curiosity, selfModel, memory, aiPolicy, betaVae] = await Promise.allSettled([
         fetch(`${COGCORE_V2_URL}/abstraction/apply`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ goal: goal.goal }),
@@ -5657,6 +5657,11 @@ async function createPlanForGoal(goal) {
             policies: ['read_codebase', 'research', 'propose_change', 'build_and_test', 'audit', 'browse', 'reflect'],
             goal: goal.goal,
           }),
+        }).then(r => r.json()),
+        // BETA-VAE: disentangled latent profile of the goal (32 interpretable dims)
+        fetch(`${COGCORE_V2_URL}/beta-vae/encode`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: goal.goal }),
         }).then(r => r.json()),
       ]);
 
@@ -5695,6 +5700,28 @@ async function createPlanForGoal(goal) {
         const ranked = aiPolicy.value.ranked_policies.slice(0, 3).map(p => `${p.action} (EFE: ${p.efe?.toFixed(2) || '?'})`).join(', ');
         v2Context += `\n\nACTIVE INFERENCE SUGGESTS: Best actions: ${ranked}. Exploration tendency: ${(aiPolicy.value.exploration_exploitation_ratio * 100).toFixed(0)}%`;
       }
+
+      // BETA-VAE: surface the most salient disentangled dimensions of this goal
+      if (betaVae.status === 'fulfilled' && betaVae.value.dimensions) {
+        const dims = Object.entries(betaVae.value.dimensions)
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+          .slice(0, 4)
+          .map(([k, v]) => `${k} ${v >= 0 ? '+' : ''}${Number(v).toFixed(2)}`);
+        if (dims.length) v2Context += `\n\nGOAL PROFILE (β-VAE disentangled): ${dims.join(', ')}`;
+      }
+
+      // REASONING: open a structured reasoning workspace for this goal (fire-and-forget, accumulates over time)
+      fetch(`${COGCORE_V2_URL}/reasoning/start`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal: goal.goal.slice(0, 200), initial_context: goal.origin || 'autonomous' }),
+      }).then(r => r.json()).then(ws => {
+        if (ws && ws.workspace_id) {
+          fetch(`${COGCORE_V2_URL}/reasoning/add-thought`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ workspace_id: ws.workspace_id, thought: `Goal: ${goal.goal.slice(0, 150)}`, thought_type: 'observation', confidence: 0.6 }),
+          }).catch(() => {});
+        }
+      }).catch(() => {});
 
       // PHASE 3: DreamCoder compose — suggest solution from library primitives
       try {
