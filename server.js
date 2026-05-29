@@ -5285,6 +5285,29 @@ async function autonomousWork(gapHours) {
 
         // PHASE 3: Trigger DreamCoder sleep (extract primitives) every 5 completed goals
         if (COGCORE_V2_URL) {
+          // DREAMCODER: record this solved goal's executed action sequence so sleep can abstract real primitives
+          try {
+            const _planRes = await fetch(`${BACKEND_URL}/api/plans`);
+            const _planData = await _planRes.json();
+            const _solvedPlan = (_planData.plans || []).find(p => p.goal_id === targetGoal.id);
+            const _solSteps = ((_solvedPlan && _solvedPlan.steps) || [])
+              .filter(s => s.status === 'completed' && s.action)
+              .map(s => String(s.action));
+            if (_solSteps.length > 0) {
+              fetch(`${COGCORE_V2_URL}/dreamcoder/record-solution`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  task: targetGoal.goal.slice(0, 200),
+                  domain: targetGoal.origin || 'autonomous',
+                  steps: _solSteps,
+                  was_successful: true,
+                }),
+              }).then(r => r.json()).then(d => {
+                if (d && d.recorded) console.log(`[DREAMCODER] Recorded solution (${_solSteps.length} steps, total solved: ${d.total_solved_tasks})`);
+              }).catch(() => {});
+            }
+          } catch {}
+
           try {
             const goalsRes = await fetch(`${BACKEND_URL}/api/goals`);
             const goalsData = await goalsRes.json();
