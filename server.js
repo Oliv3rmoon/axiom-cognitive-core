@@ -3882,33 +3882,46 @@ async function hypothalamusController(text, contextTexts, threshold) {
 }
 
 // ============================================================================
-// GLOBAL WORKSPACE (Phase 1 + 2a) -- GNWT cognitive cycle: competing specialists ->
-// COALITION FORMATION (associated proposals bind) -> nonlinear ignition over coalitions
-// -> a single broadcast -> rendered as the "conscious" context. Opt-in via `workspace:true`;
-// production path untouched when off. Reuses the per-turn controller signals (amygdala /
-// cingulate / hypothalamus / insula) as proposers, RAS as the attention weighter, and the
-// cogcore embedder (/brain/embed) to bind proposals. ONE cycle per turn here; wsRunCycle()
-// is the unit the Phase 2 continuous loop will call repeatedly.
+// GLOBAL WORKSPACE (Phase 1 + 2a + 2b) -- a PERSISTENT GNWT workspace per conversation.
+// Specialists bid proposals -> associated proposals bind into coalitions -> nonlinear
+// ignition over coalitions (with reverberation + displacement) -> a single broadcast,
+// rendered as the "conscious" context. A background loop keeps cycling the workspace
+// BETWEEN turns (decay, sustain, spontaneous curiosity), so cognition is continuous, not
+// per-request. Opt-in via `workspace:true`; dormant for normal traffic.
 // ============================================================================
 const WS_THETA_BASE = 0.34;   // base ignition threshold (on coalition weight)
 const WS_K_AROUSAL  = 0.18;   // arousal lowers the threshold (hypervigilance)
-const WS_MARGIN     = 0.04;   // the winning coalition must clear the runner-up by this much
+const WS_MARGIN     = 0.04;   // a fresh winner must clear the runner-up by this much
 const WS_AFFECT_K   = 0.30;   // emotionally arousing content is likelier to ignite
 const WS_BUFFER_MAX = 8;      // stream-of-consciousness ring buffer depth
 const WS_PERCEPT_REL = 0.85;  // the percept IS the input -> fixed high relevance
-const WS_BIND_SIM   = 0.45;   // embedding cosine at/above which two proposals bind into a coalition
+const WS_BIND_SIM   = 0.45;   // embedding cosine at/above which two proposals bind
 const WS_COHERENCE_K = 0.25;  // a tightly-bound coalition is amplified by up to this fraction
 const WS_AFFECT_BIND_VAL = 0.35; // |valence| at/above which an affect reading binds to its percept
+// --- continuous-loop dynamics ---
+const WS_TICK_MS    = 4000;   // background cognitive-cycle cadence
+const WS_DECAY      = 0.82;   // per-cycle salience decay of lingering proposals
+const WS_MIN_SAL    = 0.06;   // drop a lingering proposal below this salience
+const WS_SUSTAIN    = 3;      // cycles a fresh broadcast reverberates (sticky attention)
+const WS_DISPLACE   = 1.20;   // a challenger must beat the held focus by this ratio to capture it
+const WS_IDLE_MS    = 4 * 60 * 1000; // stop cycling a conversation after this much silence
+const WS_AROUSAL_DECAY = 0.90; // between turns, arousal relaxes toward baseline 0.5
+const WS_CURIOSITY_EVERY = 2;  // attempt a spontaneous curiosity proposal every Nth tick
+const WS_INHIBIT    = 0.6;     // lateral inhibition applied to losers on a fresh ignition
 
-const __wsByConv = new Map(); // convKey -> { buffer:[{text,source,type,t}], cycle, lastSeen }
+const __wsByConv = new Map(); // convKey -> persistent workspace
 function wsGet(cid) {
   if (!cid) cid = '_default';
   let w = __wsByConv.get(cid);
-  if (!w) { w = { buffer: [], cycle: 0, lastSeen: Date.now() }; __wsByConv.set(cid, w); }
+  if (!w) {
+    w = { contents: [], broadcast: null, sustain: 0, buffer: [], cycle: 0, tick: 0,
+          lastSeen: Date.now(), lastTurn: 0, loopActive: false, arousal: 0.5, pendingThought: null };
+    __wsByConv.set(cid, w);
+  }
   w.lastSeen = Date.now();
-  if (__wsByConv.size > 500) {
+  if (__wsByConv.size > 800) {
     const cutoff = Date.now() - 30 * 60 * 1000;
-    for (const [k, v] of __wsByConv) if (v.lastSeen < cutoff) __wsByConv.delete(k);
+    for (const [k, v] of __wsByConv) if ((v.lastTurn || v.lastSeen) < cutoff) __wsByConv.delete(k);
   }
   return w;
 }
@@ -3922,7 +3935,6 @@ function wsCos(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// Batch sentence embeddings from cogcore; returns vectors aligned to texts, or null on failure.
 async function wsEmbed(texts) {
   try {
     const ctrl = new AbortController();
@@ -3938,12 +3950,11 @@ async function wsEmbed(texts) {
   } catch (e) { return null; }
 }
 
-// Turn the already-computed per-turn signals into competing proposals (bids for the spotlight).
+// Turn the per-turn controller signals into competing proposals (bids for the spotlight).
 function wsCollectProposals(userMsg, brain, cingInfo, hypoInfo) {
   const props = [];
   if (userMsg) {
-    props.push({ source: 'percept', type: 'percept', text: wsTrunc(userMsg, 180),
-                 salience: 0.5, valence: 0, arousal: 0 });
+    props.push({ source: 'percept', type: 'percept', text: wsTrunc(userMsg, 180), salience: 0.5, valence: 0, arousal: 0 });
   }
   if (brain && brain.read && brain.read.emotion) {
     const r = brain.read;
@@ -3966,9 +3977,9 @@ function wsCollectProposals(userMsg, brain, cingInfo, hypoInfo) {
   return props;
 }
 
-// Bind associated proposals into coalitions via single-linkage over embedding cosine.
-// vectors[i] aligns to proposals[i]; if vectors is null, every proposal is a singleton coalition.
-function wsFormCoalitions(proposals, vectors) {
+// Bind associated proposals into coalitions (single-linkage over embedding cosine; plus an
+// affect-to-percept link by emotional clarity when bindAffect is on). Singletons if vectors null.
+function wsFormCoalitions(proposals, vectors, bindAffect) {
   const n = proposals.length;
   const parent = []; for (let i = 0; i < n; i++) parent.push(i);
   function find(x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
@@ -3980,11 +3991,8 @@ function wsFormCoalitions(proposals, vectors) {
       if (sim >= WS_BIND_SIM) { union(i, j); simPairs.push([i, j, sim]); }
     }
   }
-  // Affect binds to its percept when the emotional reading is clear (|valence| high): the affect
-  // is an interpretation OF the current input, not an independent topic. Text cosine of the affect
-  // label is an unreliable proxy here, so this association is by origin, weighted by emotional clarity.
   const __pIdx = proposals.findIndex(function (p) { return p.source === 'percept'; });
-  if (vectors && vectors.length === n && __pIdx !== -1) {
+  if (bindAffect && __pIdx !== -1) {
     for (let k = 0; k < n; k++) {
       if (proposals[k].type === 'affect' && Math.abs(proposals[k].valence || 0) >= WS_AFFECT_BIND_VAL) {
         union(__pIdx, k);
@@ -4013,56 +4021,126 @@ function wsFormCoalitions(proposals, vectors) {
   return coalitions;
 }
 
-// One cognitive cycle: weight each proposal, bind into coalitions, then a nonlinear,
-// all-or-nothing ignition over coalitions. Each proposal carries .relevance set by the caller.
-function wsRunCycle(proposals, arousal, vectors) {
+// THE COGNITIVE CYCLE (used per-turn AND by the background loop). Merges new proposals into the
+// persistent workspace, decays the rest, weights, binds into coalitions, then a nonlinear
+// ignition WITH reverberation (a fresh winner is sticky for WS_SUSTAIN cycles) and displacement
+// (a challenger that clearly beats the held focus captures the spotlight). opts.persist=false
+// leaves the workspace unmutated (frozen harness). opts.spontaneous marks a between-turn cycle.
+function wsCycle(ws, newProposals, arousal, vectors, opts) {
+  opts = opts || {};
+  const bindAffect = !!opts.bindAffect;
+  const persist = opts.persist !== false;
   const ar = (typeof arousal === 'number') ? arousal : 0.5;
-  for (const p of proposals) {
+
+  let contents = (ws.contents || []).map(function (p) { return Object.assign({}, p, { salience: (p.salience || 0) * WS_DECAY }); })
+                                    .filter(function (p) { return p.salience >= WS_MIN_SAL; });
+  for (const np of (newProposals || [])) {
+    contents = contents.filter(function (p) { return p.source !== np.source; });
+    contents.push(Object.assign({}, np));
+  }
+  for (const p of contents) {
     const rel = (typeof p.relevance === 'number') ? p.relevance : 1.0;
     const affectBoost = 1.0 + WS_AFFECT_K * Math.max(0, p.arousal || 0);
     p.weight = p.salience * rel * affectBoost;
   }
-  const coalitions = wsFormCoalitions(proposals, vectors);
-  if (coalitions.length === 0)
-    return { ignited: false, broadcast: null, coalitions: [], ranked: [], suppressed: [], theta: WS_THETA_BASE, margin: 0 };
-  const top = coalitions[0];
+  const coalitions = wsFormCoalitions(contents, vectors, bindAffect);
+  const theta = WS_THETA_BASE - WS_K_AROUSAL * (ar - 0.5);
+  const prevHead = (ws.broadcast && ws.broadcast.head) ? ws.broadcast.head.source : null;
+  const heldCoalition = prevHead ? (coalitions.find(function (c) { return c.sources.indexOf(prevHead) !== -1; }) || null) : null;
+  const top = coalitions[0] || null;
   const runner = coalitions[1] || { weight: 0 };
-  const theta = WS_THETA_BASE - WS_K_AROUSAL * (ar - 0.5);  // higher arousal -> easier ignition
-  const margin = top.weight - runner.weight;
-  const ignited = (top.weight >= theta) && (margin >= WS_MARGIN);
-  return {
-    ignited: ignited,
-    broadcast: ignited ? top : null,
-    coalitions: coalitions.map(function (c) {
-      return { sources: c.sources, weight: +c.weight.toFixed(3), sumWeight: +c.sumWeight.toFixed(3),
-               coherence: +c.coherence.toFixed(3), meanSim: +c.meanSim.toFixed(3) };
-    }),
-    ranked: proposals.slice().sort(function (a, b) { return b.weight - a.weight; }).map(function (p) {
-      return { source: p.source, type: p.type, salience: +(+p.salience).toFixed(3),
-               relevance: +(+p.relevance).toFixed(3), weight: +(+p.weight).toFixed(3) };
-    }),
-    suppressed: ignited ? [].concat.apply([], coalitions.slice(1).map(function (c) { return c.sources; }))
-                        : [].concat.apply([], coalitions.map(function (c) { return c.sources; })),
-    theta: +theta.toFixed(3), margin: +margin.toFixed(3),
+
+  let broadcast = null, ignited = false, sustained = false, displaced = false, fresh = false;
+  if (ws.sustain > 0 && heldCoalition && heldCoalition.weight >= WS_MIN_SAL) {
+    if (top && top !== heldCoalition && top.weight >= heldCoalition.weight * WS_DISPLACE && top.weight >= theta) {
+      broadcast = top; ignited = true; displaced = true; fresh = true;
+    } else {
+      broadcast = heldCoalition; ignited = true; sustained = true;
+    }
+  } else if (top && top.weight >= theta && (top.weight - runner.weight) >= WS_MARGIN) {
+    broadcast = top; ignited = true; fresh = true;
+  }
+
+  const result = {
+    ignited: ignited, sustained: sustained, displaced: displaced, fresh: fresh,
+    broadcast: broadcast,
+    theta: +theta.toFixed(3),
+    margin: top ? +(top.weight - runner.weight).toFixed(3) : 0,
+    coalitions: coalitions.map(function (c) { return { sources: c.sources, weight: +c.weight.toFixed(3), coherence: +c.coherence.toFixed(3), meanSim: +c.meanSim.toFixed(3) }; }),
   };
+
+  if (persist) {
+    ws.cycle = (ws.cycle || 0) + 1;
+    if (broadcast) {
+      if (fresh) {
+        ws.sustain = WS_SUSTAIN;
+        for (const p of contents) { if (broadcast.sources.indexOf(p.source) === -1) p.salience *= WS_INHIBIT; }
+        const head = broadcast.head;
+        ws.buffer.push({ text: head ? head.text : '', source: (broadcast.sources || []).join('+'), type: head ? head.type : 'coalition', t: Date.now(), spontaneous: !!opts.spontaneous });
+        while (ws.buffer.length > WS_BUFFER_MAX) ws.buffer.shift();
+        if (opts.spontaneous && head) ws.pendingThought = { text: head.text, source: (broadcast.sources || []).join('+'), t: Date.now() };
+      } else if (sustained) {
+        ws.sustain = Math.max(0, ws.sustain - 1);
+      }
+      const h = broadcast.head;
+      ws.broadcast = { head: h ? { source: h.source, text: h.text, type: h.type } : null, sources: broadcast.sources, weight: broadcast.weight };
+    } else {
+      ws.broadcast = null; ws.sustain = 0;
+    }
+    ws.contents = contents;
+  }
+  return result;
 }
 
-// Render ONLY the ignited coalition (the bottleneck): headline member + any bound members + recent stream.
-function wsRenderWorkspace(bc, buffer) {
-  if (!bc) return '';
-  const focus = bc.head ? bc.head.text : (bc.members && bc.members[0] ? bc.members[0].text : '');
-  let out = '\n\n[WORKSPACE] In focus right now: ' + focus + '.';
-  if (bc.members && bc.members.length > 1) {
-    const others = bc.members.filter(function (m) { return m !== bc.head; }).map(function (m) { return m.text; });
-    if (others.length) out += ' Bound with: ' + others.join('; ') + '.';
+// Render ONLY the ignited broadcast (the bottleneck) + recent stream + any between-turn thought.
+function wsRenderWorkspace(bc, ws) {
+  let out = '';
+  const focusText = (bc && bc.head) ? bc.head.text : null;
+  if (focusText) {
+    out += '\n\n[WORKSPACE] In focus right now: ' + focusText + '.';
+    const others = (bc.sources || []).filter(function (sname) { return sname !== bc.head.source; });
+    if (others.length) out += ' (bound with: ' + others.join(', ') + ')';
   }
-  if (buffer && buffer.length) {
-    const recent = buffer.slice(-3).map(function (b) { return b.text; }).join(' \u2192 ');
-    if (recent) out += ' Recent stream: ' + recent + '.';
+  if (ws && ws.buffer && ws.buffer.length) {
+    const recent = ws.buffer.slice(-4).map(function (b) { return b.text; }).filter(function (t) { return t && t !== focusText; }).slice(-3);
+    if (recent.length) out += (out ? ' ' : '\n\n[WORKSPACE] ') + 'Recent stream: ' + recent.join(' \u2192 ') + '.';
   }
-  out += '\n(This is what currently holds your attention -- let it shape what you say, but do not narrate this bracket.)';
+  if (ws && ws.pendingThought && ws.pendingThought.text && ws.pendingThought.text !== focusText) {
+    out += ' A thought that surfaced while you waited: ' + ws.pendingThought.text + '.';
+  }
+  if (out) out += '\n(This is what currently holds your attention -- let it shape what you say, but do not narrate this bracket.)';
   return out;
 }
+
+// THE CONTINUOUS LOOP: between turns, cycle every loopActive + recently-active workspace.
+// Cheap by design -- decay + at most one periodic curiosity probe per conversation per few ticks;
+// no LLM calls. Dormant for normal traffic (nothing is loopActive unless workspace:true was sent).
+async function wsBackgroundTick() {
+  if (process.env.WS_LOOP === '0') return;
+  const now = Date.now();
+  for (const [cid, ws] of __wsByConv) {
+    if (now - (ws.lastTurn || ws.lastSeen) > 30 * 60 * 1000) { __wsByConv.delete(cid); continue; }
+    if (!ws.loopActive) continue;
+    if (now - (ws.lastTurn || 0) > WS_IDLE_MS) continue; // gone quiet -> stop cycling (idle)
+    try {
+      ws.tick = (ws.tick || 0) + 1;
+      ws.arousal = 0.5 + (ws.arousal - 0.5) * WS_AROUSAL_DECAY; // relax toward baseline
+      const spont = [];
+      if (ws.tick % WS_CURIOSITY_EVERY === 0 && ws.buffer.length) {
+        const seed = ws.buffer[ws.buffer.length - 1].text || '';
+        const ctx = ws.buffer.slice(-4).map(function (b) { return b.text; });
+        const hypo = await hypothalamusController(seed, ctx, null);
+        if (hypo && hypo.fired) {
+          spont.push({ source: 'hypothalamus', type: 'curiosity',
+                       text: 'pulled to explore ' + (hypo.query ? '"' + wsTrunc(hypo.query, 60) + '"' : 'a new topic'),
+                       salience: (typeof hypo.curiosity === 'number') ? hypo.curiosity : 0.6, valence: 0.1, arousal: 0.3, relevance: 0.7 });
+        }
+      }
+      wsCycle(ws, spont, ws.arousal, null, { bindAffect: false, persist: true, spontaneous: true });
+    } catch (e) { /* keep the loop alive */ }
+  }
+}
+
 
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
@@ -4382,60 +4460,45 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[HYPOTHALAMUS CTRL]', e.message); }
   }
 
-  // GLOBAL WORKSPACE (Phase 1): collect this turn's signals as proposals, run one
-  // cognitive cycle (RAS-weighted competition -> nonlinear ignition), render the single
-  // broadcast. Additive + opt-in; legacy directives still apply in Phase 1 (the
-  // "broadcast replaces directive-soup" switch is Phase 2).
+  // GLOBAL WORKSPACE (Phase 1 + 2a + 2b): inject this turn's signals as proposals into the
+  // conversation's PERSISTENT workspace, run one cognitive cycle (RAS-weighted competition,
+  // coalition binding, ignition with reverberation), and render the conscious broadcast +
+  // recent stream + any thought that surfaced between turns. The background loop keeps this
+  // same workspace cycling while the user is silent.
   let __wsContext = '';
   let __wsInfo = null;
   if (__workspace) {
     try {
+      const __ws = wsGet(__basalCid);
+      if (!__freeze) { __ws.loopActive = true; __ws.lastTurn = Date.now(); }
       const __wsArousal = (__insula && typeof __insula.arousal === 'number') ? __insula.arousal
                           : ((__brain && __brain.read && typeof __brain.read.arousal === 'number') ? __brain.read.arousal : 0.5);
+      if (!__freeze) __ws.arousal = __wsArousal;
       const __props = wsCollectProposals(lastUserMsg && lastUserMsg.content || '', __brain, __cingInfo, __hypoInfo);
-      // RAS is the attention weighter: it scores how relevant each INTERNAL signal is to the
-      // current input. (arousal=0 + base_k=all => nothing dropped here; arousal acts at ignition.)
       let __relMap = null;
       const __internal = __props.filter(function (p) { return p.source !== 'percept'; });
       if (!__ablate0.includes('ras') && __internal.length > 0) {
         const __chs = __internal.map(function (p) { return { name: p.source, text: p.text }; });
         const __rr = await rasController(lastUserMsg && lastUserMsg.content || '', __chs, 0, __internal.length);
-        if (__rr && Array.isArray(__rr.selected)) {
-          __relMap = {};
-          for (const c of __rr.selected) __relMap[c.name] = (typeof c.score === 'number') ? c.score : 0.5;
-        }
+        if (__rr && Array.isArray(__rr.selected)) { __relMap = {}; for (const c of __rr.selected) __relMap[c.name] = (typeof c.score === 'number') ? c.score : 0.5; }
       }
       for (const p of __props) {
         if (p.source === 'percept') p.relevance = WS_PERCEPT_REL;
         else if (__relMap && typeof __relMap[p.source] === 'number') p.relevance = __relMap[p.source];
-        else p.relevance = 1.0; // RAS ablated/unavailable -> internal chatter ungated (uniform)
+        else p.relevance = 1.0;
       }
-      const __ws = wsGet(__basalCid);
       let __vectors = null;
-      if (!__ablate0.includes('coalition') && __props.length > 1) {
-        __vectors = await wsEmbed(__props.map(function (p) { return p.text; }));
-      }
-      const __cyc = wsRunCycle(__props, __wsArousal, __vectors);
-      __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws.buffer);
-      if (!__freeze && __cyc.broadcast) {
-        const __bh = __cyc.broadcast.head || (__cyc.broadcast.members && __cyc.broadcast.members[0]) || null;
-        __ws.buffer.push({ text: __bh ? __bh.text : '', source: (__cyc.broadcast.sources || []).join('+'), type: __bh ? __bh.type : 'coalition', t: Date.now() });
-        while (__ws.buffer.length > WS_BUFFER_MAX) __ws.buffer.shift();
-        __ws.cycle += 1;
-      }
+      if (!__ablate0.includes('coalition') && __props.length > 1) __vectors = await wsEmbed(__props.map(function (p) { return p.text; }));
+      const __bindAffect = !__ablate0.includes('coalition') && !!__vectors;
+      const __cyc = wsCycle(__ws, __props, __wsArousal, __vectors, { bindAffect: __bindAffect, persist: !__freeze, spontaneous: false });
+      __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws);
+      if (!__freeze) __ws.pendingThought = null; // surfaced once, now consumed
       __wsInfo = {
-        ignited: __cyc.ignited,
-        broadcast: __cyc.broadcast ? { sources: __cyc.broadcast.sources, head: (__cyc.broadcast.head ? __cyc.broadcast.head.source : null), weight: +(+__cyc.broadcast.weight).toFixed(3), coherence: +(+__cyc.broadcast.coherence).toFixed(3) } : null,
-        coalitions: __cyc.coalitions,
-        ranked: __cyc.ranked,
-        suppressed: __cyc.suppressed,
-        theta: __cyc.theta,
-        margin: __cyc.margin,
-        arousal: +(+__wsArousal).toFixed(3),
-        ras_ablated: __ablate0.includes('ras'),
-        coalition_ablated: __ablate0.includes('coalition'),
-        cycle: __ws.cycle,
-        buffer_depth: __ws.buffer.length,
+        ignited: __cyc.ignited, sustained: __cyc.sustained, displaced: __cyc.displaced, fresh: __cyc.fresh,
+        broadcast: __cyc.broadcast ? { sources: __cyc.broadcast.sources, head: (__cyc.broadcast.head ? __cyc.broadcast.head.source : null), weight: +(+__cyc.broadcast.weight).toFixed(3) } : null,
+        coalitions: __cyc.coalitions, theta: __cyc.theta, margin: __cyc.margin,
+        arousal: +(+__wsArousal).toFixed(3), sustain: __ws.sustain, tick: __ws.tick, cycle: __ws.cycle, cid: __basalCid,
+        ras_ablated: __ablate0.includes('ras'), coalition_ablated: __ablate0.includes('coalition'),
       };
     } catch (e) { console.error('[WORKSPACE CTRL]', e.message); }
   }
@@ -10415,6 +10478,27 @@ app.get('/artifacts', (req, res) => {
   } catch (e) {
     res.json({ artifacts: [], count: 0 });
   }
+});
+
+// Global Workspace continuous loop (Phase 2b): cycle active workspaces between turns.
+// Dormant for normal traffic (only conversations that sent workspace:true are loopActive).
+// Disable entirely with WS_LOOP=0.
+setInterval(function () { wsBackgroundTick().catch(function () {}); }, WS_TICK_MS);
+
+// Workspace introspection: inspect a conversation's live persistent workspace state.
+app.get('/v1/workspace/peek', (req, res) => {
+  const cid = String(req.query.cid || req.query.conversation_id || '').slice(0, 120);
+  if (!cid) return res.json({ error: 'pass ?cid=' });
+  const ws = __wsByConv.get(cid);
+  if (!ws) return res.json({ cid: cid, exists: false });
+  res.json({
+    cid: cid, exists: true, loopActive: ws.loopActive, tick: ws.tick, cycle: ws.cycle, sustain: ws.sustain,
+    arousal: +(+ws.arousal).toFixed(3), secs_since_turn: Math.round((Date.now() - (ws.lastTurn || 0)) / 1000),
+    broadcast: ws.broadcast ? { head: ws.broadcast.head ? ws.broadcast.head.source : null, text: ws.broadcast.head ? ws.broadcast.head.text : null, sources: ws.broadcast.sources, weight: +(+ws.broadcast.weight).toFixed(3) } : null,
+    contents: (ws.contents || []).map(function (p) { return { source: p.source, salience: +(+p.salience).toFixed(3) }; }),
+    pendingThought: ws.pendingThought,
+    buffer: (ws.buffer || []).map(function (b) { return { text: b.text, source: b.source, spontaneous: !!b.spontaneous }; }),
+  });
 });
 
 const PORT = process.env.PORT || 4001;
