@@ -3785,6 +3785,21 @@ async function cingulateController(messages) {
   } catch (e) { return null; }
 }
 
+async function insulaController(arousal, valence, drive, update) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1200);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/insula/sense`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ arousal, valence, drive: drive || 0, update: !!update }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();  // {arousal, valence, afferent, temperature, temperature_instant}
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -4009,6 +4024,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[CINGULATE CTRL]', e.message); }
   }
 
+  // INSULA — interoception. Fold the amygdala's arousal/valence into a felt body-state (momentum +
+  // decay, server-side) and let it set the REAL sampling temperature. Effect is PARAM: hotter when aroused.
+  let __insula = null;
+  let __insulaTemp = null;
+  if (__controller && !__ablate0.includes('insula')) {
+    try {
+      const __ar = (__brain && __brain.read && typeof __brain.read.arousal === 'number') ? __brain.read.arousal : 0.5;
+      const __va = (__brain && __brain.read && typeof __brain.read.valence === 'number') ? __brain.read.valence : 0.0;
+      const __drv = 0; // psyche-drive coupling: future extension
+      __insula = await insulaController(__ar, __va, __drv, !__freeze);
+      if (__insula && typeof __insula.temperature === 'number') __insulaTemp = __insula.temperature;
+    } catch (e) { console.error('[INSULA CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -4069,6 +4098,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     amygdala: (__brain ? { emotion: __brain.read.emotion, intensity: __brain.read.intensity, acute: __brain.read.acute, routeOverride: __brain.routeOverride, directive_injected: !!__brain.directive } : null),
     basal: __bgInfo,
     cingulate: __cingInfo,
+    insula: (__insula ? { arousal: __insula.arousal, valence: __insula.valence, temperature: __insula.temperature, afferent: __insula.afferent } : null),
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
@@ -4144,6 +4174,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         stream: stream !== false,
         ...(filteredTools.length > 0 ? { tools: filteredTools } : {}),
         ...rest,
+        ...(__insulaTemp != null ? { temperature: __insulaTemp } : {}),
       }),
     });
 
