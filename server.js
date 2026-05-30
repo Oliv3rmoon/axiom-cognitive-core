@@ -511,6 +511,7 @@ async function unifiedPerception(frameBase64, audioChunk, userText) {
 
     // Update consciousness with unified perception
     consciousness.perception = {
+      ...consciousness.perception,   // FIX: preserve spatial/lastFrame/visual/audio/identities (was wiped every turn -> brainState threw on undefined spatial.userPresent)
       unified_embedding: data.unified_embedding,
       interpretation: data.interpretation,
       modality_weights: data.modality_weights,
