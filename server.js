@@ -616,6 +616,8 @@ const dreamState = {
 
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
+  amygdala: { dominantEmotion: 'neutral', emotionIntensity: 0.5 },   // FIX: referenced in unifiedPerception/metacognition but never initialized
+  cingulate: { contradictions: [] },                                 // FIX: same — written on cross-modal mismatch but never initialized
   perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [],
     spatial: {
       userPresent: true,          // is the user visible in frame
