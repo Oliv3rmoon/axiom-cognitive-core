@@ -3984,7 +3984,7 @@ function wsFormCoalitions(proposals, vectors) {
   // is an interpretation OF the current input, not an independent topic. Text cosine of the affect
   // label is an unreliable proxy here, so this association is by origin, weighted by emotional clarity.
   const __pIdx = proposals.findIndex(function (p) { return p.source === 'percept'; });
-  if (__pIdx !== -1) {
+  if (vectors && vectors.length === n && __pIdx !== -1) {
     for (let k = 0; k < n; k++) {
       if (proposals[k].type === 'affect' && Math.abs(proposals[k].valence || 0) >= WS_AFFECT_BIND_VAL) {
         union(__pIdx, k);
