@@ -4128,7 +4128,8 @@ async function wsBackgroundTick() {
       const spont = [];
       if (ws.tick % WS_CURIOSITY_EVERY === 0 && ws.buffer.length) {
         const seed = ws.buffer[ws.buffer.length - 1].text || '';
-        const ctx = ws.buffer.slice(-4).map(function (b) { return b.text; });
+        // novelty must be judged against the EARLIER stream, not the seed itself (else it self-cancels)
+        const ctx = ws.buffer.slice(0, -1).slice(-4).map(function (b) { return b.text; });
         const hypo = await hypothalamusController(seed, ctx, null);
         if (hypo && hypo.fired) {
           spont.push({ source: 'hypothalamus', type: 'curiosity',
