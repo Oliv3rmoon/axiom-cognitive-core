@@ -4046,7 +4046,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         MIRROR: 'Reflect and name what they are feeling first. Match their affect before content.',
         PUSH: 'Push back. Challenge the premise or offer a dissenting take if it is warranted. Do not just agree.',
       };
-      const __genModel = (typeof __bgGenModel === 'string' && __bgGenModel) ? __bgGenModel : BRAINSTEM_MODEL;
+      const __genModel = (typeof __bgGenModel === 'string' && __bgGenModel) ? __bgGenModel : CORTEX_MODEL;
       const __sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
       const __candResults = await Promise.all(__stances.map(st => {
         const msgs = enrichedMessages.map(m => ({ ...m }));
@@ -4062,14 +4062,20 @@ app.post('/v1/chat/completions', async (req, res) => {
           .catch(() => ({ stance: st, text: '' }));
       }));
       const __cands = __candResults.filter(c => c.text);
-      let __bestIdx = 0, __scores = null;
+      // Score each candidate by the LEARNED PER-STANCE value at this context (clean, topic-invariant
+      // separation) rather than the topic-dominated raw-candidate embedding.
+      let __vals = null, __bestIdx = 0, __stanceScores = null;
       if (__cands.length > 0) {
-        const __sc = await basalScore(lastUserMsg?.content || '', __cands.map(c => c.text), !__freeze);
-        if (__sc && typeof __sc.best_index === 'number') { __bestIdx = __sc.best_index; __scores = __sc.values; }
+        const __sel = await basalSelect(lastUserMsg?.content || '', !__freeze);
+        if (__sel && __sel.values) {
+          __vals = __sel.values;
+          __stanceScores = __cands.map(c => (typeof __vals[c.stance] === 'number' ? __vals[c.stance] : 0));
+          __bestIdx = __stanceScores.indexOf(Math.max(...__stanceScores));
+        }
       }
       if (__ablate0.includes('bgselect')) __bestIdx = 0; // ablate the value head -> default (first) candidate
       const __chosen = __cands[__bestIdx] || __cands[0] || { stance: null, text: '' };
-      if (!__freeze && __chosen.text) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingCandidate: __chosen.text, pendingAction: '' };
+      if (!__freeze && __chosen.stance) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __chosen.stance, pendingCandidate: '' };
       console.log(`[BASAL/CANDIDATES] stances=${__cands.map(c => c.stance).join(',')} scores=${JSON.stringify(__scores)} chosen=${__chosen.stance} idx=${__bestIdx}`);
       const __respObj = {
         id: 'chatcmpl-bgselect', object: 'chat.completion', created: Math.floor(Date.now() / 1000),
@@ -4079,7 +4085,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
       if (__harness) {
         __respObj.axiom = { tokenmap: Object.assign({}, __axiomTokmap, { basal_candidates: {
-          stances: __cands.map(c => c.stance), scores: __scores, best_index: __bestIdx, chosen_stance: __chosen.stance } }),
+          stances: __cands.map(c => c.stance), stance_values: __vals, scores: __stanceScores, best_index: __bestIdx, chosen_stance: __chosen.stance } }),
           candidates: __cands };
       }
       return res.json(__respObj);
