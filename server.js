@@ -3702,6 +3702,10 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
+  // AXIOM HARNESS: capture + strip custom fields so they are NOT forwarded upstream to Bedrock
+  const __harness = !!(rest && rest.harness);
+  const __ablateReq = (rest && Array.isArray(rest.ablate)) ? rest.ablate : [];
+  if (rest) { delete rest.harness; delete rest.ablate; }
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -3808,7 +3812,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   } catch (e) { console.error('[SCREEN CONTEXT ERROR]', e.message); }
 
   // AXIOM HARNESS: optional per-component ablation (no-op unless request body includes `ablate`)
-  const __ablate0 = Array.isArray(rest && rest.ablate) ? rest.ablate : [];
+  const __ablate0 = __ablateReq;
   if (__ablate0.includes('memory')) memoryContext = '';
   if (__ablate0.includes('psyche')) psycheContext = '';
   if (__ablate0.includes('goals')) goalContext = '';
@@ -3866,7 +3870,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     messages: enrichedMessages.length,
     model: selectedModel,
   };
-  const __axiomAblate = Array.isArray(rest && rest.ablate) ? rest.ablate : [];
+  const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
 
   try {
@@ -4024,7 +4028,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (results) consciousness.hypothalamus.pendingSearchResult = { topic: lastSearchNS.topic, results, t: Date.now() };
         }).catch(e => console.error('[HYPOTHALAMUS]', e.message));
       }
-      if (rest && rest.harness) { try { data.axiom = { tokenmap: __axiomTokmap, ablated: __axiomAblate, latency_ms: Date.now() - startTime }; } catch (e) {} }
+      if (__harness) { try { data.axiom = { tokenmap: __axiomTokmap, ablated: __axiomAblate, latency_ms: Date.now() - startTime }; } catch (e) {} }
       res.json(data);
     }
   } catch (error) {
