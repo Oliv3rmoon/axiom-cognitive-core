@@ -3800,6 +3800,32 @@ async function insulaController(arousal, valence, drive, update) {
   } catch (e) { return null; }
 }
 
+// Per-conversation pending reward state for the Basal Ganglia (concurrency-safe). Keyed by
+// conversation so concurrent conversations never reward each other's pending stance.
+const __basalPending = new Map(); // key -> { pendingContext, pendingAction, pendingCandidate, ts }
+function basalPendingSet(key, v) {
+  __basalPending.set(key || '__anon', {
+    pendingContext: v.pendingContext || '', pendingAction: v.pendingAction || '',
+    pendingCandidate: v.pendingCandidate || '', ts: Date.now() });
+  if (__basalPending.size > 600) { // prune stale, then cap oldest-first
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [k, val] of __basalPending) if (val.ts < cutoff) __basalPending.delete(k);
+    while (__basalPending.size > 500) { const k = __basalPending.keys().next().value; __basalPending.delete(k); }
+  }
+}
+function basalPendingGet(key) { return __basalPending.get(key || '__anon') || null; }
+function basalPendingClear(key) { __basalPending.delete(key || '__anon'); }
+function basalConvKey(req, messages) {
+  const b = (req && req.body) || {}; const h = (req && req.headers) || {};
+  const explicit = b.conversation_id || b.conversationId || b.session_id || b.user ||
+                   h['x-conversation-id'] || h['x-session-id'];
+  if (explicit) return String(explicit).slice(0, 120);
+  const firstUser = (messages || []).find(m => m && m.role === 'user'); // stable opener across turns
+  const seed = (firstUser && firstUser.content) ? String(firstUser.content).slice(0, 200) : 'anon';
+  let hsh = 0; for (let i = 0; i < seed.length; i++) hsh = (hsh * 31 + seed.charCodeAt(i)) | 0;
+  return 'h' + (hsh >>> 0).toString(36);
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3830,6 +3856,7 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
+  const __basalCid = basalConvKey(req, messages);
   // AXIOM HARNESS: capture + strip custom fields so they are NOT forwarded upstream to Bedrock
   const __harness = !!(rest && rest.harness);
   const __ablateReq = (rest && Array.isArray(rest.ablate)) ? rest.ablate : [];
@@ -3976,19 +4003,25 @@ app.post('/v1/chat/completions', async (req, res) => {
   // then gate this turn's response program by learned value. The selection IS the control-flow effect.
   let __bgDirective = '';
   let __bgInfo = null;
+  let __bgRewarded = null; // what the reward loop credited THIS turn (harness/concurrency proof)
   if (__controller && !__ablate0.includes('basal')) {
     try {
-      if (!__freeze && consciousness.basal && __brain && __brain.read) {
+      const __pend = basalPendingGet(__basalCid);
+      if (!__freeze && __pend && __brain && __brain.read) {
         const fam = __brain.read.family, val = __brain.read.valence || 0;
         if (fam && fam !== 'neutral' && Math.abs(val) >= 0.2) {
-          if (consciousness.basal.pendingCandidate) {
-            basalLearn(consciousness.basal.pendingContext || '', consciousness.basal.pendingCandidate, val)
-              .then(rw => { if (rw) console.log(`[BASAL/SELECT] learn <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
+          if (__pend.pendingCandidate) {
+            __bgRewarded = { cid: __basalCid, action: null, candidate: true };
+            basalLearn(__pend.pendingContext || '', __pend.pendingCandidate, val)
+              .then(rw => { if (rw) console.log(`[BASAL/SELECT ${__basalCid}] learn <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
               .catch(() => {});
-          } else if (consciousness.basal.pendingAction) {
-            basalReward(consciousness.basal.pendingContext || '', consciousness.basal.pendingAction, val)
-              .then(rw => { if (rw) console.log(`[BASAL] reward ${consciousness.basal.pendingAction} <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
+            basalPendingClear(__basalCid);
+          } else if (__pend.pendingAction) {
+            __bgRewarded = { cid: __basalCid, action: __pend.pendingAction, candidate: false };
+            basalReward(__pend.pendingContext || '', __pend.pendingAction, val)
+              .then(rw => { if (rw) console.log(`[BASAL ${__basalCid}] reward ${__pend.pendingAction} <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
               .catch(() => {});
+            basalPendingClear(__basalCid);
           }
         }
       }
@@ -4005,7 +4038,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (__bgAction && __bgDir && !__bgCandidates) {
         __bgDirective = `\n\n[BASAL GANGLIA] Selected action: ${__bgAction}. ${__bgDir}`;
         __bgInfo = { action: __bgAction, forced: !!__bgForce, explore: __bgSel ? __bgSel.explore : false, confidence: __bgSel ? __bgSel.confidence : null };
-        if (!__freeze && !__bgForce) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction };
+        if (!__freeze && !__bgForce) basalPendingSet(__basalCid, { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction });
       }
     } catch (e) { console.error('[BASAL CTRL]', e.message); }
   }
@@ -4097,6 +4130,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     model: selectedModel,
     amygdala: (__brain ? { emotion: __brain.read.emotion, intensity: __brain.read.intensity, acute: __brain.read.acute, routeOverride: __brain.routeOverride, directive_injected: !!__brain.directive } : null),
     basal: __bgInfo,
+    basal_reward: __bgRewarded,
     cingulate: __cingInfo,
     insula: (__insula ? { arousal: __insula.arousal, valence: __insula.valence, temperature: __insula.temperature, afferent: __insula.afferent } : null),
   };
@@ -4145,7 +4179,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
       if (__ablate0.includes('bgselect')) __bestIdx = 0; // ablate the value head -> default (first) candidate
       const __chosen = __cands[__bestIdx] || __cands[0] || { stance: null, text: '' };
-      if (!__freeze && __chosen.stance) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __chosen.stance, pendingCandidate: '' };
+      if (!__freeze && __chosen.stance) basalPendingSet(__basalCid, { pendingContext: lastUserMsg?.content || '', pendingAction: __chosen.stance, pendingCandidate: '' });
       console.log(`[BASAL/CANDIDATES] stances=${__cands.map(c => c.stance).join(',')} scores=${JSON.stringify(__stanceScores)} chosen=${__chosen.stance} idx=${__bestIdx}`);
       const __respObj = {
         id: 'chatcmpl-bgselect', object: 'chat.completion', created: Math.floor(Date.now() / 1000),
