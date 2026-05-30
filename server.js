@@ -3910,6 +3910,7 @@ const WS_CURIOSITY_EVERY = 2;  // attempt a spontaneous curiosity proposal every
 const WS_INHIBIT    = 0.6;     // lateral inhibition applied to losers on a fresh ignition
 const WS_REFLECT_EVERY = 4;          // attempt a slow prefrontal (Opus) reflection every Nth tick
 const WS_REFLECT_COOLDOWN_MS = 30000; // ...but no more often than this (cost + sanity bound)
+const WS_REFLECT_MAX_PER_QUIET = 3;   // cap reflections per quiet stretch (reset on each user turn)
 
 const __wsByConv = new Map(); // convKey -> persistent workspace
 function wsGet(cid) {
@@ -4078,8 +4079,12 @@ function wsCycle(ws, newProposals, arousal, vectors, opts) {
         ws.sustain = WS_SUSTAIN;
         for (const p of contents) { if (broadcast.sources.indexOf(p.source) === -1) p.salience *= WS_INHIBIT; }
         const head = broadcast.head;
-        ws.buffer.push({ text: head ? head.text : '', source: (broadcast.sources || []).join('+'), type: head ? head.type : 'coalition', t: Date.now(), spontaneous: !!opts.spontaneous });
-        while (ws.buffer.length > WS_BUFFER_MAX) ws.buffer.shift();
+        const __htxt = head ? head.text : '';
+        const __lastB = ws.buffer.length ? ws.buffer[ws.buffer.length - 1] : null;
+        if (!__lastB || __lastB.text !== __htxt) {
+          ws.buffer.push({ text: __htxt, source: (broadcast.sources || []).join('+'), type: head ? head.type : 'coalition', t: Date.now(), spontaneous: !!opts.spontaneous });
+          while (ws.buffer.length > WS_BUFFER_MAX) ws.buffer.shift();
+        }
         if (opts.spontaneous && head) ws.pendingThought = { text: head.text, source: (broadcast.sources || []).join('+'), t: Date.now() };
       } else if (sustained) {
         ws.sustain = Math.max(0, ws.sustain - 1);
@@ -4143,6 +4148,7 @@ async function wsReflect(ws) {
     ws.injectQueue.push({ source: 'prefrontal', type: 'reflection', text: wsTrunc(text, 220),
                           salience: 0.85, valence: 0.2, arousal: 0.45, relevance: 0.85 });
     ws.reflectionCount = (ws.reflectionCount || 0) + 1;
+    ws.reflectionsThisQuiet = (ws.reflectionsThisQuiet || 0) + 1;
   } catch (e) { /* swallow */ }
 }
 
@@ -4178,6 +4184,7 @@ async function wsBackgroundTick() {
           && (ws.tick % WS_REFLECT_EVERY === 0)
           && ws.buffer.length
           && ws.lastTurn && (now - ws.lastTurn) < WS_IDLE_MS
+          && (ws.reflectionsThisQuiet || 0) < WS_REFLECT_MAX_PER_QUIET
           && (now - (ws.lastReflectAt || 0)) > WS_REFLECT_COOLDOWN_MS) {
         ws.reflecting = true; ws.lastReflectAt = now;
         wsReflect(ws).finally(function () { ws.reflecting = false; });
@@ -4512,6 +4519,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   // same workspace cycling while the user is silent.
   let __wsContext = '';
   let __wsInfo = null;
+  let __wsSwitch = false;
   if (__workspace) {
     try {
       const __ws = wsGet(__basalCid);
@@ -4537,13 +4545,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       const __bindAffect = !__ablate0.includes('coalition') && !!__vectors;
       const __cyc = wsCycle(__ws, __props, __wsArousal, __vectors, { bindAffect: __bindAffect, persist: !__freeze, spontaneous: false });
       __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws);
-      if (!__freeze) __ws.pendingThought = null; // surfaced once, now consumed
+      if (!__freeze) { __ws.pendingThought = null; __ws.reflectionsThisQuiet = 0; } // consumed; fresh reflection budget
+      __wsSwitch = !__ablate0.includes('workspace_switch') && !!__wsContext; // broadcast replaces the legacy content-directives
       __wsInfo = {
         ignited: __cyc.ignited, sustained: __cyc.sustained, displaced: __cyc.displaced, fresh: __cyc.fresh,
         broadcast: __cyc.broadcast ? { sources: __cyc.broadcast.sources, head: (__cyc.broadcast.head ? __cyc.broadcast.head.source : null), weight: +(+__cyc.broadcast.weight).toFixed(3) } : null,
         coalitions: __cyc.coalitions, theta: __cyc.theta, margin: __cyc.margin,
         arousal: +(+__wsArousal).toFixed(3), sustain: __ws.sustain, tick: __ws.tick, cycle: __ws.cycle, cid: __basalCid,
         ras_ablated: __ablate0.includes('ras'), coalition_ablated: __ablate0.includes('coalition'),
+        switch_on: __wsSwitch, legacy_suppressed: __wsSwitch ? ['amygdala', 'cingulate', 'curiosity'] : [],
+        render: __wsContext, reflections_this_quiet: __ws.reflectionsThisQuiet || 0,
       };
     } catch (e) { console.error('[WORKSPACE CTRL]', e.message); }
   }
@@ -4556,7 +4567,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext + __curiosityDirective + __wsContext;
+    (brainState || '') +
+    (__wsSwitch ? '' : __amygDirective) + __bgDirective + (__wsSwitch ? '' : __cingDirective) +
+    __rasContext + (__wsSwitch ? '' : __curiosityDirective) + __wsContext;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
