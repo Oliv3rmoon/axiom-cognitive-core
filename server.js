@@ -3881,6 +3881,109 @@ async function hypothalamusController(text, contextTexts, threshold) {
   } catch (e) { return null; }
 }
 
+// ============================================================================
+// GLOBAL WORKSPACE (Phase 1) -- GNWT cognitive cycle: competing specialists ->
+// nonlinear ignition -> a single broadcast -> rendered as the "conscious" context.
+// Opt-in via request flag `workspace:true`; the production path is untouched when
+// off. Reuses the per-turn controller signals already computed this turn
+// (amygdala / cingulate / hypothalamus / insula) as proposers, and RAS as the
+// attention weighter. ONE cycle per turn here; this same wsRunCycle() is the unit
+// that Phase 2 (the continuous loop) will call repeatedly.
+// ============================================================================
+const WS_THETA_BASE = 0.34;   // base ignition threshold (on RAS-weighted salience)
+const WS_K_AROUSAL  = 0.18;   // arousal lowers the threshold (hypervigilance)
+const WS_MARGIN     = 0.04;   // the winner must clear the runner-up by this much
+const WS_AFFECT_K   = 0.30;   // emotionally arousing content is likelier to ignite
+const WS_BUFFER_MAX = 8;      // stream-of-consciousness ring buffer depth
+const WS_PERCEPT_REL = 0.85;  // the percept IS the input -> fixed high relevance
+
+const __wsByConv = new Map(); // convKey -> { buffer:[{text,source,type,t}], cycle, lastSeen }
+function wsGet(cid) {
+  if (!cid) cid = '_default';
+  let w = __wsByConv.get(cid);
+  if (!w) { w = { buffer: [], cycle: 0, lastSeen: Date.now() }; __wsByConv.set(cid, w); }
+  w.lastSeen = Date.now();
+  if (__wsByConv.size > 500) {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [k, v] of __wsByConv) if (v.lastSeen < cutoff) __wsByConv.delete(k);
+  }
+  return w;
+}
+function wsTrunc(x, n) { x = String(x == null ? '' : x); return x.length > n ? x.slice(0, n) + '\u2026' : x; }
+
+// Turn the already-computed per-turn signals into competing proposals (bids for the spotlight).
+function wsCollectProposals(userMsg, brain, cingInfo, hypoInfo) {
+  const props = [];
+  if (userMsg) {
+    props.push({ source: 'percept', type: 'percept', text: wsTrunc(userMsg, 180),
+                 salience: 0.5, valence: 0, arousal: 0 });
+  }
+  if (brain && brain.read && brain.read.emotion) {
+    const r = brain.read;
+    const v = (typeof r.valence === 'number') ? r.valence : 0;
+    const a = (typeof r.arousal === 'number') ? r.arousal : 0;
+    props.push({ source: 'amygdala', type: 'affect',
+                 text: 'feeling ' + r.emotion + (r.family ? ' (' + r.family + ')' : '') + ', valence ' + (v >= 0 ? '+' : '') + v.toFixed(2),
+                 salience: (typeof r.intensity === 'number') ? r.intensity : 0.5, valence: v, arousal: a });
+  }
+  if (cingInfo && cingInfo.contradiction) {
+    props.push({ source: 'cingulate', type: 'contradiction',
+                 text: 'this conflicts with something said earlier' + (cingInfo.with_statement ? ': "' + wsTrunc(cingInfo.with_statement, 80) + '"' : ''),
+                 salience: (typeof cingInfo.score === 'number') ? cingInfo.score : 0.7, valence: -0.2, arousal: 0.6 });
+  }
+  if (hypoInfo && hypoInfo.fired) {
+    props.push({ source: 'hypothalamus', type: 'curiosity',
+                 text: 'pulled to explore ' + (hypoInfo.query ? '"' + wsTrunc(hypoInfo.query, 60) + '"' : 'a new topic'),
+                 salience: (typeof hypoInfo.curiosity === 'number') ? hypoInfo.curiosity : 0.6, valence: 0.1, arousal: 0.3 });
+  }
+  return props;
+}
+
+// One cognitive cycle: weight proposals (salience x relevance x affect-boost), then a
+// nonlinear, all-or-nothing ignition. Each proposal carries .relevance set by the caller
+// (RAS score for internal signals; fixed for the percept; uniform when RAS is ablated).
+function wsRunCycle(proposals, arousal) {
+  const ar = (typeof arousal === 'number') ? arousal : 0.5;
+  const weighted = proposals.map(function (p) {
+    const rel = (typeof p.relevance === 'number') ? p.relevance : 1.0;
+    const affectBoost = 1.0 + WS_AFFECT_K * Math.max(0, p.arousal || 0);
+    return Object.assign({}, p, { relevance: rel, weight: p.salience * rel * affectBoost });
+  }).sort(function (a, b) { return b.weight - a.weight; });
+
+  if (weighted.length === 0)
+    return { ignited: false, broadcast: null, ranked: [], suppressed: [], theta: WS_THETA_BASE, margin: 0 };
+
+  const top = weighted[0];
+  const runner = weighted[1] || { weight: 0 };
+  const theta = WS_THETA_BASE - WS_K_AROUSAL * (ar - 0.5);  // higher arousal -> easier ignition
+  const margin = top.weight - runner.weight;
+  const ignited = (top.weight >= theta) && (margin >= WS_MARGIN);
+
+  return {
+    ignited: ignited,
+    broadcast: ignited ? top : null,
+    ranked: weighted.map(function (p) {
+      return { source: p.source, type: p.type, salience: +(+p.salience).toFixed(3),
+               relevance: +(+p.relevance).toFixed(3), weight: +(+p.weight).toFixed(3) };
+    }),
+    suppressed: ignited ? weighted.slice(1).map(function (p) { return p.source; })
+                        : weighted.map(function (p) { return p.source; }),
+    theta: +theta.toFixed(3), margin: +margin.toFixed(3),
+  };
+}
+
+// Render ONLY the ignited broadcast (the bottleneck) plus the recent stream. Empty if nothing ignited.
+function wsRenderWorkspace(broadcast, buffer) {
+  if (!broadcast) return '';
+  let out = '\n\n[WORKSPACE] In focus right now: ' + broadcast.text + '.';
+  if (buffer && buffer.length) {
+    const recent = buffer.slice(-3).map(function (b) { return b.text; }).join(' \u2192 ');
+    if (recent) out += ' Recent stream: ' + recent + '.';
+  }
+  out += '\n(This is what currently holds your attention -- let it shape what you say, but do not narrate this bracket.)';
+  return out;
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3927,6 +4030,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (rest) { delete rest.bgCandidates; delete rest.bgGenModel; }
   const __perception = (rest && Array.isArray(rest.perception)) ? rest.perception : null;
   if (rest) delete rest.perception;
+  const __workspace = !!(rest && rest.workspace);
+  if (rest) delete rest.workspace;
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -4197,6 +4302,57 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[HYPOTHALAMUS CTRL]', e.message); }
   }
 
+  // GLOBAL WORKSPACE (Phase 1): collect this turn's signals as proposals, run one
+  // cognitive cycle (RAS-weighted competition -> nonlinear ignition), render the single
+  // broadcast. Additive + opt-in; legacy directives still apply in Phase 1 (the
+  // "broadcast replaces directive-soup" switch is Phase 2).
+  let __wsContext = '';
+  let __wsInfo = null;
+  if (__workspace) {
+    try {
+      const __wsArousal = (__insula && typeof __insula.arousal === 'number') ? __insula.arousal
+                          : ((__brain && __brain.read && typeof __brain.read.arousal === 'number') ? __brain.read.arousal : 0.5);
+      const __props = wsCollectProposals(lastUserMsg && lastUserMsg.content || '', __brain, __cingInfo, __hypoInfo);
+      // RAS is the attention weighter: it scores how relevant each INTERNAL signal is to the
+      // current input. (arousal=0 + base_k=all => nothing dropped here; arousal acts at ignition.)
+      let __relMap = null;
+      const __internal = __props.filter(function (p) { return p.source !== 'percept'; });
+      if (!__ablate0.includes('ras') && __internal.length > 0) {
+        const __chs = __internal.map(function (p) { return { name: p.source, text: p.text }; });
+        const __rr = await rasController(lastUserMsg && lastUserMsg.content || '', __chs, 0, __internal.length);
+        if (__rr && Array.isArray(__rr.selected)) {
+          __relMap = {};
+          for (const c of __rr.selected) __relMap[c.name] = (typeof c.score === 'number') ? c.score : 0.5;
+        }
+      }
+      for (const p of __props) {
+        if (p.source === 'percept') p.relevance = WS_PERCEPT_REL;
+        else if (__relMap && typeof __relMap[p.source] === 'number') p.relevance = __relMap[p.source];
+        else p.relevance = 1.0; // RAS ablated/unavailable -> internal chatter ungated (uniform)
+      }
+      const __ws = wsGet(__basalCid);
+      const __cyc = wsRunCycle(__props, __wsArousal);
+      __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws.buffer);
+      if (!__freeze && __cyc.broadcast) {
+        __ws.buffer.push({ text: __cyc.broadcast.text, source: __cyc.broadcast.source, type: __cyc.broadcast.type, t: Date.now() });
+        while (__ws.buffer.length > WS_BUFFER_MAX) __ws.buffer.shift();
+        __ws.cycle += 1;
+      }
+      __wsInfo = {
+        ignited: __cyc.ignited,
+        broadcast: __cyc.broadcast ? { source: __cyc.broadcast.source, type: __cyc.broadcast.type, weight: __cyc.broadcast.weight } : null,
+        ranked: __cyc.ranked,
+        suppressed: __cyc.suppressed,
+        theta: __cyc.theta,
+        margin: __cyc.margin,
+        arousal: +(+__wsArousal).toFixed(3),
+        ras_ablated: __ablate0.includes('ras'),
+        cycle: __ws.cycle,
+        buffer_depth: __ws.buffer.length,
+      };
+    } catch (e) { console.error('[WORKSPACE CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -4205,7 +4361,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext + __curiosityDirective;
+    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext + __curiosityDirective + __wsContext;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -4262,6 +4418,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     ras: __rasInfo,
     mirror: __mirrorInfo,
     hypothalamus: __hypoInfo,
+    workspace: __wsInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);

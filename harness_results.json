@@ -1,0 +1,66 @@
+{
+  "inputs": 8,
+  "noise_floor": 0.652,
+  "avg_latency_ms": 6902,
+  "token_map": {
+    "memory": 1278,
+    "psyche": 167,
+    "goals": 400,
+    "knowledge": 278,
+    "screen": 0,
+    "brain": 56,
+    "static_instructions": 818,
+    "injection_total": 2997,
+    "final_payload": 3011
+  },
+  "ablation": [
+    {
+      "component": "memory",
+      "tokens": 1278,
+      "pct_injection": 42.6,
+      "resp_change": 0.8,
+      "vs_noise": 1.23,
+      "verdict": "marginal"
+    },
+    {
+      "component": "psyche",
+      "tokens": 167,
+      "pct_injection": 5.6,
+      "resp_change": 0.688,
+      "vs_noise": 1.06,
+      "verdict": "marginal"
+    },
+    {
+      "component": "goals",
+      "tokens": 400,
+      "pct_injection": 13.4,
+      "resp_change": 0.725,
+      "vs_noise": 1.11,
+      "verdict": "marginal"
+    },
+    {
+      "component": "knowledge",
+      "tokens": 278,
+      "pct_injection": 9.3,
+      "resp_change": 0.645,
+      "vs_noise": 0.99,
+      "verdict": "DECORATIVE"
+    },
+    {
+      "component": "screen",
+      "tokens": 0,
+      "pct_injection": 0.0,
+      "resp_change": 0.667,
+      "vs_noise": 1.02,
+      "verdict": "DECORATIVE"
+    },
+    {
+      "component": "brain",
+      "tokens": 56,
+      "pct_injection": 1.9,
+      "resp_change": 0.765,
+      "vs_noise": 1.17,
+      "verdict": "marginal"
+    }
+  ]
+}

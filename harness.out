@@ -1,0 +1,42 @@
+[1/8] done: "hey, how's it going?"
+[2/8] done: 'what have you been thinking about since '
+[3/8] done: "I'm stuck on a bug where the context inj"
+[4/8] done: "do you ever feel like you're not real?"
+[5/8] done: 'remind me what we decided about the Drea'
+[6/8] done: "I'm exhausted, today was rough."
+[7/8] done: 'should I transfer to Stanford or Berkele'
+[8/8] done: 'tell me something true about yourself yo'
+
+==================================================================
+TOKEN MAP — where the per-turn injection goes (avg over 8 inputs)
+==================================================================
+component                tokens    % inj
+----------------------------------------
+memory                     1278    42.6%
+psyche                      167     5.6%
+goals                       400    13.4%
+knowledge                   278     9.3%
+screen                        0     0.0%
+brain                        56     1.9%
+static_instructions         818    27.3%
+----------------------------------------
+INJECTION TOTAL            2997    100%
+FINAL PAYLOAD (post-cap)     3011
+avg latency/turn           6902 ms
+
+==================================================================
+ABLATION — does removing a region change the response?
+noise floor (baseline vs baseline, same input): 0.652
+changes at/below noise = no real effect; >1.5x noise = load-bearing
+==================================================================
+component     tokens    %inj  resp-change  vs noise   verdict
+------------------------------------------------------------------------
+memory          1278   42.6%        0.800      1.2x   marginal
+psyche           167    5.6%        0.688      1.1x   marginal
+goals            400   13.4%        0.725      1.1x   marginal
+knowledge        278    9.3%        0.645      1.0x   DECORATIVE
+screen             0    0.0%        0.667      1.0x   DECORATIVE
+brain             56    1.9%        0.765      1.2x   marginal
+
+Saved harness_results.json
+DONE
