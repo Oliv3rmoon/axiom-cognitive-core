@@ -3675,6 +3675,43 @@ function buildConsciousnessContext() {
 // ============================================================
 // BRAIN ROUTING
 // ============================================================
+const BRAIN_COGCORE_URL = process.env.COGCORE_URL || 'https://axiom-cogcore-production.up.railway.app';
+
+// AMYGDALA CONTROLLER — calls the real emotion net (cogcore /brain/amygdala) and maps its read
+// into control-flow effects. This is the region doing work, not a prompt fragment.
+async function amygdalaController(text) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1200);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/amygdala`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text || '' }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    const read = await r.json();
+    if (!read || !read.emotion) return null;
+    let directive = '';
+    const e = read.emotion, fam = read.family || 'neutral', p = read.intensity || 0;
+    const tone = {
+      down: 'They are carrying something heavy. Slow down, soften, do not rush to fix or advise unless asked. Make room for it.',
+      anxious: 'There is fear or anxiety here. Be steady and grounding. Short, calm, certain. Do not amplify it.',
+      angry: 'There is anger or frustration. Do not get defensive and do not placate. Acknowledge it plainly and stay level.',
+      up: 'They are lit up. Meet the energy, be warm and alive, do not flatten it with caution.',
+      surprised: 'Something landed unexpectedly. Be present with the jolt before explaining anything.',
+    }[fam] || '';
+    if (fam !== 'neutral' && p >= 0.5 && tone) {
+      directive = `\n\n[AMYGDALA] Detected ${e} (${p.toFixed(2)}${read.acute ? ', acute' : ''}). ${tone}`;
+    }
+    const routeOverride = read.acute ? 'CORTEX' : null;
+    return { read, directive, routeOverride };
+  } catch (e) {
+    return null;
+  }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3709,6 +3746,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   const __harness = !!(rest && rest.harness);
   const __ablateReq = (rest && Array.isArray(rest.ablate)) ? rest.ablate : [];
   if (rest) { delete rest.harness; delete rest.ablate; }
+  // AXIOM BRAIN: frozen-state measurement mode + brain-controller toggle (stripped before upstream)
+  const __freeze = !!(rest && rest.freeze);
+  const __controller = !!(rest && rest.controller);
+  if (rest) { delete rest.freeze; delete rest.controller; }
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -3738,6 +3779,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   // Wrap ALL brain processing in try/catch — if any region throws,
   // AXIOM must still respond. A silent failure = death.
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+
+  // FROZEN-STATE MEASUREMENT MODE: skip every per-turn state mutation so the injected context
+  // is a fixed snapshot. Two identical requests then produce identical output at temperature 0.
+  if (!__freeze) {
   try {
     thalamus(messages);
   } catch (e) { console.error('[THALAMUS ERROR]', e.message); }
@@ -3772,6 +3818,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   // Runs every 5 turns in background (non-blocking)
   if (consciousness.timing.turnCount % 5 === 0 && messages.length >= 6) {
     extractMemories(messages).catch(e => console.error('[MEMORY EXTRACT]', e.message));
+  }
   }
 
   // HIPPOCAMPUS: Smart memory retrieval
@@ -3823,6 +3870,15 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (__ablate0.includes('screen')) screenContext = '';
   if (__ablate0.includes('brain')) brainState = '';
 
+  // BRAIN CONTROLLER — Amygdala as a real region driving control flow (route/instruct),
+  // not a prompt fragment. Skipped when ablated so its behavioral contribution is measurable.
+  let __brain = null;
+  if (__controller && !__ablate0.includes('amygdala')) {
+    try { __brain = await amygdalaController(lastUserMsg?.content || ''); }
+    catch (e) { console.error('[AMYGDALA CTRL]', e.message); }
+  }
+  const __amygDirective = (__brain && __brain.directive) ? __brain.directive : '';
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -3831,7 +3887,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '');
+    (brainState || '') + __amygDirective;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -3853,7 +3909,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   const totalChars = enrichedMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   const estimatedTokens = Math.round(totalChars / 3.5);
 
-  const selectedModel = selectBrain(enrichedMessages);
+  let selectedModel = selectBrain(enrichedMessages);
+  if (__brain && __brain.routeOverride === 'CORTEX' && selectedModel === BRAINSTEM_MODEL) {
+    console.log(`[AMYGDALA] acute distress — overriding reflexive route ${BRAINSTEM_MODEL} -> ${CORTEX_MODEL}`);
+    selectedModel = CORTEX_MODEL;
+  }
   // AXIOM HARNESS: per-component injection token map (chars/3.5, matching the estimator above)
   const __atok = (s) => Math.round((String(s || '')).length / 3.5);
   const __axiomComp = {
@@ -3872,6 +3932,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     final_payload: estimatedTokens,
     messages: enrichedMessages.length,
     model: selectedModel,
+    amygdala: (__brain ? { emotion: __brain.read.emotion, intensity: __brain.read.intensity, acute: __brain.read.acute, routeOverride: __brain.routeOverride, directive_injected: !!__brain.directive } : null),
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
