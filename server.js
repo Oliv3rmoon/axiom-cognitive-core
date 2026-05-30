@@ -3908,6 +3908,8 @@ const WS_IDLE_MS    = 4 * 60 * 1000; // stop cycling a conversation after this m
 const WS_AROUSAL_DECAY = 0.90; // between turns, arousal relaxes toward baseline 0.5
 const WS_CURIOSITY_EVERY = 2;  // attempt a spontaneous curiosity proposal every Nth tick
 const WS_INHIBIT    = 0.6;     // lateral inhibition applied to losers on a fresh ignition
+const WS_REFLECT_EVERY = 4;          // attempt a slow prefrontal (Opus) reflection every Nth tick
+const WS_REFLECT_COOLDOWN_MS = 30000; // ...but no more often than this (cost + sanity bound)
 
 const __wsByConv = new Map(); // convKey -> persistent workspace
 function wsGet(cid) {
@@ -4112,9 +4114,42 @@ function wsRenderWorkspace(bc, ws) {
   return out;
 }
 
-// THE CONTINUOUS LOOP: between turns, cycle every loopActive + recently-active workspace.
-// Cheap by design -- decay + at most one periodic curiosity probe per conversation per few ticks;
-// no LLM calls. Dormant for normal traffic (nothing is loopActive unless workspace:true was sent).
+// SLOW PREFRONTAL (Opus) REFLECTION: between turns, reflect on the recent stream and GENERATE a
+// genuinely new thought/question, queued as a high-salience proposal for the next cycle to ignite.
+// This is the real source of spontaneous between-turn cognition (vs. re-probing curiosity).
+async function wsReflect(ws) {
+  try {
+    const stream = (ws.buffer || []).slice(-5).map(function (b) { return '- ' + b.text; }).join('\n');
+    if (!stream) return;
+    const sys = 'You are the slow, reflective part of a mind -- its prefrontal cortex -- thinking quietly to yourself between conversations. No one is listening right now; you are just thinking.';
+    const usr = 'The recent stream of what has held your attention:\n' + stream +
+                '\n\nWhat new thought, connection, doubt, or question is surfacing for you now -- something genuine you have NOT already said? Reply with ONE short first-person sentence. No preamble, no quotation marks.';
+    const ctrl = new AbortController();
+    const to = setTimeout(function () { ctrl.abort(); }, 12000);
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: PREFRONTAL_MODEL, max_tokens: 90, temperature: 0.9,
+                             messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!res.ok) return;
+    const data = await res.json();
+    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    text = String(text).trim().replace(/^["']+|["']+$/g, '').trim();
+    if (!text) return;
+    ws.injectQueue = ws.injectQueue || [];
+    ws.injectQueue.push({ source: 'prefrontal', type: 'reflection', text: wsTrunc(text, 220),
+                          salience: 0.85, valence: 0.2, arousal: 0.45, relevance: 0.85 });
+    ws.reflectionCount = (ws.reflectionCount || 0) + 1;
+  } catch (e) { /* swallow */ }
+}
+
+// THE CONTINUOUS LOOP: between turns, cycle every loopActive + recently-active workspace --
+// decay + reverberation, drain any completed reflection into the cycle, and (on a slow, rate-
+// limited cadence) trigger a new Opus reflection. Dormant for normal traffic (nothing is
+// loopActive unless workspace:true was sent). Kill with WS_LOOP=0 / WS_REFLECT=0.
 async function wsBackgroundTick() {
   if (process.env.WS_LOOP === '0') return;
   const now = Date.now();
@@ -4125,19 +4160,28 @@ async function wsBackgroundTick() {
     try {
       ws.tick = (ws.tick || 0) + 1;
       ws.arousal = 0.5 + (ws.arousal - 0.5) * WS_AROUSAL_DECAY; // relax toward baseline
-      const spont = [];
+      // proposals entering this between-turn cycle: any completed prefrontal reflection first,
+      // plus an optional curiosity pull (only when a concrete topic was actually extracted).
+      const newProps = (ws.injectQueue || []).splice(0);
       if (ws.tick % WS_CURIOSITY_EVERY === 0 && ws.buffer.length) {
         const seed = ws.buffer[ws.buffer.length - 1].text || '';
-        // novelty must be judged against the EARLIER stream, not the seed itself (else it self-cancels)
         const ctx = ws.buffer.slice(0, -1).slice(-4).map(function (b) { return b.text; });
         const hypo = await hypothalamusController(seed, ctx, null);
-        if (hypo && hypo.fired) {
-          spont.push({ source: 'hypothalamus', type: 'curiosity',
-                       text: 'pulled to explore ' + (hypo.query ? '"' + wsTrunc(hypo.query, 60) + '"' : 'a new topic'),
-                       salience: (typeof hypo.curiosity === 'number') ? hypo.curiosity : 0.6, valence: 0.1, arousal: 0.3, relevance: 0.7 });
+        if (hypo && hypo.fired && hypo.query) {
+          newProps.push({ source: 'hypothalamus', type: 'curiosity', text: 'pulled to explore "' + wsTrunc(hypo.query, 60) + '"',
+                          salience: (typeof hypo.curiosity === 'number') ? hypo.curiosity : 0.6, valence: 0.1, arousal: 0.3, relevance: 0.7 });
         }
       }
-      wsCycle(ws, spont, ws.arousal, null, { bindAffect: false, persist: true, spontaneous: true });
+      wsCycle(ws, newProps, ws.arousal, null, { bindAffect: false, persist: true, spontaneous: true });
+      // slow prefrontal reflection (fire-and-forget, single-flight, rate-limited)
+      if (process.env.WS_REFLECT !== '0' && !ws.reflecting
+          && (ws.tick % WS_REFLECT_EVERY === 0)
+          && ws.buffer.length
+          && ws.lastTurn && (now - ws.lastTurn) < WS_IDLE_MS
+          && (now - (ws.lastReflectAt || 0)) > WS_REFLECT_COOLDOWN_MS) {
+        ws.reflecting = true; ws.lastReflectAt = now;
+        wsReflect(ws).finally(function () { ws.reflecting = false; });
+      }
     } catch (e) { /* keep the loop alive */ }
   }
 }
@@ -10494,6 +10538,7 @@ app.get('/v1/workspace/peek', (req, res) => {
   if (!ws) return res.json({ cid: cid, exists: false });
   res.json({
     cid: cid, exists: true, loopActive: ws.loopActive, tick: ws.tick, cycle: ws.cycle, sustain: ws.sustain,
+    reflectionCount: ws.reflectionCount || 0, reflecting: !!ws.reflecting,
     arousal: +(+ws.arousal).toFixed(3), secs_since_turn: Math.round((Date.now() - (ws.lastTurn || 0)) / 1000),
     broadcast: ws.broadcast ? { head: ws.broadcast.head ? ws.broadcast.head.source : null, text: ws.broadcast.head ? ws.broadcast.head.text : null, sources: ws.broadcast.sources, weight: +(+ws.broadcast.weight).toFixed(3) } : null,
     contents: (ws.contents || []).map(function (p) { return { source: p.source, salience: +(+p.salience).toFixed(3) }; }),
