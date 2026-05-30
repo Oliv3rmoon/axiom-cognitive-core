@@ -1368,6 +1368,12 @@ function injectEmotionTag(text) {
   return `${tag} ${text}`;
 }
 
+// MIRROR NEURONS (authoritative): strip any model-emitted emotion tag and set the mirror's.
+function applyMirrorTag(text, emotion) {
+  const stripped = text.replace(/^\s*<emotion value="[^"]*"\s*\/>\s*/, '');
+  return `<emotion value="${emotion}"/> ${stripped}`;
+}
+
 // For streaming: inject tag into first SSE chunk that has content
 // ONLY if the LLM didn't already generate one (system prompt tells it to)
 function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
@@ -1385,8 +1391,12 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
       if (content) {
         // If the LLM already generated an emotion tag, DON'T double-inject
         if (content.includes('<emotion value=') || content.includes('<emotion')) {
-          injected = true; // mark as done so we don't try again
-          return line; // return unchanged
+          injected = true;
+          if (consciousness.mirror.authoritative) { // authoritative mirror overrides the model's tag
+            json.choices[0].delta.content = content.replace(/<emotion value="[^"]*"\s*\/>/, tag);
+            return `data: ${JSON.stringify(json)}`;
+          }
+          return line; // fallback: keep the model's tag
         }
         json.choices[0].delta.content = `${tag} ${content}`;
         injected = true;
@@ -3841,6 +3851,21 @@ async function rasController(context, channels, arousal, baseK) {
   } catch (e) { return null; }
 }
 
+async function mirrorController(userValence, userArousal, update) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1200);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/mirror`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_valence: userValence, user_arousal: userArousal, update: !!update }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();  // {emotion, expressed_valence, expressed_arousal, user_*, gain, distress_regulated}
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -4109,6 +4134,29 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   }
 
+  // MIRROR NEURONS — perception->expression attunement. Pull AXIOM's expressed affect toward the
+  // user's perceived affect (cogcore coupled VA state) and make the resulting emotion AUTHORITATIVE
+  // over the avatar <emotion> tag. Effect: override the expression channel.
+  let __mirror = null;
+  let __mirrorInfo = null;
+  let __mirrorOverride = null;
+  consciousness.mirror.authoritative = false;
+  if (__controller && !__ablate0.includes('mirror')) {
+    try {
+      const __uv = (__brain && __brain.read && typeof __brain.read.valence === 'number') ? __brain.read.valence : 0.0;
+      const __ua = (__brain && __brain.read && typeof __brain.read.arousal === 'number') ? __brain.read.arousal : 0.4;
+      __mirror = await mirrorController(__uv, __ua, !__freeze);
+      if (__mirror && __mirror.emotion) {
+        __mirrorOverride = __mirror.emotion;
+        consciousness.mirror.currentEmotion = __mirror.emotion; // real mechanism replaces the heuristic lookup
+        consciousness.mirror.authoritative = true;              // avatar tag becomes authoritative (overrides model)
+        __mirrorInfo = { emotion: __mirror.emotion, expressed_valence: __mirror.expressed_valence,
+          expressed_arousal: __mirror.expressed_arousal, user_valence: __mirror.user_valence,
+          user_arousal: __mirror.user_arousal, gain: __mirror.gain, distress_regulated: __mirror.distress_regulated };
+      }
+    } catch (e) { console.error('[MIRROR CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -4172,6 +4220,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     cingulate: __cingInfo,
     insula: (__insula ? { arousal: __insula.arousal, valence: __insula.valence, temperature: __insula.temperature, afferent: __insula.afferent } : null),
     ras: __rasInfo,
+    mirror: __mirrorInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
@@ -4367,11 +4416,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       // Rewrite model name for Tavus
       if (data.model) data.model = requestedModel;
       let content = data.choices?.[0]?.message?.content || '';
-      // MIRROR NEURONS: Inject emotion tag for Phoenix-4 facial expression
-      if (consciousness.mirror.active && content) {
+      // MIRROR NEURONS: emotion tag for Phoenix-4 facial expression
+      let __modelEmittedTag = null;
+      const __tm = content.match(/^\s*<emotion value="([^"]*)"\s*\/>/);
+      if (__tm) __modelEmittedTag = __tm[1];
+      if (__mirrorOverride && content) {            // authoritative: mirror sets the tag
+        content = applyMirrorTag(content, __mirrorOverride);
+        if (data.choices?.[0]?.message) data.choices[0].message.content = content;
+      } else if (consciousness.mirror.active && content) {
         content = injectEmotionTag(content);
         if (data.choices?.[0]?.message) data.choices[0].message.content = content;
       }
+      if (__mirrorInfo) { __mirrorInfo.model_tag = __modelEmittedTag; __mirrorInfo.final_tag = __mirrorOverride; }
       insula(content);
 
       // CONVERSATION MOMENTUM: Record AXIOM's turn (non-streaming)
