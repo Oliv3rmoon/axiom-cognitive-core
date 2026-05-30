@@ -3898,6 +3898,7 @@ const WS_BUFFER_MAX = 8;      // stream-of-consciousness ring buffer depth
 const WS_PERCEPT_REL = 0.85;  // the percept IS the input -> fixed high relevance
 const WS_BIND_SIM   = 0.45;   // embedding cosine at/above which two proposals bind into a coalition
 const WS_COHERENCE_K = 0.25;  // a tightly-bound coalition is amplified by up to this fraction
+const WS_AFFECT_BIND_VAL = 0.35; // |valence| at/above which an affect reading binds to its percept
 
 const __wsByConv = new Map(); // convKey -> { buffer:[{text,source,type,t}], cycle, lastSeen }
 function wsGet(cid) {
@@ -3977,6 +3978,18 @@ function wsFormCoalitions(proposals, vectors) {
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
       const sim = wsCos(vectors[i], vectors[j]);
       if (sim >= WS_BIND_SIM) { union(i, j); simPairs.push([i, j, sim]); }
+    }
+  }
+  // Affect binds to its percept when the emotional reading is clear (|valence| high): the affect
+  // is an interpretation OF the current input, not an independent topic. Text cosine of the affect
+  // label is an unreliable proxy here, so this association is by origin, weighted by emotional clarity.
+  const __pIdx = proposals.findIndex(function (p) { return p.source === 'percept'; });
+  if (__pIdx !== -1) {
+    for (let k = 0; k < n; k++) {
+      if (proposals[k].type === 'affect' && Math.abs(proposals[k].valence || 0) >= WS_AFFECT_BIND_VAL) {
+        union(__pIdx, k);
+        simPairs.push([Math.min(__pIdx, k), Math.max(__pIdx, k), Math.abs(proposals[k].valence || 0)]);
+      }
     }
   }
   const groups = {};
