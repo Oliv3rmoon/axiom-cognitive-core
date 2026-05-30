@@ -3826,6 +3826,21 @@ function basalConvKey(req, messages) {
   return 'h' + (hsh >>> 0).toString(36);
 }
 
+async function rasController(context, channels, arousal, baseK) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/ras`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context, channels, arousal: (typeof arousal === 'number' ? arousal : 0.5), base_k: baseK || null }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();  // {selected, suppressed, effective_k, n_channels, arousal}
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3870,6 +3885,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   const __bgCandidates = !!(rest && rest.bgCandidates);
   const __bgGenModel = (rest && typeof rest.bgGenModel === 'string') ? rest.bgGenModel : null;
   if (rest) { delete rest.bgCandidates; delete rest.bgGenModel; }
+  const __perception = (rest && Array.isArray(rest.perception)) ? rest.perception : null;
+  if (rest) delete rest.perception;
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -4038,7 +4055,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (__bgAction && __bgDir && !__bgCandidates) {
         __bgDirective = `\n\n[BASAL GANGLIA] Selected action: ${__bgAction}. ${__bgDir}`;
         __bgInfo = { action: __bgAction, forced: !!__bgForce, explore: __bgSel ? __bgSel.explore : false, confidence: __bgSel ? __bgSel.confidence : null };
-        if (!__freeze && !__bgForce) basalPendingSet(__basalCid, { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction });
+        if (!__freeze) basalPendingSet(__basalCid, { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction });
       }
     } catch (e) { console.error('[BASAL CTRL]', e.message); }
   }
@@ -4071,6 +4088,27 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[INSULA CTRL]', e.message); }
   }
 
+  // RAS — arousal-gated attention over perception channels. Score each channel's salience to what's
+  // happening now and admit only the top-K (K narrows with arousal); suppress the rest. Effect is GATE.
+  let __rasContext = '';
+  let __rasInfo = null;
+  if (__controller && Array.isArray(__perception) && __perception.length > 0) {
+    const __rasAr = (__insula && typeof __insula.arousal === 'number') ? __insula.arousal
+                   : ((__brain && __brain.read && typeof __brain.read.arousal === 'number') ? __brain.read.arousal : 0.5);
+    if (__ablate0.includes('ras')) {
+      __rasContext = '\n\n[PERCEPTION]\n' + __perception.map(c => `- ${c.name}: ${c.text}`).join('\n');
+      __rasInfo = { ablated: true, admitted: __perception.map(c => c.name), suppressed: [], effective_k: __perception.length };
+    } else {
+      try {
+        const __r = await rasController(lastUserMsg?.content || '', __perception, __rasAr);
+        if (__r && Array.isArray(__r.selected)) {
+          __rasContext = '\n\n[PERCEPTION]\n' + __r.selected.map(c => `- ${c.name}: ${c.text}`).join('\n');
+          __rasInfo = { ablated: false, admitted: __r.selected.map(c => c.name), suppressed: __r.suppressed, effective_k: __r.effective_k, arousal: __r.arousal };
+        }
+      } catch (e) { console.error('[RAS CTRL]', e.message); }
+    }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -4079,7 +4117,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective + __bgDirective + __cingDirective;
+    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -4133,6 +4171,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     basal_reward: __bgRewarded,
     cingulate: __cingInfo,
     insula: (__insula ? { arousal: __insula.arousal, valence: __insula.valence, temperature: __insula.temperature, afferent: __insula.afferent } : null),
+    ras: __rasInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
