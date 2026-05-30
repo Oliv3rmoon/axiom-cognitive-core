@@ -618,6 +618,7 @@ const dreamState = {
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
   amygdala: { dominantEmotion: 'neutral', emotionIntensity: 0.5 },   // FIX: referenced in unifiedPerception/metacognition but never initialized
+  basal: { pendingContext: '', pendingAction: '' },   // Basal Ganglia: cross-turn action awaiting reward
   perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [],
     spatial: {
       userPresent: true,          // is the user visible in frame
@@ -3712,6 +3713,32 @@ async function amygdalaController(text) {
   }
 }
 
+// BASAL GANGLIA helpers — select an action program (Go/NoGo) and reward the prior one.
+async function basalSelect(text, explore) {
+  try {
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 1200);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/basal-ganglia/select`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text || '', explore: explore !== false }), signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+async function basalReward(text, action, reward) {
+  try {
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 1200);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/basal-ganglia/reward`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text || '', action, reward }), signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3750,6 +3777,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   const __freeze = !!(rest && rest.freeze);
   const __controller = !!(rest && rest.controller);
   if (rest) { delete rest.freeze; delete rest.controller; }
+  const __bgForce = (rest && typeof rest.bgForce === 'string') ? rest.bgForce : null;
+  if (rest) { delete rest.bgForce; }
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -3879,6 +3908,38 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
   const __amygDirective = (__brain && __brain.directive) ? __brain.directive : '';
 
+  // BASAL GANGLIA — reward the previous action from the current affect (its consequence),
+  // then gate this turn's response program by learned value. The selection IS the control-flow effect.
+  let __bgDirective = '';
+  let __bgInfo = null;
+  if (__controller && !__ablate0.includes('basal')) {
+    try {
+      if (!__freeze && consciousness.basal && consciousness.basal.pendingAction && __brain && __brain.read) {
+        const fam = __brain.read.family, val = __brain.read.valence || 0;
+        if (fam && fam !== 'neutral' && Math.abs(val) >= 0.2) {
+          basalReward(consciousness.basal.pendingContext || '', consciousness.basal.pendingAction, val)
+            .then(rw => { if (rw) console.log(`[BASAL] reward ${consciousness.basal.pendingAction} <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
+            .catch(() => {});
+        }
+      }
+      let __bgAction = __bgForce;
+      let __bgSel = null;
+      if (!__bgAction) { __bgSel = await basalSelect(lastUserMsg?.content || '', !__freeze); if (__bgSel) __bgAction = __bgSel.action; }
+      const __bgDir = {
+        DIRECT: 'Answer the substance plainly and concretely. No hedging, no preamble.',
+        PROBE: 'Ask one sharp, specific question to go deeper before answering anything else.',
+        MIRROR: 'Reflect and name what they are feeling first. Match their affect before content.',
+        PUSH: 'Push back. Challenge the premise or offer a dissenting take if it is warranted. Do not just agree.',
+        LIGHTEN: 'Bring some levity or warmth. Lower the intensity with a light touch.',
+      }[__bgAction] || '';
+      if (__bgAction && __bgDir) {
+        __bgDirective = `\n\n[BASAL GANGLIA] Selected action: ${__bgAction}. ${__bgDir}`;
+        __bgInfo = { action: __bgAction, forced: !!__bgForce, explore: __bgSel ? __bgSel.explore : false, confidence: __bgSel ? __bgSel.confidence : null };
+        if (!__freeze && !__bgForce) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction };
+      }
+    } catch (e) { console.error('[BASAL CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -3887,7 +3948,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective;
+    (brainState || '') + __amygDirective + __bgDirective;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -3933,6 +3994,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     messages: enrichedMessages.length,
     model: selectedModel,
     amygdala: (__brain ? { emotion: __brain.read.emotion, intensity: __brain.read.intensity, acute: __brain.read.acute, routeOverride: __brain.routeOverride, directive_injected: !!__brain.directive } : null),
+    basal: __bgInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
