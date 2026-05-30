@@ -3807,6 +3807,15 @@ app.post('/v1/chat/completions', async (req, res) => {
     screenContext = getScreenContext();
   } catch (e) { console.error('[SCREEN CONTEXT ERROR]', e.message); }
 
+  // AXIOM HARNESS: optional per-component ablation (no-op unless request body includes `ablate`)
+  const __ablate0 = Array.isArray(rest && rest.ablate) ? rest.ablate : [];
+  if (__ablate0.includes('memory')) memoryContext = '';
+  if (__ablate0.includes('psyche')) psycheContext = '';
+  if (__ablate0.includes('goals')) goalContext = '';
+  if (__ablate0.includes('knowledge')) knowledgeContext = '';
+  if (__ablate0.includes('screen')) screenContext = '';
+  if (__ablate0.includes('brain')) brainState = '';
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -3838,6 +3847,26 @@ app.post('/v1/chat/completions', async (req, res) => {
   const estimatedTokens = Math.round(totalChars / 3.5);
 
   const selectedModel = selectBrain(enrichedMessages);
+  // AXIOM HARNESS: per-component injection token map (chars/3.5, matching the estimator above)
+  const __atok = (s) => Math.round((String(s || '')).length / 3.5);
+  const __axiomComp = {
+    memory: __atok(memoryContext),
+    psyche: __atok(psycheContext),
+    goals: __atok(goalContext),
+    knowledge: __atok(knowledgeContext),
+    screen: __atok(screenContext),
+    brain: __atok(brainState),
+  };
+  let __compSum = 0; for (const __k in __axiomComp) __compSum += __axiomComp[__k];
+  const __axiomTokmap = {
+    components: __axiomComp,
+    static_instructions: Math.max(0, __atok(contextInjection) - __compSum),
+    injection_total: __atok(contextInjection),
+    final_payload: estimatedTokens,
+    messages: enrichedMessages.length,
+    model: selectedModel,
+  };
+  const __axiomAblate = Array.isArray(rest && rest.ablate) ? rest.ablate : [];
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
 
   try {
@@ -3995,6 +4024,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (results) consciousness.hypothalamus.pendingSearchResult = { topic: lastSearchNS.topic, results, t: Date.now() };
         }).catch(e => console.error('[HYPOTHALAMUS]', e.message));
       }
+      if (rest && rest.harness) { try { data.axiom = { tokenmap: __axiomTokmap, ablated: __axiomAblate, latency_ms: Date.now() - startTime }; } catch (e) {} }
       res.json(data);
     }
   } catch (error) {
