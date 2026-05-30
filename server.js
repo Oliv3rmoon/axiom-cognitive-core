@@ -524,13 +524,14 @@ async function unifiedPerception(frameBase64, audioChunk, userText) {
       consciousness.amygdala.emotionIntensity = data.interpretation.emotion_confidence || 0.5;
     }
 
-    // Feed mismatches to cingulate
+    // CINGULATE — surface cross-modal mismatch into the contradictions buffer buildConsciousnessContext actually reads
     if (data.interpretation?.mismatch_detected) {
-      consciousness.cingulate.contradictions.push({
-        type: 'cross_modal_mismatch',
-        description: data.interpretation.mismatch_description,
+      consciousness.contradictions.push({
+        what: `Cross-modal mismatch: ${data.interpretation.mismatch_description || 'words and signals disagree'}`,
+        detail: data.interpretation.mismatch_description || '',
         timestamp: Date.now(),
       });
+      if (consciousness.contradictions.length > 5) consciousness.contradictions.shift();
       console.log(`[MULTIMODAL] Mismatch detected: ${data.interpretation.mismatch_description}`);
     }
 
@@ -617,7 +618,6 @@ const dreamState = {
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
   amygdala: { dominantEmotion: 'neutral', emotionIntensity: 0.5 },   // FIX: referenced in unifiedPerception/metacognition but never initialized
-  cingulate: { contradictions: [] },                                 // FIX: same — written on cross-modal mismatch but never initialized
   perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [],
     spatial: {
       userPresent: true,          // is the user visible in frame
