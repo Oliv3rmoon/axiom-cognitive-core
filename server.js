@@ -3764,6 +3764,27 @@ async function basalLearn(context, candidate, reward) {
   } catch (e) { return null; }
 }
 
+async function cingulateController(messages) {
+  try {
+    const userMsgs = (messages || []).filter(m => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim());
+    if (userMsgs.length < 2) return null;  // need a prior claim to contradict
+    const statement = userMsgs[userMsgs.length - 1].content;
+    const priors = userMsgs.slice(0, -1).slice(-3).map(m => m.content);
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1800);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/cingulate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ statement, against: priors }), signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    const c = await r.json();
+    if (!c || !c.contradiction) return c || null;
+    c.directive = `\n\n[CINGULATE] CONFLICT DETECTED (contradiction ${c.score}, topic-match ${c.sim}). The user just said "${statement}" \u2014 this contradicts something said earlier: "${c.with_statement}". Do not smoothly continue. Stop, name the discrepancy directly, and ask which holds before anything else.`;
+    return c;
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3974,6 +3995,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[BASAL CTRL]', e.message); }
   }
 
+  // CINGULATE — contradiction monitor. A real NLI net (gated by topic similarity) flags when the
+  // user's latest claim contradicts an earlier one; the effect is an INTERRUPT (surface it + re-evaluate).
+  let __cingDirective = '';
+  let __cingInfo = null;
+  if (__controller && !__ablate0.includes('cingulate')) {
+    try {
+      const __cing = await cingulateController(messages);
+      if (__cing) {
+        __cingInfo = { contradiction: __cing.contradiction, score: __cing.score, sim: __cing.sim, with_statement: __cing.with_statement, directive_injected: !!__cing.directive };
+        if (__cing.directive) __cingDirective = __cing.directive;
+      }
+    } catch (e) { console.error('[CINGULATE CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -3982,7 +4017,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective + __bgDirective;
+    (brainState || '') + __amygDirective + __bgDirective + __cingDirective;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -4009,6 +4044,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log(`[AMYGDALA] acute distress — overriding reflexive route ${BRAINSTEM_MODEL} -> ${CORTEX_MODEL}`);
     selectedModel = CORTEX_MODEL;
   }
+  if (__cingInfo && __cingInfo.contradiction && selectedModel === BRAINSTEM_MODEL) {
+    console.log(`[CINGULATE] contradiction \u2014 overriding reflexive route ${BRAINSTEM_MODEL} -> ${CORTEX_MODEL} for re-evaluation`);
+    selectedModel = CORTEX_MODEL;
+  }
   // AXIOM HARNESS: per-component injection token map (chars/3.5, matching the estimator above)
   const __atok = (s) => Math.round((String(s || '')).length / 3.5);
   const __axiomComp = {
@@ -4029,6 +4068,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     model: selectedModel,
     amygdala: (__brain ? { emotion: __brain.read.emotion, intensity: __brain.read.intensity, acute: __brain.read.acute, routeOverride: __brain.routeOverride, directive_injected: !!__brain.directive } : null),
     basal: __bgInfo,
+    cingulate: __cingInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
