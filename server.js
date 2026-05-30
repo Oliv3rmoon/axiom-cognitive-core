@@ -3866,6 +3866,21 @@ async function mirrorController(userValence, userArousal, update) {
   } catch (e) { return null; }
 }
 
+async function hypothalamusController(text, contextTexts, threshold) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/hypothalamus`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, context: contextTexts || [], threshold: (typeof threshold === 'number' ? threshold : null) }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();  // {fired, curiosity, externality, novelty, ext_raw}
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3961,7 +3976,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
 
   try {
-    hypothalamusProcess(lastUserMsg?.content || '');
+    if (!(__controller && !__ablate0.includes('hypothalamus'))) hypothalamusProcess(lastUserMsg?.content || '');
   } catch (e) { console.error('[HYPOTHALAMUS ERROR]', e.message); }
 
   // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
@@ -4157,6 +4172,31 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[MIRROR CTRL]', e.message); }
   }
 
+  // HYPOTHALAMUS — curiosity drive. Decide whether to PROACTIVELY search the web (a search AXIOM runs
+  // on its own initiative because it is curious). Real externality x novelty computation gates it.
+  let __hypo = null;
+  let __hypoInfo = null;
+  let __curiosityDirective = '';
+  if (__controller && !__ablate0.includes('hypothalamus')) {
+    try {
+      const __ctx = messages.filter(m => m && m.role === 'user').slice(0, -1).map(m => String(m.content || '')).slice(-3);
+      __hypo = await hypothalamusController(lastUserMsg?.content || '', __ctx);
+      if (__hypo) {
+        let __q = null;
+        if (__hypo.fired) {
+          const __t = extractTopics(lastUserMsg?.content || '');
+          __q = (__t.find(t => !t.startsWith('_'))) || (lastUserMsg?.content || '').trim().slice(0, 80);
+          __curiosityDirective = `\n\n[CURIOSITY] A novel external topic — you're genuinely curious and have begun looking into "${__q}". Weave in what you find naturally.`;
+          if (!__freeze) { // fire the proactive search through the existing async machinery
+            consciousness.hypothalamus.currentDrive = { type: 'search', topic: __q, query: __q, score: __hypo.curiosity };
+            consciousness.hypothalamus.driveHistory.push({ type: 'search', topic: __q, t: Date.now() });
+          }
+        }
+        __hypoInfo = { fired: __hypo.fired, curiosity: __hypo.curiosity, externality: __hypo.externality, novelty: __hypo.novelty, query: __q };
+      }
+    } catch (e) { console.error('[HYPOTHALAMUS CTRL]', e.message); }
+  }
+
   // Build the full context injection: memories + psyche + goals + knowledge + screen + brain signals
   const contextInjection = (memoryContext ? '\n\n' + memoryContext : '') +
     (psycheContext ? '\n\n' + psycheContext : '') +
@@ -4165,7 +4205,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     (screenContext ? '\n\n' + screenContext : '') +
     MIRROR_SYSTEM_PROMPT +
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
-    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext;
+    (brainState || '') + __amygDirective + __bgDirective + __cingDirective + __rasContext + __curiosityDirective;
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -4221,6 +4261,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     insula: (__insula ? { arousal: __insula.arousal, valence: __insula.valence, temperature: __insula.temperature, afferent: __insula.afferent } : null),
     ras: __rasInfo,
     mirror: __mirrorInfo,
+    hypothalamus: __hypoInfo,
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
