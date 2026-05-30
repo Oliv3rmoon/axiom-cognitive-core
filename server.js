@@ -4076,7 +4076,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (__ablate0.includes('bgselect')) __bestIdx = 0; // ablate the value head -> default (first) candidate
       const __chosen = __cands[__bestIdx] || __cands[0] || { stance: null, text: '' };
       if (!__freeze && __chosen.stance) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __chosen.stance, pendingCandidate: '' };
-      console.log(`[BASAL/CANDIDATES] stances=${__cands.map(c => c.stance).join(',')} scores=${JSON.stringify(__scores)} chosen=${__chosen.stance} idx=${__bestIdx}`);
+      console.log(`[BASAL/CANDIDATES] stances=${__cands.map(c => c.stance).join(',')} scores=${JSON.stringify(__stanceScores)} chosen=${__chosen.stance} idx=${__bestIdx}`);
       const __respObj = {
         id: 'chatcmpl-bgselect', object: 'chat.completion', created: Math.floor(Date.now() / 1000),
         model: model || selectedModel,
