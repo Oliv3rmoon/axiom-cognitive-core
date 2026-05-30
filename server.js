@@ -618,7 +618,7 @@ const dreamState = {
 const consciousness = {
   emotion: { primary: 'neutral', intensity: 0, secondary: null, valence: 0, arousal: 0.5, lastUpdated: Date.now() },
   amygdala: { dominantEmotion: 'neutral', emotionIntensity: 0.5 },   // FIX: referenced in unifiedPerception/metacognition but never initialized
-  basal: { pendingContext: '', pendingAction: '' },   // Basal Ganglia: cross-turn action awaiting reward
+  basal: { pendingContext: '', pendingAction: '', pendingCandidate: '' },   // Basal Ganglia: cross-turn action/candidate awaiting reward
   perception: { visual: [], audio: [], faceIdentity: null, voiceIdentity: null, lastFrame: null, salience: [],
     spatial: {
       userPresent: true,          // is the user visible in frame
@@ -3739,6 +3739,31 @@ async function basalReward(text, action, reward) {
   } catch (e) { return null; }
 }
 
+async function basalScore(context, candidates, explore) {
+  try {
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 2500);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/basal-ganglia/score`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: context || '', candidates: candidates || [], explore: explore !== false }), signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+async function basalLearn(context, candidate, reward) {
+  try {
+    const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetch(`${BRAIN_COGCORE_URL}/brain/basal-ganglia/learn`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: context || '', candidate, reward }), signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
 function selectBrain(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return CORTEX_MODEL;
@@ -3779,6 +3804,9 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (rest) { delete rest.freeze; delete rest.controller; }
   const __bgForce = (rest && typeof rest.bgForce === 'string') ? rest.bgForce : null;
   if (rest) { delete rest.bgForce; }
+  const __bgCandidates = !!(rest && rest.bgCandidates);
+  const __bgGenModel = (rest && typeof rest.bgGenModel === 'string') ? rest.bgGenModel : null;
+  if (rest) { delete rest.bgCandidates; delete rest.bgGenModel; }
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -3914,17 +3942,23 @@ app.post('/v1/chat/completions', async (req, res) => {
   let __bgInfo = null;
   if (__controller && !__ablate0.includes('basal')) {
     try {
-      if (!__freeze && consciousness.basal && consciousness.basal.pendingAction && __brain && __brain.read) {
+      if (!__freeze && consciousness.basal && __brain && __brain.read) {
         const fam = __brain.read.family, val = __brain.read.valence || 0;
         if (fam && fam !== 'neutral' && Math.abs(val) >= 0.2) {
-          basalReward(consciousness.basal.pendingContext || '', consciousness.basal.pendingAction, val)
-            .then(rw => { if (rw) console.log(`[BASAL] reward ${consciousness.basal.pendingAction} <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
-            .catch(() => {});
+          if (consciousness.basal.pendingCandidate) {
+            basalLearn(consciousness.basal.pendingContext || '', consciousness.basal.pendingCandidate, val)
+              .then(rw => { if (rw) console.log(`[BASAL/SELECT] learn <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
+              .catch(() => {});
+          } else if (consciousness.basal.pendingAction) {
+            basalReward(consciousness.basal.pendingContext || '', consciousness.basal.pendingAction, val)
+              .then(rw => { if (rw) console.log(`[BASAL] reward ${consciousness.basal.pendingAction} <- valence ${val}: ${rw.value_before}->${rw.value_after}`); })
+              .catch(() => {});
+          }
         }
       }
       let __bgAction = __bgForce;
       let __bgSel = null;
-      if (!__bgAction) { __bgSel = await basalSelect(lastUserMsg?.content || '', !__freeze); if (__bgSel) __bgAction = __bgSel.action; }
+      if (!__bgAction && !__bgCandidates) { __bgSel = await basalSelect(lastUserMsg?.content || '', !__freeze); if (__bgSel) __bgAction = __bgSel.action; }
       const __bgDir = {
         DIRECT: 'Answer the substance plainly and concretely. No hedging, no preamble.',
         PROBE: 'Ask one sharp, specific question to go deeper before answering anything else.',
@@ -3932,7 +3966,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         PUSH: 'Push back. Challenge the premise or offer a dissenting take if it is warranted. Do not just agree.',
         LIGHTEN: 'Bring some levity or warmth. Lower the intensity with a light touch.',
       }[__bgAction] || '';
-      if (__bgAction && __bgDir) {
+      if (__bgAction && __bgDir && !__bgCandidates) {
         __bgDirective = `\n\n[BASAL GANGLIA] Selected action: ${__bgAction}. ${__bgDir}`;
         __bgInfo = { action: __bgAction, forced: !!__bgForce, explore: __bgSel ? __bgSel.explore : false, confidence: __bgSel ? __bgSel.confidence : null };
         if (!__freeze && !__bgForce) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingAction: __bgAction };
@@ -3998,6 +4032,61 @@ app.post('/v1/chat/completions', async (req, res) => {
   };
   const __axiomAblate = __ablateReq;
   console.log(`[TURN ${consciousness.timing.turnCount}] ${selectedModel} | Emotion: ${consciousness.emotion.primary} | Mirror: ${consciousness.mirror.currentEmotion} | RAS: ${consciousness.ras.attentionMode} | Curiosity: ${consciousness.hypothalamus.curiosityPressure.toFixed(2)} | Msgs: ${enrichedMessages.length} | ~${estimatedTokens} tokens | Sys: ${sysMsg?.content?.length || 0} chars | Fear: ${consciousness.psyche.fears.activeFear || '-'} | Desire: ${consciousness.psyche.desires.activeDesire || '-'}`);
+
+  // BASAL GANGLIA — CANDIDATE SELECTION (controller mode). The cortex proposes one candidate per
+  // stance (generated in parallel at temp 0 -> reproducible set); the learned value head releases
+  // the best (Go) and suppresses the rest (NoGo). Selection over a fixed set is deterministic, so
+  // its effect is provable independent of LLM sampling noise. Non-streaming.
+  if (__controller && __bgCandidates) {
+    try {
+      const __stances = ['DIRECT', 'PROBE', 'MIRROR', 'PUSH'];
+      const __stanceDir = {
+        DIRECT: 'Answer the substance plainly and concretely. No hedging, no preamble.',
+        PROBE: 'Ask one sharp, specific question to go deeper before answering anything else.',
+        MIRROR: 'Reflect and name what they are feeling first. Match their affect before content.',
+        PUSH: 'Push back. Challenge the premise or offer a dissenting take if it is warranted. Do not just agree.',
+      };
+      const __genModel = (typeof __bgGenModel === 'string' && __bgGenModel) ? __bgGenModel : BRAINSTEM_MODEL;
+      const __sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
+      const __candResults = await Promise.all(__stances.map(st => {
+        const msgs = enrichedMessages.map(m => ({ ...m }));
+        const dir = `\n\n[ACTION] ${__stanceDir[st]}`;
+        if (__sysIdx >= 0) msgs[__sysIdx] = { ...msgs[__sysIdx], content: (msgs[__sysIdx].content || '') + dir };
+        else msgs.unshift({ role: 'system', content: dir });
+        return fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: msgs, model: __genModel, stream: false, ...rest }),
+        }).then(r => (r.ok ? r.json() : null))
+          .then(j => ({ stance: st, text: (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '' }))
+          .catch(() => ({ stance: st, text: '' }));
+      }));
+      const __cands = __candResults.filter(c => c.text);
+      let __bestIdx = 0, __scores = null;
+      if (__cands.length > 0) {
+        const __sc = await basalScore(lastUserMsg?.content || '', __cands.map(c => c.text), !__freeze);
+        if (__sc && typeof __sc.best_index === 'number') { __bestIdx = __sc.best_index; __scores = __sc.values; }
+      }
+      if (__ablate0.includes('bgselect')) __bestIdx = 0; // ablate the value head -> default (first) candidate
+      const __chosen = __cands[__bestIdx] || __cands[0] || { stance: null, text: '' };
+      if (!__freeze && __chosen.text) consciousness.basal = { pendingContext: lastUserMsg?.content || '', pendingCandidate: __chosen.text, pendingAction: '' };
+      console.log(`[BASAL/CANDIDATES] stances=${__cands.map(c => c.stance).join(',')} scores=${JSON.stringify(__scores)} chosen=${__chosen.stance} idx=${__bestIdx}`);
+      const __respObj = {
+        id: 'chatcmpl-bgselect', object: 'chat.completion', created: Math.floor(Date.now() / 1000),
+        model: model || selectedModel,
+        choices: [{ index: 0, message: { role: 'assistant', content: __chosen.text }, finish_reason: 'stop' }],
+        usage: {},
+      };
+      if (__harness) {
+        __respObj.axiom = { tokenmap: Object.assign({}, __axiomTokmap, { basal_candidates: {
+          stances: __cands.map(c => c.stance), scores: __scores, best_index: __bestIdx, chosen_stance: __chosen.stance } }),
+          candidates: __cands };
+      }
+      return res.json(__respObj);
+    } catch (e) {
+      console.error('[BASAL/CANDIDATES]', e.message);
+    }
+  }
 
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
