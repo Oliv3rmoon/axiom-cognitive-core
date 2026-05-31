@@ -4161,11 +4161,13 @@ function wsAttentionSchema(ws, cyc) {
 // This is the real source of spontaneous between-turn cognition (vs. re-probing curiosity).
 async function wsReflect(ws) {
   try {
-    const stream = (ws.buffer || []).slice(-5).map(function (b) { return '- ' + b.text; }).join('\n');
+    const stream = (ws.buffer || []).slice(-5).map(function (b) {
+      return (String(b.source || '').indexOf('percept') !== -1 ? 'Andrew said: ' : 'I thought: ') + b.text;
+    }).join('\n');
     if (!stream) return;
-    const sys = 'You are the slow, reflective part of a mind -- its prefrontal cortex -- thinking quietly to yourself between conversations. No one is listening right now; you are just thinking.';
-    const usr = 'The recent stream of what has held your attention:\n' + stream +
-                '\n\nWhat new thought, connection, doubt, or question is surfacing for you now -- something genuine you have NOT already said? Reply with ONE short first-person sentence. No preamble, no quotation marks.';
+    const sys = 'You are AXIOM, an AI, thinking privately to yourself between turns of a conversation with Andrew (the person you talk with). These are YOUR own thoughts. Speak as "I"; refer to Andrew in the third person ("Andrew", "he", "him"). Never write as if you were Andrew or adopt his first-person voice.';
+    const usr = 'The recent stream (what Andrew said, and what you have been thinking):\n' + stream +
+                '\n\nWhat new thought, connection, doubt, or question about Andrew or the conversation is surfacing for you now -- something genuine you have NOT already said? Reply with ONE short sentence in your own first-person voice. No preamble, no quotation marks.';
     const ctrl = new AbortController();
     const to = setTimeout(function () { ctrl.abort(); }, 12000);
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
@@ -4193,10 +4195,12 @@ async function wsReflect(ws) {
 // to name -- specifically -- what it keeps circling, and queue it as a higher-order proposal.
 async function wsSelfObserve(ws) {
   try {
-    const stream = (ws.buffer || []).slice(-4).map(function (b) { return '- ' + b.text; }).join('\n');
+    const stream = (ws.buffer || []).slice(-4).map(function (b) {
+      return (String(b.source || '').indexOf('percept') !== -1 ? 'Andrew said: ' : 'I thought: ') + b.text;
+    }).join('\n');
     if (!stream) return;
-    const sys = 'You are the metacognitive part of a mind, watching your own attention. You have realized you keep circling the same thoughts without moving forward.';
-    const usr = 'Your recent stream of thought:\n' + stream + '\n\nIn ONE short first-person sentence, name specifically what you keep circling and that you are stuck on it. No preamble, no quotation marks.';
+    const sys = 'You are AXIOM, an AI, watching your own attention during a conversation with Andrew. You keep circling the same thoughts without moving forward. Speak as "I"; refer to Andrew in the third person. Never write as if you were Andrew.';
+    const usr = 'Your recent stream (what Andrew said, and what you have been thinking):\n' + stream + '\n\nIn ONE short first-person sentence, name specifically what you keep circling and that you are stuck on it. No preamble, no quotation marks.';
     const ctrl = new AbortController(); const to = setTimeout(function () { ctrl.abort(); }, 12000);
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
@@ -4374,7 +4378,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (rest) { delete rest.bgCandidates; delete rest.bgGenModel; }
   const __perception = (rest && Array.isArray(rest.perception)) ? rest.perception : null;
   if (rest) delete rest.perception;
-  const __workspace = !!(rest && rest.workspace);
+  const __workspace = !!(rest && rest.workspace) || process.env.WS_LIVE === '1';
   if (rest) delete rest.workspace;
   const __wsProactive = (rest && typeof rest.wsProactive === 'string') ? rest.wsProactive : null;
   if (rest) delete rest.wsProactive;
