@@ -3911,6 +3911,8 @@ const WS_INHIBIT    = 0.6;     // lateral inhibition applied to losers on a fres
 const WS_REFLECT_EVERY = 4;          // attempt a slow prefrontal (Opus) reflection every Nth tick
 const WS_REFLECT_COOLDOWN_MS = 30000; // ...but no more often than this (cost + sanity bound)
 const WS_REFLECT_MAX_PER_QUIET = 3;   // cap reflections per quiet stretch (reset on each user turn)
+const WS_FRESH_RESET = 0.5;           // a fresh user turn dims the prior internal stream (so new input wins focus)
+const WS_SELFOBS_COOLDOWN_MS = 60000; // min spacing between metacognitive self-observations
 
 const __wsByConv = new Map(); // convKey -> persistent workspace
 function wsGet(cid) {
@@ -4035,7 +4037,8 @@ function wsCycle(ws, newProposals, arousal, vectors, opts) {
   const persist = opts.persist !== false;
   const ar = (typeof arousal === 'number') ? arousal : 0.5;
 
-  let contents = (ws.contents || []).map(function (p) { return Object.assign({}, p, { salience: (p.salience || 0) * WS_DECAY }); })
+  const __extraDecay = opts.freshInput ? WS_FRESH_RESET : 1.0; // a new external input dims the prior internal stream
+  let contents = (ws.contents || []).map(function (p) { return Object.assign({}, p, { salience: (p.salience || 0) * WS_DECAY * __extraDecay }); })
                                     .filter(function (p) { return p.salience >= WS_MIN_SAL; });
   for (const np of (newProposals || [])) {
     contents = contents.filter(function (p) { return p.source !== np.source; });
@@ -4053,8 +4056,9 @@ function wsCycle(ws, newProposals, arousal, vectors, opts) {
   const top = coalitions[0] || null;
   const runner = coalitions[1] || { weight: 0 };
 
+  const heldActive = (opts.freshInput ? 0 : (ws.sustain || 0)) > 0; // fresh external input interrupts reverberation
   let broadcast = null, ignited = false, sustained = false, displaced = false, fresh = false;
-  if (ws.sustain > 0 && heldCoalition && heldCoalition.weight >= WS_MIN_SAL) {
+  if (heldActive && heldCoalition && heldCoalition.weight >= WS_MIN_SAL) {
     if (top && top !== heldCoalition && top.weight >= heldCoalition.weight * WS_DISPLACE && top.weight >= theta) {
       broadcast = top; ignited = true; displaced = true; fresh = true;
     } else {
@@ -4119,6 +4123,36 @@ function wsRenderWorkspace(bc, ws) {
   return out;
 }
 
+// SELF-MODEL / ATTENTION SCHEMA (Phase 3): a mechanistic, causally-efficacious model of the
+// workspace's OWN attentional state -- what it attends to, whether it is ruminating, its arousal,
+// whether it is conflicted. Rendered into context (the cortex reads a model of its own attention)
+// and, on detected rumination, injected as a higher-order proposal that can itself be broadcast.
+// This crosses the metacognition indicator -- it is not a claim of phenomenal experience.
+function wsAttentionSchema(ws, cyc) {
+  const recent = (ws.buffer || []).slice(-4);
+  const counts = {};
+  for (const b of recent) { const k = String(b.source || '').split('+')[0]; counts[k] = (counts[k] || 0) + 1; }
+  let domSource = null, domN = 0;
+  for (const k in counts) { if (counts[k] > domN) { domN = counts[k]; domSource = k; } }
+  const ruminating = recent.length >= 3 && domN >= 3;
+  const arousal = (typeof ws.arousal === 'number') ? ws.arousal : 0.5;
+  const arousalState = arousal < 0.4 ? 'settled' : (arousal > 0.62 ? 'charged' : 'engaged');
+  const margin = (cyc && typeof cyc.margin === 'number') ? cyc.margin : 1;
+  const ncoal = (cyc && cyc.coalitions) ? cyc.coalitions.length : 0;
+  const conflict = ncoal >= 2 && margin < 0.08;
+  const ignited = !!(cyc && cyc.broadcast);
+  const focusSrc = ignited ? (cyc.broadcast.head ? cyc.broadcast.head.source : (cyc.broadcast.sources || [])[0]) : null;
+  let attn;
+  if (!ignited) attn = 'my attention is unsettled -- nothing has quite cohered';
+  else if (ruminating) attn = 'I keep circling the same thread of thought';
+  else attn = 'my attention is settled on one thing';
+  let text = (arousalState === 'settled' ? 'I feel calm; ' : arousalState === 'charged' ? 'I feel charged up; ' : 'I feel engaged; ') + attn;
+  if (conflict) text += ", and I'm pulled in more than one direction";
+  text += '.';
+  return { attending_to: focusSrc, ruminating: ruminating, rumination_source: ruminating ? domSource : null,
+           arousal_state: arousalState, conflict: conflict, ignited: ignited, text: text };
+}
+
 // SLOW PREFRONTAL (Opus) REFLECTION: between turns, reflect on the recent stream and GENERATE a
 // genuinely new thought/question, queued as a high-salience proposal for the next cycle to ignite.
 // This is the real source of spontaneous between-turn cognition (vs. re-probing curiosity).
@@ -4179,6 +4213,14 @@ async function wsBackgroundTick() {
         }
       }
       wsCycle(ws, newProps, ws.arousal, null, { bindAffect: false, persist: true, spontaneous: true });
+      // metacognition (Phase 3): if stuck ruminating, a higher-order self-observation can enter the
+      // workspace and break the loop (it out-salients the rumination it is about).
+      const __sm = wsAttentionSchema(ws, { broadcast: ws.broadcast, coalitions: [], margin: 1 });
+      if (__sm.ruminating && (now - (ws.lastSelfObsAt || 0)) > WS_SELFOBS_COOLDOWN_MS) {
+        ws.lastSelfObsAt = now;
+        (ws.injectQueue = ws.injectQueue || []).push({ source: 'self_model', type: 'metacognition',
+          text: 'I notice I keep circling the same thought instead of moving forward', salience: 0.9, valence: -0.1, arousal: 0.4, relevance: 0.9 });
+      }
       // slow prefrontal reflection (fire-and-forget, single-flight, rate-limited)
       if (process.env.WS_REFLECT !== '0' && !ws.reflecting
           && (ws.tick % WS_REFLECT_EVERY === 0)
@@ -4543,8 +4585,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       let __vectors = null;
       if (!__ablate0.includes('coalition') && __props.length > 1) __vectors = await wsEmbed(__props.map(function (p) { return p.text; }));
       const __bindAffect = !__ablate0.includes('coalition') && !!__vectors;
-      const __cyc = wsCycle(__ws, __props, __wsArousal, __vectors, { bindAffect: __bindAffect, persist: !__freeze, spontaneous: false });
+      const __cyc = wsCycle(__ws, __props, __wsArousal, __vectors, { bindAffect: __bindAffect, persist: !__freeze, spontaneous: false, freshInput: true });
       __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws);
+      const __self = wsAttentionSchema(__ws, __cyc);
+      if (__self && __self.text) __wsContext += '\n\n[SELF-MODEL] ' + __self.text + '\n(This is your read of your own attention right now -- it may inform how you speak, but do not narrate this bracket.)';
       if (!__freeze) { __ws.pendingThought = null; __ws.reflectionsThisQuiet = 0; } // consumed; fresh reflection budget
       __wsSwitch = !__ablate0.includes('workspace_switch') && !!__wsContext; // broadcast replaces the legacy content-directives
       __wsInfo = {
@@ -4555,6 +4599,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         ras_ablated: __ablate0.includes('ras'), coalition_ablated: __ablate0.includes('coalition'),
         switch_on: __wsSwitch, legacy_suppressed: __wsSwitch ? ['amygdala', 'cingulate', 'curiosity'] : [],
         render: __wsContext, reflections_this_quiet: __ws.reflectionsThisQuiet || 0,
+        self_model: __self,
       };
     } catch (e) { console.error('[WORKSPACE CTRL]', e.message); }
   }
