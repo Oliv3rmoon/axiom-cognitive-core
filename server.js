@@ -10709,11 +10709,20 @@ app.get('/v1/workspace/peek', (req, res) => {
 app.get('/v1/workspace/pending-utterance', (req, res) => {
   const cid = String(req.query.cid || req.query.conversation_id || '').slice(0, 120);
   if (!cid) return res.json({ error: 'pass ?cid=' });
-  const ws = __wsByConv.get(cid);
+  let key = cid, ws = __wsByConv.get(cid);
+  // Fallback for live use: if the requested cid has nothing queued but EXACTLY ONE active workspace
+  // does, serve that. Handles the single-live-conversation case where the frontend's Tavus
+  // conversation_id differs from the key Tavus passes the cognitive-core LLM. Safe: only when one
+  // active workspace has a pending utterance (never ambiguous across concurrent live conversations).
+  if (!ws || !ws.pendingUtterance) {
+    const live = [];
+    for (const [k, w] of __wsByConv) { if (w && w.loopActive && w.pendingUtterance) live.push([k, w]); }
+    if (live.length === 1) { key = live[0][0]; ws = live[0][1]; }
+  }
   if (!ws || !ws.pendingUtterance) return res.json({ cid: cid, utterance: null });
   const u = ws.pendingUtterance;
   ws.pendingUtterance = null;
-  res.json({ cid: cid, utterance: u.text, thought: u.thought, already_delivered: !!u.delivered });
+  res.json({ cid: cid, matched: key, utterance: u.text, thought: u.thought, already_delivered: !!u.delivered });
 });
 
 const PORT = process.env.PORT || 4001;
