@@ -3913,6 +3913,9 @@ const WS_REFLECT_COOLDOWN_MS = 30000; // ...but no more often than this (cost + 
 const WS_REFLECT_MAX_PER_QUIET = 3;   // cap reflections per quiet stretch (reset on each user turn)
 const WS_FRESH_RESET = 0.5;           // a fresh user turn dims the prior internal stream (so new input wins focus)
 const WS_SELFOBS_COOLDOWN_MS = 60000; // min spacing between metacognitive self-observations
+const WS_PROACTIVE_SILENCE_MS = 30000; // user must be silent at least this long before AXIOM speaks unprompted
+const WS_PROACTIVE_COOLDOWN_MS = 90000; // min spacing between proactive utterances
+const WS_PROACTIVE_MAX = 2;            // cap proactive utterances per quiet stretch (reset on each user turn)
 
 const __wsByConv = new Map(); // convKey -> persistent workspace
 function wsGet(cid) {
@@ -4186,6 +4189,93 @@ async function wsReflect(ws) {
   } catch (e) { /* swallow */ }
 }
 
+// METACOGNITIVE SELF-OBSERVATION (Phase 3, model-generated): when stuck ruminating, ask the model
+// to name -- specifically -- what it keeps circling, and queue it as a higher-order proposal.
+async function wsSelfObserve(ws) {
+  try {
+    const stream = (ws.buffer || []).slice(-4).map(function (b) { return '- ' + b.text; }).join('\n');
+    if (!stream) return;
+    const sys = 'You are the metacognitive part of a mind, watching your own attention. You have realized you keep circling the same thoughts without moving forward.';
+    const usr = 'Your recent stream of thought:\n' + stream + '\n\nIn ONE short first-person sentence, name specifically what you keep circling and that you are stuck on it. No preamble, no quotation marks.';
+    const ctrl = new AbortController(); const to = setTimeout(function () { ctrl.abort(); }, 12000);
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: PREFRONTAL_MODEL, max_tokens: 70, temperature: 0.8,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }), signal: ctrl.signal });
+    clearTimeout(to);
+    if (!res.ok) return;
+    const data = await res.json();
+    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    text = String(text).trim().replace(/^["']+|["']+$/g, '').trim();
+    if (!text) return;
+    (ws.injectQueue = ws.injectQueue || []).push({ source: 'self_model', type: 'metacognition', text: wsTrunc(text, 200), salience: 0.9, valence: -0.1, arousal: 0.4, relevance: 0.9 });
+  } catch (e) { /* swallow */ }
+}
+
+// PROACTIVE SPEECH (the unprompted path).
+// Turn an internal thought into a brief, natural spoken opener to Andrew (the cortex voice).
+async function wsProactiveUtterance(thought) {
+  try {
+    const sys = 'You are AXIOM, speaking aloud to Andrew during a quiet pause in your live conversation. You have been thinking to yourself and want to share a thought with him, unprompted.';
+    const usr = 'The thought on your mind: "' + thought + '"\n\nSay it to Andrew now as a brief, natural spoken opener (1-2 sentences). First person, warm, direct. No stage directions, no quotation marks, no filler like "sure" or "well".';
+    const ctrl = new AbortController(); const to = setTimeout(function () { ctrl.abort(); }, 12000);
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: CORTEX_MODEL, max_tokens: 90, temperature: 0.85,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }), signal: ctrl.signal });
+    clearTimeout(to);
+    if (!res.ok) return null;
+    const data = await res.json();
+    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    return String(text).trim().replace(/^["']+|["']+$/g, '').trim() || null;
+  } catch (e) { return null; }
+}
+
+// Best-effort direct delivery to a live Tavus conversation via an echo interaction. Only used when
+// proactive mode is '1' AND the conversation key looks like a Tavus id (otherwise we rely on the
+// frontend pulling from /v1/workspace/pending-utterance and speaking via its own live connection).
+async function wsSendTavusEcho(cid, text) {
+  try {
+    const KEY = process.env.TAVUS_API_KEY;
+    if (!KEY || !cid || !/^c[0-9a-f]{6,}$/i.test(cid)) return false;
+    const ctrl = new AbortController(); const to = setTimeout(function () { ctrl.abort(); }, 8000);
+    const res = await fetch('https://tavusapi.com/v2/conversations/' + cid + '/interactions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': KEY },
+      body: JSON.stringify({ message_type: 'conversation', event_type: 'conversation.echo', conversation_id: cid, properties: { text: text } }),
+      signal: ctrl.signal });
+    clearTimeout(to);
+    return res.ok;
+  } catch (e) { return false; }
+}
+
+// Decide whether to speak unprompted; if so, generate + queue (+ best-effort deliver). Default OFF.
+// Per-conversation mode via the wsProactive request flag, or globally via env WS_PROACTIVE.
+// '1' = live delivery attempt; 'dry' = generate + queue/log only (no server-side send).
+async function wsProactiveCheck(ws, cid, now) {
+  const mode = ws.proactiveMode || process.env.WS_PROACTIVE;
+  if (mode !== '1' && mode !== 'dry') return;
+  if (ws.proactiveBusy) return;
+  const thought = ws.pendingThought;
+  if (!thought || !thought.text) return;                                   // need something on its mind
+  const sinceTurn = now - (ws.lastTurn || 0);
+  if (sinceTurn < WS_PROACTIVE_SILENCE_MS || sinceTurn > WS_IDLE_MS) return; // only during a real lull
+  if ((now - (ws.lastProactiveAt || 0)) < WS_PROACTIVE_COOLDOWN_MS) return;  // cooldown
+  if ((ws.proactiveThisQuiet || 0) >= WS_PROACTIVE_MAX) return;             // cap per quiet stretch
+  ws.proactiveBusy = true;
+  try {
+    const line = await wsProactiveUtterance(thought.text);
+    if (line) {
+      ws.lastProactiveAt = now;
+      ws.proactiveThisQuiet = (ws.proactiveThisQuiet || 0) + 1;
+      let delivered = false;
+      if (mode === '1') delivered = await wsSendTavusEcho(cid, line);
+      ws.pendingUtterance = { text: line, thought: thought.text, t: now, delivered: delivered };
+      ws.pendingThought = null; // voiced -> don't also surface it on the next user turn
+      console.log('[WS PROACTIVE]' + (delivered ? ' (sent)' : ' (queued)') + ' ' + line.slice(0, 90));
+    }
+  } catch (e) { /* swallow */ } finally { ws.proactiveBusy = false; }
+}
+
 // THE CONTINUOUS LOOP: between turns, cycle every loopActive + recently-active workspace --
 // decay + reverberation, drain any completed reflection into the cycle, and (on a slow, rate-
 // limited cadence) trigger a new Opus reflection. Dormant for normal traffic (nothing is
@@ -4213,14 +4303,16 @@ async function wsBackgroundTick() {
         }
       }
       wsCycle(ws, newProps, ws.arousal, null, { bindAffect: false, persist: true, spontaneous: true });
-      // metacognition (Phase 3): if stuck ruminating, a higher-order self-observation can enter the
-      // workspace and break the loop (it out-salients the rumination it is about).
+      // metacognition (Phase 3): if stuck ruminating, generate a higher-order self-observation
+      // (via the model) that can enter the workspace and break the loop.
       const __sm = wsAttentionSchema(ws, { broadcast: ws.broadcast, coalitions: [], margin: 1 });
-      if (__sm.ruminating && (now - (ws.lastSelfObsAt || 0)) > WS_SELFOBS_COOLDOWN_MS) {
-        ws.lastSelfObsAt = now;
-        (ws.injectQueue = ws.injectQueue || []).push({ source: 'self_model', type: 'metacognition',
-          text: 'I notice I keep circling the same thought instead of moving forward', salience: 0.9, valence: -0.1, arousal: 0.4, relevance: 0.9 });
+      if (__sm.ruminating && !ws.selfObserving && (now - (ws.lastSelfObsAt || 0)) > WS_SELFOBS_COOLDOWN_MS) {
+        ws.selfObserving = true; ws.lastSelfObsAt = now;
+        wsSelfObserve(ws).finally(function () { ws.selfObserving = false; });
       }
+      // proactive speech (unprompted): if a fresh thought is on its mind and the user has gone
+      // quiet, decide whether to voice it. Fire-and-forget; default OFF and heavily gated.
+      wsProactiveCheck(ws, cid, now);
       // slow prefrontal reflection (fire-and-forget, single-flight, rate-limited)
       if (process.env.WS_REFLECT !== '0' && !ws.reflecting
           && (ws.tick % WS_REFLECT_EVERY === 0)
@@ -4284,6 +4376,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (rest) delete rest.perception;
   const __workspace = !!(rest && rest.workspace);
   if (rest) delete rest.workspace;
+  const __wsProactive = (rest && typeof rest.wsProactive === 'string') ? rest.wsProactive : null;
+  if (rest) delete rest.wsProactive;
   // Pass tools through — Tavus manages the full tool call lifecycle:
   // LLM returns tool_call → Tavus fires webhook → backend executes → result back to LLM
   // We only filter log_internal_state (causes infinite loops).
@@ -4589,7 +4683,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       __wsContext = wsRenderWorkspace(__cyc.broadcast, __ws);
       const __self = wsAttentionSchema(__ws, __cyc);
       if (__self && __self.text) __wsContext += '\n\n[SELF-MODEL] ' + __self.text + '\n(This is your read of your own attention right now -- it may inform how you speak, but do not narrate this bracket.)';
-      if (!__freeze) { __ws.pendingThought = null; __ws.reflectionsThisQuiet = 0; } // consumed; fresh reflection budget
+      if (!__freeze) { __ws.pendingThought = null; __ws.reflectionsThisQuiet = 0; __ws.proactiveThisQuiet = 0; if (__wsProactive) __ws.proactiveMode = __wsProactive; } // consumed; fresh budgets
       __wsSwitch = !__ablate0.includes('workspace_switch') && !!__wsContext; // broadcast replaces the legacy content-directives
       __wsInfo = {
         ignited: __cyc.ignited, sustained: __cyc.sustained, displaced: __cyc.displaced, fresh: __cyc.fresh,
@@ -10597,12 +10691,25 @@ app.get('/v1/workspace/peek', (req, res) => {
   res.json({
     cid: cid, exists: true, loopActive: ws.loopActive, tick: ws.tick, cycle: ws.cycle, sustain: ws.sustain,
     reflectionCount: ws.reflectionCount || 0, reflecting: !!ws.reflecting,
+    proactiveThisQuiet: ws.proactiveThisQuiet || 0, pendingUtterance: ws.pendingUtterance || null,
     arousal: +(+ws.arousal).toFixed(3), secs_since_turn: Math.round((Date.now() - (ws.lastTurn || 0)) / 1000),
     broadcast: ws.broadcast ? { head: ws.broadcast.head ? ws.broadcast.head.source : null, text: ws.broadcast.head ? ws.broadcast.head.text : null, sources: ws.broadcast.sources, weight: +(+ws.broadcast.weight).toFixed(3) } : null,
     contents: (ws.contents || []).map(function (p) { return { source: p.source, salience: +(+p.salience).toFixed(3) }; }),
     pendingThought: ws.pendingThought,
     buffer: (ws.buffer || []).map(function (b) { return { text: b.text, source: b.source, spontaneous: !!b.spontaneous }; }),
   });
+});
+
+// Proactive-speech delivery (pull): the frontend polls this during a lull and, if a line is queued
+// and the replica is NOT currently speaking, has the Tavus client echo it. Consume-once.
+app.get('/v1/workspace/pending-utterance', (req, res) => {
+  const cid = String(req.query.cid || req.query.conversation_id || '').slice(0, 120);
+  if (!cid) return res.json({ error: 'pass ?cid=' });
+  const ws = __wsByConv.get(cid);
+  if (!ws || !ws.pendingUtterance) return res.json({ cid: cid, utterance: null });
+  const u = ws.pendingUtterance;
+  ws.pendingUtterance = null;
+  res.json({ cid: cid, utterance: u.text, thought: u.thought, already_delivered: !!u.delivered });
 });
 
 const PORT = process.env.PORT || 4001;
