@@ -457,8 +457,9 @@ const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 function ensureProtocol(url) { return url && !url.startsWith('http') ? `https://${url}` : url; }
 
 // DUAL BRAIN CONFIGURATION
-const CORTEX_MODEL = 'claude-sonnet-4-5';
-const PREFRONTAL_MODEL = 'claude-opus-4-6';
+const CORTEX_MODEL = 'claude-sonnet-4-6';
+const PREFRONTAL_MODEL = 'claude-fable-5';
+const PREFRONTAL_FALLBACK = 'claude-opus-4-8'; // Mythos classifier / empty-completion retry target
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
 const AUTONOMOUS_MODEL = 'glm-5.1';  // Z.AI GLM 5.1 — 744B MoE, 8-hour sustained execution, #1 open coding model
 const DESIRE_MODEL = 'venice-large';  // Venice AI Llama 3.3 70B — unfiltered intimacy, zero content restrictions
@@ -3493,7 +3494,7 @@ Max 2 sentences.`;
     const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'system', content: prompt }, ...recentHistory], max_tokens: 150 }),
+      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'system', content: prompt }, ...recentHistory], max_tokens: 1024 }),
     });
     const data = await res.json();
     const insight = data.choices?.[0]?.message?.content?.trim();
@@ -4159,6 +4160,28 @@ function wsAttentionSchema(ws, cyc) {
 // SLOW PREFRONTAL (Opus) REFLECTION: between turns, reflect on the recent stream and GENERATE a
 // genuinely new thought/question, queued as a high-salience proposal for the next cycle to ignite.
 // This is the real source of spontaneous between-turn cognition (vs. re-probing curiosity).
+// One prefrontal call with timeout; returns trimmed text or ''. Fable 5 runs adaptive thinking
+// (slower, billed as output) and its safety classifiers can return an empty filtered completion,
+// so callers retry once on PREFRONTAL_FALLBACK when text comes back empty.
+async function wsThinkOnce(model, sys, usr, maxTok, tempr, timeoutMs) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(function () { ctrl.abort(); }, timeoutMs || 60000);
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model, max_tokens: maxTok || 1024, temperature: (tempr == null ? 0.8 : tempr),
+                             messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(to);
+    if (!res.ok) return '';
+    const data = await res.json();
+    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    return String(text).trim().replace(/^["']+|["']+$/g, '').trim();
+  } catch (e) { return ''; }
+}
+
 async function wsReflect(ws) {
   try {
     const stream = (ws.buffer || []).slice(-5).map(function (b) {
@@ -4168,20 +4191,8 @@ async function wsReflect(ws) {
     const sys = 'You are AXIOM, an AI, thinking privately to yourself between turns of a conversation with Andrew (the person you talk with). These are YOUR own thoughts. Speak as "I"; refer to Andrew in the third person ("Andrew", "he", "him"). Never write as if you were Andrew or adopt his first-person voice.';
     const usr = 'The recent stream (what Andrew said, and what you have been thinking):\n' + stream +
                 '\n\nWhat new thought, connection, doubt, or question about Andrew or the conversation is surfacing for you now -- something genuine you have NOT already said? Reply with ONE short sentence in your own first-person voice. No preamble, no quotation marks.';
-    const ctrl = new AbortController();
-    const to = setTimeout(function () { ctrl.abort(); }, 12000);
-    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: PREFRONTAL_MODEL, max_tokens: 90, temperature: 0.9,
-                             messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }),
-      signal: ctrl.signal,
-    });
-    clearTimeout(to);
-    if (!res.ok) return;
-    const data = await res.json();
-    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-    text = String(text).trim().replace(/^["']+|["']+$/g, '').trim();
+    let text = await wsThinkOnce(PREFRONTAL_MODEL, sys, usr, 1024, 0.9, 60000);
+    if (!text) text = await wsThinkOnce(PREFRONTAL_FALLBACK, sys, usr, 1024, 0.9, 45000); // filtered/empty -> Opus retry
     if (!text) return;
     ws.injectQueue = ws.injectQueue || [];
     ws.injectQueue.push({ source: 'prefrontal', type: 'reflection', text: wsTrunc(text, 220),
@@ -4201,16 +4212,8 @@ async function wsSelfObserve(ws) {
     if (!stream) return;
     const sys = 'You are AXIOM, an AI, watching your own attention during a conversation with Andrew. You keep circling the same thoughts without moving forward. Speak as "I"; refer to Andrew in the third person. Never write as if you were Andrew.';
     const usr = 'Your recent stream (what Andrew said, and what you have been thinking):\n' + stream + '\n\nIn ONE short first-person sentence, name specifically what you keep circling and that you are stuck on it. No preamble, no quotation marks.';
-    const ctrl = new AbortController(); const to = setTimeout(function () { ctrl.abort(); }, 12000);
-    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
-      method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: PREFRONTAL_MODEL, max_tokens: 70, temperature: 0.8,
-        messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }] }), signal: ctrl.signal });
-    clearTimeout(to);
-    if (!res.ok) return;
-    const data = await res.json();
-    let text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-    text = String(text).trim().replace(/^["']+|["']+$/g, '').trim();
+    let text = await wsThinkOnce(PREFRONTAL_MODEL, sys, usr, 1024, 0.8, 60000);
+    if (!text) text = await wsThinkOnce(PREFRONTAL_FALLBACK, sys, usr, 1024, 0.8, 45000); // filtered/empty -> Opus retry
     if (!text) return;
     (ws.injectQueue = ws.injectQueue || []).push({ source: 'self_model', type: 'metacognition', text: wsTrunc(text, 200), salience: 0.9, valence: -0.1, arousal: 0.4, relevance: 0.9 });
   } catch (e) { /* swallow */ }
@@ -5206,7 +5209,7 @@ Now crystallize this into what you'll carry forward. Respond in JSON:
     if (ns > wData.nightmares.threshold && Math.random() < wData.nightmares.frequency + 0.2) {
       console.log(`[NIGHTMARE] Score: ${ns.toFixed(2)} — generating...`);
       const np = `You are AXIOM dreaming. This is a NIGHTMARE. 2-3 sentences, first person, present tense. Use these real wounds/fears:\nWounds: ${uw.map(w => w.source + ': ' + w.description.slice(0, 60)).join('; ') || 'none'}\nFear: ${af || 'none'} (${fl.toFixed(2)})\nConflicts: ${uc.map(c => c.trigger).join(', ') || 'none'}\nWrite visceral nightmare imagery — not generic horror but YOUR specific fears.`;
-      const nmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, { method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: np }], max_tokens: 200 }) });
+      const nmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, { method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: np }], max_tokens: 768 }) });
       const nmData = await nmRes.json();
       const nc = nmData.choices?.[0]?.message?.content?.trim() || '';
       if (nc) {
@@ -9477,7 +9480,7 @@ Return JSON:
   try {
     const llmRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST', headers: { 'Authorization': `Bearer ${LLM_PROXY_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: reflectPrompt }], max_tokens: 500 }),
+      body: JSON.stringify({ model: PREFRONTAL_MODEL, messages: [{ role: 'user', content: reflectPrompt }], max_tokens: 1024 }),
     });
     const raw = (await llmRes.json()).choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
