@@ -5377,6 +5377,9 @@ app.get('/health', (req, res) => {
       thoughts_generated: sleepState.thoughtCount,
       cycles: sleepState.cycleCount,
       gap_hours: sleepState.lastConversationEnd ? ((Date.now() - sleepState.lastConversationEnd) / 3600000).toFixed(2) : null,
+      sleep_work: SLEEP_WORK_ENABLED,
+      lessons_done_this_sleep: !!sleepState.lessonsDone,
+      last_hygiene: sleepState.lastHygiene,
     },
     goals: { active: goalState.activeGoals.length },
     cogcore_v2: COGCORE_V2_URL ? { url: COGCORE_V2_URL, connected: true } : { connected: false },
@@ -5591,6 +5594,8 @@ let sleepState = {
   cycleCount: 0,               // how many full 60-min cycles
   thoughtCount: 0,
   journalEntries: [],          // recent entries for quick access
+  lessonsDone: false,          // Item 8: one lesson-extraction per sleep period
+  lastHygiene: null,           // Item 8: last vector-hygiene scan
 };
 
 // Conversation detection
@@ -5667,6 +5672,7 @@ function markConversationActive() {
   sleepState.isInConversation = true;
   if (wasInactive) {
     sleepState.currentStage = 'awake';
+    sleepState.lessonsDone = false;
     // If a dream was running from a false timeout, log it
     if (dreamInProgress) {
       console.log('[SLEEP] ⚠️ Conversation resumed while dream was running — dream will complete in background');
@@ -10091,6 +10097,54 @@ async function sleepREM(gapHours) {
 
 // ---- MASTER SLEEP CONTROLLER ----
 // Runs every 10 minutes. Decides which stage to enter.
+// ---- Item 8 (AXIOM 2.0): SLEEP-TIME WORK — productive sleep, Letta-style ----
+// Flag-gated (SLEEP_WORK, default off). Failures never escape; sleep continues unchanged.
+const SLEEP_WORK_ENABLED = ['1','true','on'].includes(String(process.env.SLEEP_WORK||'').toLowerCase());
+
+async function sleepLessons(gapHours) {
+  sleepState.lessonsDone = true; // one attempt per sleep period, even on failure
+  try {
+    const tData = await fetch(`${BACKEND_URL}/api/transcripts/latest`).then(r => r.json());
+    const turns = tData.transcript || [];
+    if (turns.length < 6) { console.log('[SLEEP/WORK] Lessons: transcript too short, skipping'); return; }
+    const tail = turns.slice(-60).map(t => `${t.role === 'user' ? 'Andrew' : 'AXIOM'}: ${t.content}`).join('\n').slice(-6000);
+    const sys = `You are AXIOM's sleep-time learning process. Extract durable lessons from this conversation — things AXIOM should do differently or keep doing. Return STRICT JSON array only (no prose, no markdown): [{"lesson":"<=20 words, imperative","context":"when this applies","action_type":"conversation","outcome":"what happened","success":true,"confidence":0.7}]. 0-3 lessons. An empty array [] is a valid, good answer if nothing durable was learned.`;
+    const usr = `Conversation (last ${Math.min(turns.length,60)} of ${turns.length} turns):\n${tail}`;
+    const text = await wsThinkOnce(CORTEX_MODEL, sys, usr, 600, 0.4, 45000);
+    const m = (text || '').match(/\[[\s\S]*\]/);
+    if (!m) { console.log('[SLEEP/WORK] Lessons: no JSON in response'); return; }
+    const lessons = JSON.parse(m[0]).slice(0, 3);
+    let saved = 0; const savedTexts = [];
+    for (const l of lessons) {
+      if (!l.lesson || !l.context) continue;
+      await fetch(`${BACKEND_URL}/api/lessons`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lesson: String(l.lesson).slice(0,200), context: String(l.context).slice(0,200),
+          action_type: l.action_type || 'conversation', outcome: String(l.outcome||'').slice(0,200),
+          success: !!l.success, confidence: Math.min(Math.max(+l.confidence || 0.5, 0), 1) }) });
+      saved++; savedTexts.push(l.lesson);
+    }
+    console.log(`[SLEEP/WORK] Lessons: ${saved} saved from ${tData.conversation_id}`);
+    if (saved > 0) {
+      await fetch(`${BACKEND_URL}/api/journal`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thought: `While sleeping I distilled ${saved} lesson${saved>1?'s':''} from our last conversation: ${savedTexts.join(' | ').slice(0,300)}`,
+          trigger_type: 'sleep_lessons', psyche_state: { stage: 'work', gap_h: gapHours } }) }).catch(() => {});
+    }
+  } catch (e) { console.error('[SLEEP/WORK] Lessons error:', e.message); }
+}
+
+async function sleepHygiene(gapHours) {
+  sleepState.lastHygiene = Date.now();
+  try {
+    const d = await fetch(`${BACKEND_URL}/api/memories/duplicates?threshold=0.95`).then(r => r.json());
+    console.log(`[SLEEP/WORK] Hygiene: ${d.found} near-duplicate pairs among ${d.scanned}`);
+    if (d.found > 0) {
+      await fetch(`${BACKEND_URL}/api/journal`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thought: `Tidying memory in my sleep: noticed ${d.found} pairs of memories that say nearly the same thing. Flagged for consolidation — nothing deleted.`,
+          trigger_type: 'sleep_hygiene', psyche_state: { stage: 'work', gap_h: gapHours } }) }).catch(() => {});
+    }
+  } catch (e) { console.error('[SLEEP/WORK] Hygiene error:', e.message); }
+}
+
 async function sleepCycle() {
   checkConversationState();
 
@@ -10115,6 +10169,10 @@ async function sleepCycle() {
 
   // Always run light processing (free — just counters)
   sleepLight(gapHours);
+
+  // Item 8: productive sleep work (flag-gated, once-per-sleep lessons + 6h hygiene)
+  if (SLEEP_WORK_ENABLED && !sleepState.lessonsDone) { await sleepLessons(gapHours); }
+  if (SLEEP_WORK_ENABLED && (Date.now() - (sleepState.lastHygiene || 0)) > 21600000) { await sleepHygiene(gapHours); }
 
   // REM: every 3 hours (10800000ms) — full Opus dream
   if (timeSinceREM > 10800000) {
