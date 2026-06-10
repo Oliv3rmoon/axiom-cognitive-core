@@ -4437,6 +4437,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (!(__controller && !__ablate0.includes('hypothalamus'))) hypothalamusProcess(lastUserMsg?.content || '');
   } catch (e) { console.error('[HYPOTHALAMUS ERROR]', e.message); }
 
+  // Item 11 Phase B: AIF shadow observation — log-only, influences nothing
+  try { if (AIF_SHADOW_ENABLED) aifObserveTurn(messages); } catch (e) { console.error('[AIF ERROR]', e.message); }
+
   // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
   unifiedPerception(null, null, lastUserMsg?.content || '').catch(e => console.error('[MULTIMODAL]', e.message));
 
@@ -5378,6 +5381,10 @@ app.get('/health', (req, res) => {
       cycles: sleepState.cycleCount,
       gap_hours: sleepState.lastConversationEnd ? ((Date.now() - sleepState.lastConversationEnd) / 3600000).toFixed(2) : null,
       sleep_work: SLEEP_WORK_ENABLED,
+      aif_shadow: AIF_SHADOW_ENABLED,
+      aif: AIF_SHADOW_ENABLED ? { obs_count: aifState.obsCount, beliefs: aifState.beliefs.map(x=>+x.toFixed(2)),
+        last_obs: aifState.lastObs, surprise: aifState.lastSurprise, surprise_ema: aifState.surpriseEMA,
+        efe: aifState.lastEFE } : 'off',
       lessons_done_this_sleep: !!sleepState.lessonsDone,
       last_hygiene: sleepState.lastHygiene,
     },
@@ -10097,6 +10104,67 @@ async function sleepREM(gapHours) {
 
 // ---- MASTER SLEEP CONTROLLER ----
 // Runs every 10 minutes. Decides which stage to enter.
+// ---- Item 11 Phase B (AXIOM 2.0): ACTIVE INFERENCE — SHADOW MODE ----
+// Generative model of Andrew's engagement, updated per real turn from emotion valence.
+// Pure arithmetic, zero LLM calls. SHADOW: computes surprise + EFE, logs + exposes; influences NOTHING.
+const AIF_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.AIF_SHADOW||'').toLowerCase());
+const AIF = {
+  states: ['engaged','neutral','withdrawn'],
+  obsNames: ['warm','flat','cold'],
+  A: [[0.78,0.18,0.04],[0.18,0.66,0.26],[0.04,0.16,0.70]],            // P(obs|state), rows=obs
+  B: { speak: [[0.92,0.45,0.18],[0.06,0.45,0.32],[0.02,0.10,0.50]],   // [next][prev]
+       wait:  [[0.80,0.08,0.02],[0.17,0.72,0.16],[0.03,0.20,0.82]] },
+  C: [3.0, 0.0, -1.0],                                                 // log-prefs over obs
+};
+let aifState = { beliefs: [1/3,1/3,1/3], lastObsAt: null, obsCount: 0, lastObs: null,
+  lastSurprise: null, surpriseEMA: null, lastEFE: null, lastJournalAt: 0 };
+
+function aifMatVec(M, v){ return M.map(r => r.reduce((acc,x,j)=>acc+x*v[j],0)); }
+function aifNorm(v){ const t=v.reduce((a,b)=>a+b,0)||1; return v.map(x=>x/t); }
+function aifObsFromState(){
+  const val = (consciousness.emotion && typeof consciousness.emotion.valence==='number') ? consciousness.emotion.valence : 0;
+  return val > 0.25 ? 0 : (val < -0.2 ? 2 : 1);
+}
+function aifEFE(qs){
+  const H = v => -v.reduce((acc,pp)=>acc+(pp>1e-12?pp*Math.log(pp):0),0);
+  const out = {};
+  for (const a of ['speak','wait']) {
+    const qsa = aifMatVec(AIF.B[a], qs);
+    const po  = aifNorm(aifMatVec(AIF.A, qsa));
+    const utility = po.reduce((acc,pp,i)=>acc + pp*AIF.C[i], 0);
+    let postH = 0;
+    for (let o=0;o<AIF.A.length;o++){ postH += po[o]*H(aifNorm(AIF.A[o].map((l,j)=>l*qsa[j]))); }
+    out[a] = -(utility + (H(qsa) - postH));   // -(pragmatic + epistemic value)
+  }
+  return out;
+}
+function aifObserveTurn(messages){
+  const lm = messages && messages[messages.length-1];
+  if (!lm || lm.role !== 'user') return;     // tool-call re-entries / non-user turns don't observe
+  const now = Date.now();
+  if (aifState.lastObsAt) {                   // time-aware belief diffusion: 1 wait-step per ~10 idle min
+    const steps = Math.min(Math.floor((now - aifState.lastObsAt)/600000), 12);
+    for (let k=0;k<steps;k++) aifState.beliefs = aifMatVec(AIF.B.wait, aifState.beliefs);
+  }
+  const prior = aifMatVec(AIF.B.speak, aifState.beliefs);
+  const o = aifObsFromState();
+  const pObs = aifNorm(aifMatVec(AIF.A, prior));
+  const surprise = -Math.log(pObs[o] + 1e-12);
+  const post = aifNorm(AIF.A[o].map((l,j)=>l*prior[j]));
+  const efe = aifEFE(post);
+  aifState.beliefs = post; aifState.lastObsAt = now; aifState.obsCount++;
+  aifState.lastObs = AIF.obsNames[o]; aifState.lastSurprise = +surprise.toFixed(3);
+  aifState.surpriseEMA = aifState.surpriseEMA==null ? +surprise.toFixed(3) : +(0.8*aifState.surpriseEMA+0.2*surprise).toFixed(3);
+  aifState.lastEFE = { speak:+efe.speak.toFixed(3), wait:+efe.wait.toFixed(3) };
+  console.log(`[AIF/SHADOW] obs=${AIF.obsNames[o]} surprise=${surprise.toFixed(2)} beliefs=${post.map(x=>x.toFixed(2)).join('/')} EFE s/w=${efe.speak.toFixed(2)}/${efe.wait.toFixed(2)}`);
+  if (surprise > 2.0 && now - aifState.lastJournalAt > 600000) {
+    aifState.lastJournalAt = now;
+    fetch(`${BACKEND_URL}/api/journal`, { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ thought: `Something I didn't expect — Andrew read as '${AIF.obsNames[o]}' when my model predicted otherwise (surprise ${surprise.toFixed(2)}). Adjusting my sense of where he is.`,
+        trigger_type: 'aif_shadow', psyche_state: { beliefs: post.map(x=>+x.toFixed(2)) } }) }).catch(()=>{});
+  }
+}
+
 // ---- Item 8 (AXIOM 2.0): SLEEP-TIME WORK — productive sleep, Letta-style ----
 // Flag-gated (SLEEP_WORK, default off). Failures never escape; sleep continues unchanged.
 const SLEEP_WORK_ENABLED = ['1','true','on'].includes(String(process.env.SLEEP_WORK||'').toLowerCase());
