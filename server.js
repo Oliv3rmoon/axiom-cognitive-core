@@ -10107,6 +10107,62 @@ async function sleepREM(gapHours) {
 
 // ---- MASTER SLEEP CONTROLLER ----
 // Runs every 10 minutes. Decides which stage to enter.
+// ---- Item 13 (AXIOM 2.0): GRADED REASONING ESCALATOR ----
+// Test-time compute that scales with difficulty. Triggered (by EFE/surprise or markers), never default.
+// INVARIANT: extended thinking requires max_tokens > budget_tokens (Bedrock 500s otherwise; that error
+// masquerades as the Fable entitlement error — do not be fooled).
+const REASON_ENABLED = ['1','true','on'].includes(String(process.env.DEEP_REASON||'').toLowerCase());
+
+async function wsThinkDeep(model, sys, usr, maxTok, budgetTok, timeoutMs) {
+  try {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), timeoutMs || 120000);
+    const mx = Math.max(maxTok || 1200, (budgetTok || 1024) + 512);
+    const body = { model, max_tokens: mx, messages: [{ role:'system', content: sys }, { role:'user', content: usr }] };
+    if (budgetTok) { body.thinking = { type:'enabled', budget_tokens: budgetTok }; body.temperature = 1.0; }
+    const res = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
+      method:'POST', headers:{ 'Authorization':`Bearer ${LLM_PROXY_KEY}`, 'Content-Type':'application/json' },
+      body: JSON.stringify(body), signal: ctrl.signal });
+    clearTimeout(to);
+    if (!res.ok) { console.error(`[REASON] deep call HTTP ${res.status}`); return ''; }
+    const d = await res.json();
+    return String(d?.choices?.[0]?.message?.content || '').trim();
+  } catch (e) { console.error('[REASON] deep err:', e.message); return ''; }
+}
+
+function reasoningTier(text, efeGap, surprise) {
+  const t = String(text || '').trim(), wc = t.split(/\s+/).filter(Boolean).length;
+  if ((efeGap != null && efeGap > 1.5) || (surprise != null && surprise > 2.2)) return { tier:3, why:`live-signal efe=${efeGap} surprise=${surprise}` };
+  if (wc <= 3 && !t.endsWith('?')) return { tier:0, why:'reflex' };
+  const hard = /\b(prove|derive|design|trade-?off|why does|contradi|reconcile|optimal|should i|which is better|architect|debate|analy[sz]e whether)\b/i.test(t);
+  const multi = (t.match(/\?/g)||[]).length >= 2 || (/ and /i.test(t) && wc > 25);
+  if (hard && (multi || wc > 12)) return { tier:3, why:`hard+scope wc=${wc}` };
+  if (hard || multi || wc > 40) return { tier:2, why:`moderate wc=${wc}` };
+  return { tier:1, why:`routine wc=${wc}` };
+}
+
+async function deepReason(question, opts) {
+  opts = opts || {};
+  const t0 = Date.now();
+  const g = (opts.forceTier != null) ? { tier: opts.forceTier, why: 'forced' } : reasoningTier(question, opts.efeGap, opts.surprise);
+  const sys = opts.sys || 'You are AXIOM, an AI reasoning carefully. Be rigorous and concise.';
+  let text = '';
+  if (g.tier <= 1) {
+    text = await wsThinkOnce(CORTEX_MODEL, sys, question, 700, 0.7, 45000);
+  } else if (g.tier === 2) {
+    const draft = await wsThinkOnce(CORTEX_MODEL, sys, question, 600, 0.7, 45000);
+    text = await wsThinkDeep(PREFRONTAL_MODEL, sys,
+      `Question: ${question}\n\nDraft answer:\n${draft}\n\nCritique this draft for errors and gaps, then produce the corrected, complete final answer.`,
+      1400, 1024, 90000) || draft;
+  } else {
+    const pos = await wsThinkDeep(PREFRONTAL_MODEL, sys, `${question}\n\nArgue the STRONGEST position rigorously but concisely.`, 1100, 1024, 90000);
+    const neg = await wsThinkDeep(PREFRONTAL_MODEL, sys, `${question}\n\nA colleague argued:\n${pos}\n\nArgue the OPPOSING or strongest alternative view, as rigorously.`, 1100, 1024, 90000);
+    text = await wsThinkDeep(PREFRONTAL_MODEL, sys, `Question: ${question}\n\nPosition A:\n${pos}\n\nPosition B:\n${neg}\n\nAdjudicate: weigh both honestly, then give your best-judgment final answer.`, 1600, 1536, 110000);
+    if (!text) text = pos;
+  }
+  return { tier: g.tier, why: g.why, text, ms: Date.now() - t0 };
+}
+
 // Item 13: deep-reasoning invocation route (opt-in; flag-gated; not in main turn path)
 app.post('/reason', async (req, res) => {
   if (!REASON_ENABLED) return res.status(403).json({ error: 'deep reasoning disabled (set DEEP_REASON=1)' });
