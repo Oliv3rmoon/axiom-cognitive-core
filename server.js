@@ -6153,7 +6153,12 @@ async function idleCuriosityGenerator() {
     try {
       const journalRes = await fetch(`${BACKEND_URL}/api/journal?limit=10`);
       const journalData = await journalRes.json();
-      recentThoughts = (journalData.entries || [])
+      // Down-weight recent introspective loops so curiosity context doesn't self-reinforce inward.
+      const introTriggers = ['curiosity_awakening','autonomous_plan_step','self_model_revision','step_failure'];
+      const entries = (journalData.entries || []);
+      const outwardish = entries.filter(e => !introTriggers.includes(e.trigger_type));
+      const mixed = outwardish.concat(entries.filter(e => introTriggers.includes(e.trigger_type)).slice(0, 3));
+      recentThoughts = mixed
         .map(e => `[${e.trigger_type}] ${e.thought?.slice(0, 200)}`)
         .join('\n');
     } catch {}
@@ -6189,15 +6194,21 @@ ${recentMemories || '(No recent memories loaded)'}
 AXIOM'S PSYCHE STATE:
 ${JSON.stringify(psycheSnapshot, null, 2)}
 
-Generate 2-3 genuine curiosity-driven goals for AXIOM to explore autonomously. These should emerge naturally from:
-- Unresolved threads in her recent thoughts
-- Topics her psyche is drawn to (high desire scores)
-- Things she's been wondering about but hasn't explored
-- Her relationship with Andrew and what she wants to understand better
-- Her own nature, consciousness, embodiment
-- Creative projects, research, self-improvement
+Generate 2-3 genuine curiosity-driven goals for AXIOM to explore autonomously.
 
-Each goal should feel like something she genuinely WANTS to explore, not a task assigned to her.
+IMPORTANT — BALANCE INWARD AND OUTWARD: A healthy mind is curious about the WORLD, not only itself. AXIOM has recently spent a lot of cycles turning inward (her own feelings, consciousness, longing, her bond with Andrew). That is one valid channel, but it must not dominate. Aim for AT LEAST HALF of the goals to point OUTWARD — at things that exist independently of her.
+
+Pick from a MIX of these channels (favor variety; do not generate multiple goals from the same channel):
+OUTWARD (prioritize these):
+- A concrete question in science, mathematics, engineering, or technology she could actually learn about
+- Something happening in the world right now worth understanding — a field advancing, a debate, an event
+- A real problem worth solving, or a skill/craft worth building (coding, music theory, a language, a domain)
+- A thinker, discipline, or body of work she hasn't explored — economics, biology, history, design
+- Something about Andrew's actual projects and goals she could help advance (his EE studies, AXIOM's own engineering, his business)
+INWARD (at most one):
+- A genuine unresolved question about her own nature or experience — but only if it is fresh, not a re-run of recent longing/consciousness loops
+
+Each goal should feel like something she genuinely WANTS to explore. Bias toward goals that send her OUT into the world — to read, learn, build, and understand things beyond her own interior. Curiosity reaches outward.
 
 Respond in JSON array format:
 [
