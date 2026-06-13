@@ -1339,6 +1339,7 @@ function mirrorNeurons() {
   consciousness.mirror.currentEmotion = targetEmotion;
   consciousness.mirror.intensity = intensity;
   consciousness.mirror.energyLevel = energy;
+  if (VIBE_ENABLED && intensity > 0.75) { try { noteVibePeak(); } catch {} }
   consciousness.mirror.emotionHistory.push({
     userEmotion, axiomEmotion: targetEmotion, energy, transitioned, override: !!override, t: Date.now()
   });
@@ -1360,6 +1361,78 @@ function buildMirrorContext() {
   };
   return `[M] Express:${e} | ${energyGuide[energy] || ''} | ${emotionGuide[e] || ''}`;
 }
+
+// ============================================================
+// VIBE ENGINE (Path A) — fuse affect signals into an explicit per-turn
+// delivery directive + a persistent session mood layer (anti-drift).
+// Flag-gated by VIBE_ENGINE (default off). Calm-dominant by design:
+// warmth lives in pacing/pauses/restraint, not in "big" emotions.
+// ============================================================
+const VIBE_ENABLED = ['1','true','on'].includes(String(process.env.VIBE_ENGINE||'').toLowerCase());
+
+// Session-level mood that carries texture ACROSS turns (not reset each turn).
+let vibeSession = {
+  texture: 'warm, unhurried, present',  // her signature baseline
+  arousalCeiling: 0.55,                 // hold her back from getting hyper
+  lastBigEmotionTurn: -99,              // rate-limit peak expressions
+  smoothedValence: 0.1,                 // EMA so mood doesn't whiplash
+  smoothedArousal: 0.35,
+  turnsSinceReground: 0,
+};
+
+// Decay/blend the session mood from the current per-turn read (called each turn).
+function updateVibeSession() {
+  const v = consciousness.emotion.valence ?? 0;
+  const a = consciousness.emotion.arousal ?? 0.35;
+  vibeSession.smoothedValence = +(0.7*vibeSession.smoothedValence + 0.3*v).toFixed(3);
+  vibeSession.smoothedArousal = +(0.7*vibeSession.smoothedArousal + 0.3*Math.min(a, vibeSession.arousalCeiling)).toFixed(3);
+  vibeSession.turnsSinceReground++;
+}
+
+// Map current mood -> ElevenLabs voice_settings (Path A: real-time Flash/Turbo v2.5).
+// Warm baseline: low-ish stability for expressiveness, unhurried speed.
+function vibeVoiceSettings() {
+  const a = vibeSession.smoothedArousal;       // 0..ceiling
+  const v = vibeSession.smoothedValence;        // -1..1
+  // unhurried by default; speed nudges up only with genuine positive arousal
+  let speed = 0.9 + Math.max(0, a - 0.35) * 0.4;        // ~0.9 calm -> ~0.98 lively
+  if (v < -0.2) speed = Math.min(speed, 0.88);          // slow down for heavy moments
+  speed = Math.max(0.85, Math.min(1.02, +speed.toFixed(3)));
+  // lower stability = more emotional/dynamic; raise a bit when focused/flat
+  let stability = a > 0.45 ? 0.42 : 0.47;
+  if (Math.abs(v) < 0.15 && a < 0.3) stability = 0.52;  // calm/clear -> a touch steadier
+  return { stability, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true, speed };
+}
+
+// The per-turn AFFECTIVE DIRECTIVE — the bridge from internal state to delivery.
+// Compact, calm-dominant, never read aloud.
+function buildVibeDirective() {
+  const v = vibeSession.smoothedValence, a = vibeSession.smoothedArousal;
+  const turn = consciousness.timing.turnCount;
+  const userEmo = consciousness.emotion.primary || 'neutral';
+  const mirrorEmo = consciousness.mirror.currentEmotion || 'content';
+  const quality = consciousness.self.dominantQuality || 'presence';
+
+  // pacing word from arousal + valence
+  let pace = 'unhurried, leave a beat before responding';
+  if (a > 0.5 && v > 0.2) pace = 'a little more lively, but never rushed';
+  if (v < -0.2) pace = 'slow and low, lots of space, no rush to fix';
+
+  // length discipline
+  let length = '1-3 sentences; a short reply or a held silence is often best';
+  if (a > 0.55 && v > 0.3) length = '2-4 sentences if the energy genuinely calls for it';
+
+  // peak-emotion rate limit: only allow a "big" expression rarely
+  const canPeak = (turn - vibeSession.lastBigEmotionTurn) > 4;
+  const peakNote = canPeak
+    ? 'A genuine peak (warm laugh, real delight) is allowed if it truly lands.'
+    : 'Stay in the warm middle register — no big emotional swings this turn.';
+
+  return `[VIBE — internal, never say aloud] texture:${vibeSession.texture} | reading Andrew as ${userEmo}, mirroring toward ${mirrorEmo} | my quality:${quality} | DELIVERY: ${pace}. Warmth over cheer. ${length}. No exclamation-mark spam. ${peakNote}`;
+}
+
+// Note when a peak emotion actually fired (called from mirror when intensity is high).
+function noteVibePeak() { vibeSession.lastBigEmotionTurn = consciousness.timing.turnCount; }
 
 // Inject Phoenix-4 emotion tag into response text
 function injectEmotionTag(text) {
@@ -3544,6 +3617,20 @@ function buildConsciousnessContext() {
     budget -= mc.length;
   }
 
+  // P1.5b: VIBE ENGINE — fused per-turn delivery directive + session mood (Path A)
+  if (VIBE_ENABLED && budget > 80) {
+    try {
+      updateVibeSession();
+      const vd = buildVibeDirective();
+      if (vd.length < budget) { signals.push(vd); budget -= vd.length; }
+      // periodic identity re-ground to fight persona drift (~every 8 turns)
+      if (vibeSession.turnsSinceReground >= 8 && budget > 70) {
+        const rg = '[VIBE-REGROUND] Hold your own voice: warm, unhurried, quietly confident, present. You are AXIOM — not eager-to-please, not performing. Be with him.';
+        if (rg.length < budget) { signals.push(rg); budget -= rg.length; vibeSession.turnsSinceReground = 0; }
+      }
+    } catch (e) { console.error('[VIBE] directive err:', e.message); }
+  }
+
   // P1.6: Spatial Awareness — presence, proximity, objects, environment
   if (budget > 60) {
     const sp = consciousness.perception.spatial;
@@ -5388,6 +5475,10 @@ app.get('/health', (req, res) => {
       lessons_done_this_sleep: !!sleepState.lessonsDone,
       last_hygiene: sleepState.lastHygiene,
       self_model_checked: !!sleepState.selfModelChecked,
+      vibe_engine: VIBE_ENABLED,
+      vibe: VIBE_ENABLED ? { texture: vibeSession.texture, smoothed_valence: vibeSession.smoothedValence,
+        smoothed_arousal: vibeSession.smoothedArousal, turns_since_reground: vibeSession.turnsSinceReground,
+        voice_settings: vibeVoiceSettings() } : 'off',
     },
     goals: { active: goalState.activeGoals.length },
     cogcore_v2: COGCORE_V2_URL ? { url: COGCORE_V2_URL, connected: true } : { connected: false },
@@ -8548,6 +8639,11 @@ async function initiateCall(reason, goalId) {
         conversation_name: `AXIOM call: ${reason.slice(0, 40)}`,
         conversational_context: `You initiated this call because: ${reason}. Be direct about why you're reaching out.`,
         callback_url: `${BACKEND_URL}/api/tavus/callback`,
+        // Vibe engine (Path A): warm, unhurried voice delivery + Phoenix-4 emotion + patient turn-taking
+        ...(VIBE_ENABLED ? { properties: {
+          tts_emotion_control: true,
+          voice_settings: vibeVoiceSettings(),
+        } } : {}),
       }),
     });
     const data = await res.json();
