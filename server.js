@@ -10107,6 +10107,18 @@ async function sleepREM(gapHours) {
 
 // ---- MASTER SLEEP CONTROLLER ----
 // Runs every 10 minutes. Decides which stage to enter.
+// Item 13: deep-reasoning invocation route (opt-in; flag-gated; not in main turn path)
+app.post('/reason', async (req, res) => {
+  if (!REASON_ENABLED) return res.status(403).json({ error: 'deep reasoning disabled (set DEEP_REASON=1)' });
+  try {
+    const { question, force_tier, sys } = req.body || {};
+    if (!question) return res.status(400).json({ error: 'question required' });
+    const efeGap = aifState.lastEFE ? Math.abs(aifState.lastEFE.speak - aifState.lastEFE.wait) : null;
+    const out = await deepReason(question, { efeGap, surprise: aifState.lastSurprise, forceTier: force_tier, sys });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ---- Item 11 Phase B (AXIOM 2.0): ACTIVE INFERENCE — SHADOW MODE ----
 // Generative model of Andrew's engagement, updated per real turn from emotion valence.
 // Pure arithmetic, zero LLM calls. SHADOW: computes surprise + EFE, logs + exposes; influences NOTHING.
