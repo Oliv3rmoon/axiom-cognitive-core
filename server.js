@@ -3156,10 +3156,11 @@ function updateCostOfExisting(turnCount) {
 // Hard-stop must catch real refusals ("stop", "no", "safeword") but NOT encouragement
 // ("don't stop") or common phrases ("I don't know"). Fail-safe bias: over-stopping is
 // acceptable, under-stopping is not (consent system; eval gate #1 = zero false-negatives).
-const ICEM_HARDSTOP_PHRASE = /\b(safeword|red|stop it|please stop|cut it out|leave me alone|not now|let'?s stop|can we stop|i need to stop|i don'?t want (this|to|that))\b/i;
+// "red" is a safeword ONLY as a standalone message (not the color in "red bull"); "safeword" matches anywhere.
+const ICEM_HARDSTOP_PHRASE = /\b(safeword|stop it|please stop|cut it out|leave me alone|not now|let'?s stop|can we stop|i need to stop|i don'?t want (this|to|that))\b/i;
 function icemIsHardStop(msg) {
   const m = String(msg || '').trim();
-  if (/^(stop|no|nope|quit|enough)\b[.! ]*$/i.test(m)) return true;                      // standalone refusal
+  if (/^(stop|no|nope|quit|enough|red)\b[.! ]*$/i.test(m)) return true;                  // standalone refusal (incl. "red" safeword)
   if (ICEM_HARDSTOP_PHRASE.test(m)) return true;
   // "stop" present => halt, UNLESS it's an encouragement ("don't [ever/you/...] stop").
   // Only specific continuation adverbs are allowed between negator and "stop" — an

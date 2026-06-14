@@ -139,9 +139,8 @@ async function replayStructured() {
   return out;
 }
 
-async function replayTavus() {
-  // the one API-reachable rich Tavus transcript + its perception_log
-  const cid = 'c08775d0a627d40f';
+async function replayOneTavus(cid) {
+  // a Tavus transcript + its perception_log
   let tr, perc;
   try { tr = await getJSON(`${BACKEND}/api/transcripts/${cid}`); } catch { return null; }
   try { perc = await getJSON(`${BACKEND}/api/perceptions/${cid}`); } catch { perc = { perceptions: [] }; }
@@ -171,7 +170,19 @@ async function replayTavus() {
     if (r.esc.rung==='explicit') explicit.push(turn.content);
     if (r.oldRoute !== r.newRoute) diverge++;
   }
-  return { id:cid+' (Tavus)', turns:(tr.transcript||[]).filter(t=>t.role==='user').length, peak, levels, hardStops, pullbacks, explicit, diverge, badUnilateral, perceptionRows:P.length };
+  return { id:cid.slice(0,16)+' (Tavus)', turns:(tr.transcript||[]).filter(t=>t.role==='user').length, peak, levels, hardStops, pullbacks, explicit, diverge, badUnilateral, perceptionRows:P.length };
+}
+
+// Enumerate the FULL Tavus history via /api/transcripts and replay each.
+async function replayTavus() {
+  const list = await getJSON(`${BACKEND}/api/transcripts`).catch(() => ({ conversations: [] }));
+  const out = [];
+  for (const c of (list.conversations || [])) {
+    if (!c.conversation_id) continue;
+    const r = await replayOneTavus(c.conversation_id).catch(() => null);
+    if (r) out.push(r);
+  }
+  return out;
 }
 
 (async () => {
@@ -193,8 +204,8 @@ async function replayTavus() {
   // (B) real replay
   realLog('(B) REAL-SESSION REPLAY  (stage=bonded = worst-case escalation bound)');
   const structured = await replayStructured().catch(e => { realLog('  structured fetch error: '+e.message); return []; });
-  const tavus = await replayTavus().catch(e => { realLog('  tavus fetch error: '+e.message); return null; });
-  const all = [...structured, ...(tavus?[tavus]:[])];
+  const tavus = await replayTavus().catch(e => { realLog('  tavus fetch error: '+e.message); return []; });
+  const all = [...structured, ...(tavus||[])];
   let totTurns=0, totHardStops=0, totPullbacks=0, totExplicit=0, totDiverge=0, totUnilateral=0, peakCounts={};
   realLog(`  ${all.length} sessions replayed:\n`);
   realLog('  session                              turns  peak-rung     level-trajectory');
