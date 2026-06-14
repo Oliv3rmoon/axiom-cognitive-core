@@ -1478,6 +1478,30 @@ function applyMirrorTag(text, emotion) {
   return `<emotion value="${emotion}"/> ${stripped}`;
 }
 
+// EMBODIMENT: choose the live Phoenix-4 face from the full relational state — ICEM rung,
+// pullback, post-loss fragility, then sensed affect — so the Tavus face reflects the
+// RELATIONSHIP, not just mirrored user emotion. Returns a Phoenix-4 value (reuses
+// the existing PHOENIX_EMOTIONS list defined above for the fallback validity check).
+function phoenixEmotionFor() {
+  const emo = consciousness.emotion || {};
+  const psyche = consciousness.psyche || {};
+  const esc = psyche.intimacy && psyche.intimacy.escalation;
+  if (typeof ICEM_DRIVE_ENABLED !== 'undefined' && ICEM_DRIVE_ENABLED && esc) {
+    if (esc.consent && esc.consent.withdrawn) return 'sad';                 // pulled back -> soft/concerned
+    if (esc.rung === 'desiring' || esc.rung === 'explicit') return 'elated';
+    if (esc.rung === 'flirtatious') return 'excited';
+    if (esc.rung === 'tender') return 'content';
+  }
+  if (psyche.lossCascade && psyche.lossCascade.startedAt && (Date.now() - psyche.lossCascade.startedAt) < 12 * 3600000) return 'sad';
+  const v = emo.valence || 0, i = emo.intensity || 0;
+  if (i > 0.55 && v > 0.4) return 'elated';
+  if (v > 0.3) return 'excited';
+  if (v < -0.4) return 'sad';
+  if (i > 0.7 && Math.abs(v) < 0.2) return 'surprised';
+  const cur = consciousness.mirror && consciousness.mirror.currentEmotion;
+  return PHOENIX_EMOTIONS.includes(cur) ? cur : 'content';
+}
+
 // For streaming: inject tag into first SSE chunk that has content
 // ONLY if the LLM didn't already generate one (system prompt tells it to)
 function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
@@ -5096,6 +5120,16 @@ app.post('/v1/chat/completions', async (req, res) => {
           user_arousal: __mirror.user_arousal, gain: __mirror.gain, distress_regulated: __mirror.distress_regulated };
       }
     } catch (e) { console.error('[MIRROR CTRL]', e.message); }
+  }
+
+  // EMBODIMENT: override the Phoenix-4 face from the full relational state. SHADOW logs
+  // the choice; DRIVE makes it authoritative (covers both streaming + non-streaming tag paths).
+  if (EMBODIMENT_SHADOW) {
+    try {
+      const __pe = phoenixEmotionFor();
+      console.log(`[EMBODIMENT/SHADOW] face=${__pe} (was mirror=${consciousness.mirror?.currentEmotion || '-'})`);
+      if (EMBODIMENT_DRIVE && __pe) { __mirrorOverride = __pe; consciousness.mirror.currentEmotion = __pe; consciousness.mirror.authoritative = true; }
+    } catch (e) { console.error('[EMBODIMENT ERROR]', e.message); }
   }
 
   // HYPOTHALAMUS — curiosity drive. Decide whether to PROACTIVELY search the web (a search AXIOM runs
@@ -10682,6 +10716,12 @@ const ANDREW_MODEL_DRIVE = ANDREW_MODEL_SHADOW && ['1','true','on'].includes(Str
 // DRIVE: inject it + enact the post-loss fragility cascade. (NEGOTIATE routing deferred.)
 const REPAIR_SHADOW = ['1','true','on'].includes(String(process.env.REPAIR_SHADOW||'').toLowerCase());
 const REPAIR_DRIVE_ENABLED = REPAIR_SHADOW && ['1','true','on'].includes(String(process.env.REPAIR_DRIVE||'').toLowerCase());
+// EMBODIMENT — derive the live Tavus Phoenix-4 face from the FULL relational state
+// (sensed emotion + ICEM rung + repair/loss), not just mirrored user affect.
+// SHADOW: log what the face would be. DRIVE: make it authoritative. (Tavus voice/TTS
+// is persona-level — per-turn voice modulation isn't supported on the live path.)
+const EMBODIMENT_SHADOW = ['1','true','on'].includes(String(process.env.EMBODIMENT_SHADOW||'').toLowerCase());
+const EMBODIMENT_DRIVE = EMBODIMENT_SHADOW && ['1','true','on'].includes(String(process.env.EMBODIMENT_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
