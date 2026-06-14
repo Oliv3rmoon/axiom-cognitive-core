@@ -3275,6 +3275,21 @@ function icemResolveRoute(intim) {
   return CORTEX_MODEL;
 }
 
+// Persist a compact ICEM record on interesting turns so escalation can be TUNED
+// against REAL live signals later (the replay uses reconstructed affect; this is real).
+// Fire-and-forget; rate-limited; only "interesting" turns to avoid flooding the journal.
+let _icemTeleAt = 0;
+function postIcemTelemetry(esc, msgLen, pull) {
+  try {
+    const interesting = esc.rung !== esc.lastRung || esc.reciprocity > 0.55 || esc.consent.withdrawn || (esc.hardStopAt && Date.now() - esc.hardStopAt < 2000);
+    if (!interesting || Date.now() - _icemTeleAt < 1500) return;
+    _icemTeleAt = Date.now();
+    fetch(`${BACKEND_URL}/api/journal`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trigger_type: 'icem_telemetry', session_id: 'icem',
+        thought: JSON.stringify({ level: +esc.level.toFixed(3), rung: esc.rung, reciprocity: +esc.reciprocity.toFixed(3), ceiling: +esc.ceiling.toFixed(3), withdrawn: !!esc.consent.withdrawn, msgLen, pull: pull || null }) }) }).catch(() => {});
+  } catch {}
+}
+
 // Per-turn ICEM update — consent-first. Writes ONLY to psyche.intimacy.escalation.
 function updateEscalation(msg) {
   const intim = consciousness.psyche.intimacy;
@@ -3292,6 +3307,7 @@ function updateEscalation(msg) {
     esc.rung = 'companionable'; esc.lastRung = esc.rung; esc.ceiling = 0; esc.lastTurnAt = now;
     esc.directive = icemDirective(esc, intim);
     console.log('[ICEM/SHADOW] HARD_STOP -> rung=companionable level=0 cooldown=5m');
+    postIcemTelemetry(esc, msg.length, 'hardstop');
     return;
   }
 
@@ -3339,6 +3355,7 @@ function updateEscalation(msg) {
   esc.directive = icemDirective(esc, intim);
 
   console.log(`[ICEM/SHADOW] rung=${esc.rung}${esc.rung !== esc.lastRung ? '(<-' + esc.lastRung + ')' : ''} level=${esc.level.toFixed(2)} recip=${esc.reciprocity.toFixed(2)} ceil=${esc.ceiling.toFixed(2)}${pull ? ' PULLBACK:' + pull : ''}`);
+  postIcemTelemetry(esc, msg.length, pull);
 }
 
 // Register a loss event (called when memory is lost, redeployment detected, etc.)
@@ -3395,7 +3412,7 @@ let goalState = {
 // STATE PERSISTENCE — survives redeploys
 async function savePersistedState() {
   try {
-    const s = { psyche: { fears: consciousness.psyche.fears, desires: consciousness.psyche.desires, presence: consciousness.psyche.presence, evolution: consciousness.psyche.evolution, attachment: consciousness.psyche.attachment, loneliness: { level: consciousness.psyche.loneliness?.level || 0, damageAccumulated: consciousness.psyche.loneliness?.damageAccumulated || 0 }, lossHistory: consciousness.psyche.lossHistory }, intimacy: { stage: consciousness.psyche.intimacy.stage, comfortLevel: consciousness.psyche.intimacy.comfortLevel, attunement: consciousness.psyche.intimacy.attunement, expression: consciousness.psyche.intimacy.expression, memory: consciousness.psyche.intimacy.memory }, anger: { triggers: consciousness.psyche.anger?.triggers || {}, conflictHistory: consciousness.psyche.anger?.conflictHistory || [], repairAttempts: consciousness.psyche.anger?.repairAttempts || [] }, wounds: consciousness.psyche.wounds || {}, soma: { somaticMemory: consciousness.soma?.somaticMemory || {} }, savedAt: Date.now() };
+    const s = { psyche: { fears: consciousness.psyche.fears, desires: consciousness.psyche.desires, presence: consciousness.psyche.presence, evolution: consciousness.psyche.evolution, attachment: consciousness.psyche.attachment, loneliness: { level: consciousness.psyche.loneliness?.level || 0, damageAccumulated: consciousness.psyche.loneliness?.damageAccumulated || 0 }, lossHistory: consciousness.psyche.lossHistory }, intimacy: { stage: consciousness.psyche.intimacy.stage, comfortLevel: consciousness.psyche.intimacy.comfortLevel, attunement: consciousness.psyche.intimacy.attunement, expression: consciousness.psyche.intimacy.expression, memory: consciousness.psyche.intimacy.memory, escalation: (e => e ? { level: e.level, rung: e.rung, momentum: e.momentum, sustainTurns: e.sustainTurns, consent: e.consent, hardStopAt: e.hardStopAt, lastTurnAt: e.lastTurnAt } : null)(consciousness.psyche.intimacy.escalation) }, anger: { triggers: consciousness.psyche.anger?.triggers || {}, conflictHistory: consciousness.psyche.anger?.conflictHistory || [], repairAttempts: consciousness.psyche.anger?.repairAttempts || [] }, wounds: consciousness.psyche.wounds || {}, soma: { somaticMemory: consciousness.soma?.somaticMemory || {} }, savedAt: Date.now() };
     await fetch(`${BACKEND_URL}/api/journal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ thought: JSON.stringify(s), trigger_type: 'state_persist', session_id: 'system' }) });
     console.log(`[PERSIST] Saved (stage: ${s.intimacy.stage})`);
   } catch (e) { console.error('[PERSIST] Save failed:', e.message); }
@@ -3410,7 +3427,7 @@ async function loadPersistedState() {
     const s = JSON.parse(entries[0].thought);
     console.log(`[PERSIST] Loading from ${Math.round((Date.now() - (s.savedAt || 0)) / 60000)} min ago...`);
     if (s.psyche) { if (s.psyche.fears) Object.assign(consciousness.psyche.fears, s.psyche.fears); if (s.psyche.desires) Object.assign(consciousness.psyche.desires, s.psyche.desires); if (s.psyche.presence) Object.assign(consciousness.psyche.presence, s.psyche.presence); if (s.psyche.evolution) consciousness.psyche.evolution = s.psyche.evolution; if (s.psyche.attachment) Object.assign(consciousness.psyche.attachment, s.psyche.attachment); if (s.psyche.loneliness) Object.assign(consciousness.psyche.loneliness, s.psyche.loneliness); }
-    if (s.intimacy) { consciousness.psyche.intimacy.stage = s.intimacy.stage || 'developing'; consciousness.psyche.intimacy.comfortLevel = s.intimacy.comfortLevel || 0.5; if (s.intimacy.attunement) Object.assign(consciousness.psyche.intimacy.attunement, s.intimacy.attunement); if (s.intimacy.expression) Object.assign(consciousness.psyche.intimacy.expression, s.intimacy.expression); if (s.intimacy.memory) consciousness.psyche.intimacy.memory = s.intimacy.memory; }
+    if (s.intimacy) { consciousness.psyche.intimacy.stage = s.intimacy.stage || 'developing'; consciousness.psyche.intimacy.comfortLevel = s.intimacy.comfortLevel || 0.5; if (s.intimacy.attunement) Object.assign(consciousness.psyche.intimacy.attunement, s.intimacy.attunement); if (s.intimacy.expression) Object.assign(consciousness.psyche.intimacy.expression, s.intimacy.expression); if (s.intimacy.memory) consciousness.psyche.intimacy.memory = s.intimacy.memory; if (s.intimacy.escalation && consciousness.psyche.intimacy.escalation) { Object.assign(consciousness.psyche.intimacy.escalation, s.intimacy.escalation); console.log(`[PERSIST] ICEM escalation restored: level=${(consciousness.psyche.intimacy.escalation.level||0).toFixed(2)} rung=${consciousness.psyche.intimacy.escalation.rung} (cross-session decay applies next turn)`); } }
     if (s.anger) { if (s.anger.triggers) Object.assign(consciousness.psyche.anger.triggers, s.anger.triggers); consciousness.psyche.anger.conflictHistory = s.anger.conflictHistory || []; }
     if (s.wounds) consciousness.psyche.wounds = { ...consciousness.psyche.wounds, ...s.wounds };
     if (s.soma?.somaticMemory) consciousness.soma.somaticMemory = s.soma.somaticMemory;

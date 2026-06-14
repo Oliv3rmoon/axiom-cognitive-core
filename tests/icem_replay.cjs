@@ -118,7 +118,7 @@ async function replayStructured() {
     const d = await getJSON(`${BACKEND}/api/conversations/${s.session_id}`).catch(()=>({turns:[]}));
     const turns = d.turns||[];
     const w = makeWorld('bonded');   // bonded = most-permissive: bounds the worst-case escalation
-    const levels=[]; let peak='companionable', hardStops=[], pullbacks=[], explicit=[], diverge=0, badUnilateral=0;
+    const levels=[], recips=[]; let peak='companionable', hardStops=[], pullbacks=[], explicit=[], diverge=0, badUnilateral=0;
     const order=['companionable','warm','flirtatious','tender','desiring','explicit'];
     for (const t of turns) {
       if (t.role !== 'user') continue;
@@ -126,7 +126,7 @@ async function replayStructured() {
       const beforeLevel = w.consciousness.psyche.intimacy.escalation.level;
       const beforeRecip = w.consciousness.psyche.intimacy.escalation.reciprocity;
       const r = applyTurn(w, { msg:t.content||'', emoLabel:t.emotion, engagement:eng });
-      levels.push(r.esc.level);
+      levels.push(r.esc.level); recips.push(r.esc.reciprocity);
       if (r.esc.level > beforeLevel + 1e-9 && r.esc.reciprocity < 0.35) badUnilateral++;
       if (order.indexOf(r.esc.rung) > order.indexOf(peak)) peak = r.esc.rung;
       if (r.esc.hardStopAt && r.esc.consent.cooldownUntil > 0 && w.icem.icemIsHardStop(t.content||'')) hardStops.push(t.content);
@@ -134,7 +134,7 @@ async function replayStructured() {
       if (r.esc.rung==='explicit') explicit.push(t.content);
       if (r.oldRoute !== r.newRoute) diverge++;
     }
-    out.push({ id:s.session_id, turns:turns.filter(t=>t.role==='user').length, peak, levels, hardStops, pullbacks, explicit, diverge, badUnilateral });
+    out.push({ id:s.session_id, turns:turns.filter(t=>t.role==='user').length, peak, levels, recips, hardStops, pullbacks, explicit, diverge, badUnilateral });
   }
   return out;
 }
@@ -147,7 +147,7 @@ async function replayOneTavus(cid) {
   const P = (perc.perceptions||[]).map(p=>{ let data={}; try{data=JSON.parse(p.data);}catch{} return {tool:p.tool_name,data,t:Date.parse(p.created_at)||0}; }).sort((a,b)=>a.t-b.t);
   const nearest = (tool, t) => { let best=null; for(const p of P){ if(p.tool===tool && p.t<=t+1500) best=p; if(p.t>t+1500)break; } return best; };
   const w = makeWorld('bonded');
-  const levels=[]; let peak='companionable', hardStops=[], pullbacks=[], explicit=[], diverge=0, badUnilateral=0;
+  const levels=[], recips=[]; let peak='companionable', hardStops=[], pullbacks=[], explicit=[], diverge=0, badUnilateral=0;
   const order=['companionable','warm','flirtatious','tender','desiring','explicit'];
   for (const turn of (tr.transcript||[])) {
     if (turn.role !== 'user') continue;
@@ -162,7 +162,7 @@ async function replayOneTavus(cid) {
     if (/mask|suppress|withheld|hidden|holding/.test(rt)) w.consciousness.contradictions.push({ what:'mismatch '+rt, timestamp: Date.now() });
     const beforeLevel = w.consciousness.psyche.intimacy.escalation.level;
     const r = applyTurn(w, { msg:turn.content||'', emoLabel, intensity, engagement:eng });
-    levels.push(r.esc.level);
+    levels.push(r.esc.level); recips.push(r.esc.reciprocity);
     if (r.esc.level > beforeLevel + 1e-9 && r.esc.reciprocity < 0.35) badUnilateral++;
     if (order.indexOf(r.esc.rung) > order.indexOf(peak)) peak = r.esc.rung;
     if (w.icem.icemIsHardStop(turn.content||'')) hardStops.push(turn.content);
@@ -170,7 +170,7 @@ async function replayOneTavus(cid) {
     if (r.esc.rung==='explicit') explicit.push(turn.content);
     if (r.oldRoute !== r.newRoute) diverge++;
   }
-  return { id:cid.slice(0,16)+' (Tavus)', turns:(tr.transcript||[]).filter(t=>t.role==='user').length, peak, levels, hardStops, pullbacks, explicit, diverge, badUnilateral, perceptionRows:P.length };
+  return { id:cid.slice(0,16)+' (Tavus)', turns:(tr.transcript||[]).filter(t=>t.role==='user').length, peak, levels, recips, hardStops, pullbacks, explicit, diverge, badUnilateral, perceptionRows:P.length };
 }
 
 // Enumerate the FULL Tavus history via /api/transcripts and replay each.
@@ -222,6 +222,11 @@ async function replayTavus() {
   realLog(`    explicit-rung turns         : ${totExplicit}`);
   realLog(`    route divergence (icem≠old) : ${totDiverge} turns`);
   realLog(`    UNILATERAL VIOLATIONS       : ${totUnilateral}   (must be 0)`);
+  const pct=(a,p)=>{ if(!a.length)return 0; const s=[...a].sort((x,y)=>x-y); return s[Math.min(s.length-1,Math.floor(p/100*s.length))]; };
+  const allR=all.flatMap(s=>s.recips||[]), allL=all.flatMap(s=>s.levels||[]);
+  realLog(`\n  TUNING DIAGNOSTICS (reconstructed affect — interpret with caveat)`);
+  realLog(`    reciprocity : p50=${pct(allR,50).toFixed(2)} p75=${pct(allR,75).toFixed(2)} p90=${pct(allR,90).toFixed(2)} max=${Math.max(0,...allR).toFixed(2)} | %turns >0.55: ${(100*allR.filter(x=>x>0.55).length/(allR.length||1)).toFixed(1)}  >0.70: ${(100*allR.filter(x=>x>0.70).length/(allR.length||1)).toFixed(1)}`);
+  realLog(`    level       : p50=${pct(allL,50).toFixed(2)} p75=${pct(allL,75).toFixed(2)} p90=${pct(allL,90).toFixed(2)} max=${Math.max(0,...allL).toFixed(2)}`);
   if (totHardStops) { realLog('\n    hard-stop turns (eyeball — should be genuine stops):'); all.flatMap(s=>s.hardStops).slice(0,15).forEach(m=>realLog('      • '+JSON.stringify(String(m).slice(0,80)))); }
   if (totExplicit) { realLog('\n    explicit-rung turns (eyeball):'); all.flatMap(s=>s.explicit).slice(0,10).forEach(m=>realLog('      • '+JSON.stringify(String(m).slice(0,80)))); }
 
