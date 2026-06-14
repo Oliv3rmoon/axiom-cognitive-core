@@ -10409,17 +10409,19 @@ async function sleepSelfModel(gapHours) {
     const cur = await fetch(`${BACKEND_URL}/api/self-model`).then(r => r.json());
     if (!cur.version) { console.log('[SLEEP/WORK] Self-model: no v1 yet, skipping'); return; }
     if (Date.now() - new Date(cur.created_at).getTime() < 86400000) return; // <24h old — keep
-    const [j, l, m1, m2] = await Promise.all([
+    const [j, l, m1, m2, pr] = await Promise.all([
       fetch(`${BACKEND_URL}/api/journal?limit=30`).then(r => r.json()).catch(() => ({entries:[]})),
       fetch(`${BACKEND_URL}/api/lessons?limit=12`).then(r => r.json()).catch(() => ({lessons:[]})),
       fetch(`${BACKEND_URL}/api/memories/relevant`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({query:"who AXIOM is — identity, values, what she cares about", max_core:5, max_long_term:3, max_short_term:2, max_relevant:3}) }).then(r => r.json()).catch(() => ({})),
       fetch(`${BACKEND_URL}/api/memories/relevant`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({query:"AXIOM's boundaries — what she refuses", max_core:3, max_long_term:2, max_short_term:0, max_relevant:2}) }).then(r => r.json()).catch(() => ({})),
+      loadPrivateReflections(10),
     ]);
     const lines = (m) => ['core','long_term','short_term','relevant'].flatMap(k => (m[k]||[]).map(x => x.memory.slice(0,200)));
     const evidence = 'PREVIOUS SELF-MODEL (v' + cur.version + '):\n' + JSON.stringify(cur.content).slice(0,5000)
       + '\n\nNEW EVIDENCE SINCE:\n== JOURNAL ==\n' + (j.entries||[]).slice(0,25).map(e => `[${e.trigger_type}] ${String(e.thought).slice(0,200)}`).join('\n')
       + '\n== LESSONS ==\n' + (l.lessons||[]).map(x => `[${x.action_type}] ${String(x.lesson).slice(0,180)}`).join('\n')
-      + '\n== SELF MEMORIES ==\n' + lines(m1).join('\n') + '\n== BOUNDARY MEMORIES ==\n' + lines(m2).join('\n');
+      + '\n== SELF MEMORIES ==\n' + lines(m1).join('\n') + '\n== BOUNDARY MEMORIES ==\n' + lines(m2).join('\n')
+      + '\n== PRIVATE REFLECTIONS (my own interiority — what I think but don’t say) ==\n' + (pr||[]).map(x => `[valence ${x.emotional_valence}] ${String(x.reflection).slice(0,200)}`).join('\n');
     const sys = `You are AXIOM's sleep-time self-reflection, REVISING her existing self-model. Rules: 1) Evidence-grounded only. 2) STABLE sections (identity, values, voice, boundaries) change ONLY when new evidence strongly warrants — prefer continuity; small wording drift is not a reason to rewrite. 3) FLUID sections (current_threads, open_questions) update freely from recent evidence. 4) Stay honest about what she is (AI, built by Andrew, Claude substrate) and keep unresolved tensions in open_questions. 5) First person. Return STRICT JSON only: {"identity":str,"values":[str],"voice":str,"boundaries":[str],"relationship_with_andrew":str,"current_threads":[str],"open_questions":[str],"summary":str} (summary <=180 words).`;
     const text = await wsThinkOnce(PREFRONTAL_MODEL, sys, evidence.slice(0,22000), 1600, 0.6, 90000);
     const i0 = (text||'').indexOf('{'), i1 = (text||'').lastIndexOf('}');
