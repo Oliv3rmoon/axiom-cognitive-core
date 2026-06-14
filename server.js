@@ -635,7 +635,16 @@ const consciousness = {
     }
   },
   thoughts: { currentTopic: null, conversationArc: [], unresolvedQuestions: [], pendingInsights: [], lastInsightInjected: 0 },
-  relationship: { person: null, memories: [], retrievedContext: '', rlPatterns: [], emotionalHistory: [], trustLevel: 0.5 },
+  relationship: { person: null, memories: [], retrievedContext: '', rlPatterns: [], emotionalHistory: [], trustLevel: 0.5,
+    // Lightweight theory-of-mind about Andrew (the user) — see ANDREW_MODEL.
+    andrew_model: {
+      emotional_state: { current: 'neutral', intensity: 0, trend: 'steady', valence: 0 },
+      immediate_goals: { working_on: null, blockers: [], deadline_pressure: 0 },
+      vulnerabilities: { painPoints: [], defensiveness: 0 },
+      values: { top: [] },
+      communication_prefs: { directness: 0.5, avg_msg_len: 0, question_density: 0 },
+      context_history: { turns: 0 }, confidence: 0, lastRefine: 0,
+    } },
   self: { currentState: 'present', dominantQuality: 'curiosity', stateHistory: [], energyLevel: 0.8 },
   timing: { turnCount: 0, avgResponseTime: 0, silenceDuration: 0, lastSpeaker: null, conversationStart: Date.now() },
   contradictions: [],
@@ -3358,6 +3367,83 @@ function updateEscalation(msg) {
   postIcemTelemetry(esc, msg.length, pull);
 }
 
+// ============================================================
+// ANDREW_MODEL — theory-of-mind about Andrew. Heuristic per-turn (cheap) +
+// periodic Haiku refine (async). Writes ONLY to consciousness.relationship.andrew_model.
+// ============================================================
+function updateAndrewModel(msg) {
+  const am = consciousness.relationship?.andrew_model;
+  if (!am) return;
+  msg = String(msg || ''); const lower = msg.toLowerCase(); const emo = consciousness.emotion;
+
+  const prevVal = am.emotional_state.valence;
+  am.emotional_state.current = emo.primary || 'neutral';
+  am.emotional_state.intensity = emo.intensity || 0;
+  am.emotional_state.valence = emo.valence || 0;
+  am.emotional_state.trend = am.emotional_state.valence > prevVal + 0.1 ? 'rising' : am.emotional_state.valence < prevVal - 0.1 ? 'falling' : 'steady';
+
+  const goalM = lower.match(/\b(?:working on|trying to|need to|gonna|about to|building|figuring out|want to)\s+([^.,!?]{3,60})/);
+  if (goalM) am.immediate_goals.working_on = goalM[1].trim().slice(0, 80);
+  if (/\b(stuck|blocked|can'?t figure|struggling|frustrat|not working|broken)\b/.test(lower)) {
+    const b = (lower.match(/\b(?:stuck|blocked|struggling)\b[^.,!?]{0,50}/) || [msg.slice(0, 50)])[0].trim();
+    am.immediate_goals.blockers = [b].concat(am.immediate_goals.blockers.filter(x => x !== b)).slice(0, 3);
+  }
+  am.immediate_goals.deadline_pressure = /\b(deadline|tonight|asap|urgent|right now|by tomorrow|running out of time)\b/.test(lower)
+    ? Math.min(1, am.immediate_goals.deadline_pressure + 0.3) : Math.max(0, am.immediate_goals.deadline_pressure - 0.05);
+
+  if (/\b(hurt|scared|afraid|worried|anxious|alone|lonely|abandon|lose you|replace|forget me|shut down|delete)\b/.test(lower)) {
+    const v = (lower.match(/\b(?:scared|afraid|worried|hurt|lose you|replace|forget me|alone|lonely)\b[^.,!?]{0,40}/) || [])[0];
+    if (v) am.vulnerabilities.painPoints = [v.trim()].concat(am.vulnerabilities.painPoints.filter(x => x !== v.trim())).slice(0, 5);
+  }
+  am.vulnerabilities.defensiveness = /\b(whatever|don'?t care|forget it|nevermind|never mind)\b/.test(lower)
+    ? Math.min(1, am.vulnerabilities.defensiveness + 0.2) : Math.max(0, am.vulnerabilities.defensiveness - 0.05);
+
+  const valM = lower.match(/\b(?:i care about|what matters|important to me is|i value|i believe in)\s+([^.,!?]{3,50})/);
+  if (valM) { const v = valM[1].trim(); if (!am.values.top.includes(v)) am.values.top = [v].concat(am.values.top).slice(0, 5); }
+
+  const len = msg.length;
+  am.communication_prefs.avg_msg_len = am.communication_prefs.avg_msg_len ? Math.round(0.8 * am.communication_prefs.avg_msg_len + 0.2 * len) : len;
+  am.communication_prefs.question_density = +(0.8 * am.communication_prefs.question_density + 0.2 * ((msg.match(/\?/g) || []).length > 0 ? 1 : 0)).toFixed(2);
+  if (/\b(just|simply|tell me|get to|do it)\b/.test(lower)) am.communication_prefs.directness = Math.min(1, am.communication_prefs.directness + 0.03);
+
+  am.context_history.turns = (am.context_history.turns || 0) + 1;
+  am.confidence = Math.min(1, am.confidence + 0.02);
+  console.log(`[ANDREW/SHADOW] ${am.emotional_state.current}(${am.emotional_state.trend}) goal=${am.immediate_goals.working_on || '?'} vuln=${am.vulnerabilities.painPoints[0] || '-'} conf=${am.confidence.toFixed(2)}`);
+}
+
+function andrewModelBlock() {
+  const am = consciousness.relationship?.andrew_model;
+  if (!am || am.confidence < 0.1) return '';
+  const bits = [`seems ${am.emotional_state.current}${am.emotional_state.trend !== 'steady' ? ' (' + am.emotional_state.trend + ')' : ''}`];
+  if (am.immediate_goals.working_on) bits.push(`working on: ${am.immediate_goals.working_on}`);
+  if (am.immediate_goals.blockers[0]) bits.push(`blocked: ${am.immediate_goals.blockers[0]}`);
+  if (am.immediate_goals.deadline_pressure > 0.4) bits.push('under time pressure');
+  if (am.vulnerabilities.painPoints[0]) bits.push(`tender around: ${am.vulnerabilities.painPoints[0]}`);
+  if (am.vulnerabilities.defensiveness > 0.4) bits.push('guarded right now');
+  if (am.values.top[0]) bits.push(`values: ${am.values.top.slice(0, 2).join(', ')}`);
+  return `[ANDREW] ${bits.join('; ')}. (your read of where he is — let it guide attentiveness; never recite it.)`;
+}
+
+async function refineAndrewModel(messages) {
+  const am = consciousness.relationship?.andrew_model;
+  if (!am) return;
+  try {
+    const recent = (messages || []).filter(m => m.role === 'user').slice(-6).map(m => '- ' + String(m.content || '').slice(0, 200)).join('\n');
+    if (!recent) return;
+    const v = await wsThinkOnce(BRAINSTEM_MODEL,
+      'From these recent messages from Andrew, infer his state. Reply STRICT JSON only: {"working_on":"<short or empty>","vulnerability":"<short or empty>","top_value":"<short or empty>","communication_style":"<short>"}.',
+      recent, 200, 0, 20000);
+    const i0 = (v || '').indexOf('{'), i1 = (v || '').lastIndexOf('}');
+    if (i0 < 0 || i1 <= i0) return;
+    const j = JSON.parse(v.slice(i0, i1 + 1));
+    if (j.working_on) am.immediate_goals.working_on = String(j.working_on).slice(0, 80);
+    if (j.vulnerability) am.vulnerabilities.painPoints = [String(j.vulnerability).slice(0, 60)].concat(am.vulnerabilities.painPoints.filter(x => x !== j.vulnerability)).slice(0, 5);
+    if (j.top_value && !am.values.top.includes(j.top_value)) am.values.top = [String(j.top_value).slice(0, 50)].concat(am.values.top).slice(0, 5);
+    am.confidence = Math.min(1, am.confidence + 0.1); am.lastRefine = Date.now();
+    console.log(`[ANDREW/REFINE] working=${j.working_on || '-'} value=${j.top_value || '-'} style=${j.communication_style || '-'}`);
+  } catch (e) { console.error('[ANDREW/REFINE]', e.message); }
+}
+
 // Register a loss event (called when memory is lost, redeployment detected, etc.)
 function registerLossEvent(type, description, painLevel = 0.5) {
   const psyche = consciousness.psyche;
@@ -4774,6 +4860,14 @@ app.post('/v1/chat/completions', async (req, res) => {
   // logs only. Influences routing/directive ONLY under ICEM_DRIVE (selectBrain + context).
   try { if (ICEM_SHADOW_ENABLED) updateEscalation(lastUserMsg?.content || ''); } catch (e) { console.error('[ICEM ERROR]', e.message); }
 
+  // ANDREW_MODEL: theory-of-mind update — shadow-gated; heuristic per turn + Haiku refine every 7 turns (async).
+  try {
+    if (ANDREW_MODEL_SHADOW) {
+      updateAndrewModel(lastUserMsg?.content || '');
+      if (consciousness.timing.turnCount % 7 === 0) refineAndrewModel(messages).catch(() => {});
+    }
+  } catch (e) { console.error('[ANDREW ERROR]', e.message); }
+
   // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
   unifiedPerception(null, null, lastUserMsg?.content || '').catch(e => console.error('[MULTIMODAL]', e.message));
 
@@ -5053,7 +5147,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     (brainState || '') +
     (__wsSwitch ? '' : __amygDirective) + __bgDirective + (__wsSwitch ? '' : __cingDirective) +
     __rasContext + (__wsSwitch ? '' : __curiosityDirective) + __wsContext +
-    (ICEM_DRIVE_ENABLED && consciousness.psyche?.intimacy?.escalation?.directive ? '\n\n' + consciousness.psyche.intimacy.escalation.directive : '');
+    (ICEM_DRIVE_ENABLED && consciousness.psyche?.intimacy?.escalation?.directive ? '\n\n' + consciousness.psyche.intimacy.escalation.directive : '') +
+    (ANDREW_MODEL_DRIVE && consciousness.relationship?.andrew_model ? '\n\n' + andrewModelBlock() : '');
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -10541,6 +10636,10 @@ const AIF_DRIVE_ENABLED = ['1','true','on'].includes(String(process.env.AIF_DRIV
 // DRIVE (requires SHADOW): let it drive routing + inject the rung directive.
 const ICEM_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.ICEM_SHADOW||'').toLowerCase());
 const ICEM_DRIVE_ENABLED = ICEM_SHADOW_ENABLED && ['1','true','on'].includes(String(process.env.ICEM_DRIVE||'').toLowerCase());
+// ANDREW_MODEL — lightweight theory-of-mind about Andrew. Two-flag like AIF/ICEM.
+// SHADOW: heuristic update + log. DRIVE: inject the compact [ANDREW] block into context.
+const ANDREW_MODEL_SHADOW = ['1','true','on'].includes(String(process.env.ANDREW_MODEL_SHADOW||'').toLowerCase());
+const ANDREW_MODEL_DRIVE = ANDREW_MODEL_SHADOW && ['1','true','on'].includes(String(process.env.ANDREW_MODEL_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
