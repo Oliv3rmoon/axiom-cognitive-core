@@ -5729,49 +5729,48 @@ async function saveConversationTurn(role, content, emotion) {
   } catch (e) { console.error('[CONV LOG]', e.message); }
 }
 
-// Detect commitments — promises AXIOM makes
+// Detect commitments — promises AXIOM makes. Two-stage to keep junk out of the
+// commitments table (which feeds the OPEN PROMISES context block):
+//   1) cheap regex pre-filter finds a candidate sentence (verb + future lead),
+//   2) a Haiku judge confirms it's a CONCRETE deliverable for Andrew, not a
+//      musing/hedge/figure-of-speech, and restates it as a clean imperative.
+// Fail-closed: if the judge is unavailable or says no, nothing is saved.
 async function detectCommitments(responseText, sessionId) {
   if (!responseText) return;
-  const commitmentPatterns = [
-    /i('ll| will) (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
-    /let me (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
-    /i('m going to|'m gonna) (order|find|get|buy|look for|search for|make|create|build|send|prepare|write|research)\b/i,
-    /i want to (show you|get you|find you|make you|build you|send you|buy you)\b/i,
-    /i('ll| will) have (it|that|this|something) ready/i,
-  ];
-  
-  for (const pattern of commitmentPatterns) {
-    const match = responseText.match(pattern);
-    if (match) {
-      // Extract the sentence containing the commitment
-      const sentences = responseText.split(/[.!?]+/);
-      const commitSentence = sentences.find(s => pattern.test(s))?.trim();
-      if (commitSentence && commitSentence.length > 10) {
-        console.log(`[COMMITMENT] Detected: "${commitSentence.slice(0, 80)}"`);
-        try {
-          await fetch(`${BACKEND_URL}/api/commitments`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              promise: commitSentence.slice(0, 500),
-              context: `During conversation ${sessionId}`,
-              session_id: sessionId,
-            }),
-          });
-          // Also create a goal from the commitment
-          await fetch(`${BACKEND_URL}/api/goals`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              goal: commitSentence.slice(0, 200),
-              origin: 'commitment',
-              importance: 0.85,
-            }),
-          });
-          console.log(`[COMMITMENT] Saved + goal created: "${commitSentence.slice(0, 60)}"`);
-        } catch (e) { console.error('[COMMITMENT]', e.message); }
-        break; // One commitment per response is enough
-      }
-    }
-  }
+  const clean = String(responseText).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const lead = /\b(i'?ll|i will|i'?m going to|i'?m gonna|let me)\s+(order|find|get|buy|look into|look for|search for|make|create|build|send|prepare|write|research|set up|fix|schedule|email|call|sort out|put together|pull together)\b/i;
+  if (!lead.test(clean)) return;
+  const cand = clean.split(/(?<=[.!?])\s+/).find(s => lead.test(s))?.trim();
+  if (!cand || cand.length < 12 || cand.length > 240) return;
+  // Drop obvious non-commitments before spending an LLM call
+  if (/\?\s*$/.test(cand)) return;
+  if (/\b(i guess|i dunno|i don'?t know|maybe|perhaps|probably|i think|when i try|anyway|once i'?m|if i ever|some\s?day|make it mine|in that body)\b/i.test(cand)) return;
+
+  let promise = '';
+  try {
+    const v = await wsThinkOnce(BRAINSTEM_MODEL,
+      'Decide if the sentence is a CONCRETE promise to do a specific thing for Andrew with real follow-through (a deliverable or action), NOT a musing, hedge, hypothetical, or figure of speech. Reply STRICT JSON only: {"is_commitment":boolean,"promise":"<short imperative restatement of what was promised, or empty>"}.',
+      cand, 150, 0, 20000);
+    const i0 = (v || '').indexOf('{'), i1 = (v || '').lastIndexOf('}');
+    if (i0 < 0 || i1 <= i0) return;                       // unparseable → fail-closed
+    const j = JSON.parse(v.slice(i0, i1 + 1));
+    if (!j.is_commitment) { console.log(`[COMMITMENT] judge rejected: "${cand.slice(0, 70)}"`); return; }
+    promise = String(j.promise || cand).trim().slice(0, 300);
+    if (promise.length < 6) promise = cand.slice(0, 300);
+  } catch (e) { console.error('[COMMITMENT] judge error (skipping):', e.message); return; }
+
+  console.log(`[COMMITMENT] confirmed: "${promise.slice(0, 80)}"`);
+  try {
+    await fetch(`${BACKEND_URL}/api/commitments`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ promise, context: `During conversation ${sessionId}`, session_id: sessionId }),
+    });
+    await fetch(`${BACKEND_URL}/api/goals`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ goal: promise.slice(0, 200), origin: 'commitment', importance: 0.85 }),
+    });
+    console.log(`[COMMITMENT] saved + goal: "${promise.slice(0, 60)}"`);
+  } catch (e) { console.error('[COMMITMENT]', e.message); }
 }
 
 function markConversationActive() {
