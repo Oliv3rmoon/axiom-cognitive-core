@@ -1090,10 +1090,18 @@ async function hippocampus() {
 // Returns only relevant memories instead of dumping all of them
 async function hippocampusRetrieve(query) {
   try {
+    const ctxBody = { query, max_core: 5, max_relevant: 5 };
+    // PREDICT horizon: ship the live AIF belief so the backend renders it inside
+    // the unified Relational State block. Gated by AIF_DRIVE (default off).
+    try {
+      if (AIF_SHADOW_ENABLED && AIF_DRIVE_ENABLED && aifState && aifState.obsCount > 0) {
+        ctxBody.predict = { beliefs: aifState.beliefs, surprise: aifState.lastSurprise };
+      }
+    } catch {}
     const res = await fetch(`${BACKEND_URL}/api/memories/context`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, max_core: 5, max_relevant: 5 }),
+      body: JSON.stringify(ctxBody),
     });
     const data = await res.json();
     consciousness.relationship.retrievedContext = data.context || '';
@@ -10286,6 +10294,9 @@ app.post('/reason', async (req, res) => {
 // Generative model of Andrew's engagement, updated per real turn from emotion valence.
 // Pure arithmetic, zero LLM calls. SHADOW: computes surprise + EFE, logs + exposes; influences NOTHING.
 const AIF_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.AIF_SHADOW||'').toLowerCase());
+// AIF_DRIVE: promote the shadow belief from log-only to the PREDICT horizon of
+// the backend's Relational State block. Default OFF; requires AIF_SHADOW on.
+const AIF_DRIVE_ENABLED = ['1','true','on'].includes(String(process.env.AIF_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
