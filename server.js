@@ -3164,7 +3164,7 @@ function icemIsHardStop(msg) {
   // "stop" present => halt, UNLESS it's an encouragement ("don't [ever/you/...] stop").
   // Only specific continuation adverbs are allowed between negator and "stop" — an
   // arbitrary window would swallow real stops like "don't know, stop" (a false-negative).
-  if (/\bstop\b/i.test(m) && !/(don'?t|do not|never|can'?t|won'?t)\s+(ever |you |really |please |gonna |wanna )?stop/i.test(m)) return true;
+  if (/\bstop\b/i.test(m) && !/(don'?t|do not|cannot|can ?not|can'?t|couldn'?t|wouldn'?t|didn'?t|won'?t|never|unable to)\s+(ever |you |really |please |gonna |wanna |want to |to )?stop/i.test(m)) return true;
   return false;
 }
 const ICEM_DIRECTIVES = {
