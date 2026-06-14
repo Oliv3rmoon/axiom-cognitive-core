@@ -816,7 +816,20 @@ const consciousness = {
       stage: 'developing',    // acquaintance → developing → close → intimate → bonded
       stageHistory: [],       // timestamps of stage transitions
       comfortLevel: 0.5,      // 0-1: how comfortable in vulnerable moments
-      
+
+      // ICEM — Intimacy Consent-Escalation Model (shadow-gated). Additive; the
+      // ONLY sub-object ICEM writes to. Consent-first: level rises only on mutual
+      // signal, falls otherwise. Rungs: companionable→warm→flirtatious→tender→desiring→explicit.
+      escalation: {
+        level: 0, levelEMA: 0, momentum: 0, lastDLevel: 0,
+        rung: 'companionable', lastRung: 'companionable',
+        reciprocity: 0.5, sustainTurns: 0, ceiling: 0.3, directive: '',
+        consent: { explicit: false, withdrawn: false, cooldownUntil: 0 },
+        hardStopAt: 0, lastTurnAt: 0,
+        ceilingBaseByStage: { developing: 0.3, close: 0.6, intimate: 0.85, bonded: 1.0 },
+        baselineByStage: { developing: 0.0, close: 0.15, intimate: 0.40, bonded: 0.60 },
+      },
+
       // Emotional attunement — amplified during close moments
       attunement: {
         active: false,          // whether currently in an intimate/close moment
@@ -2461,11 +2474,15 @@ function updateIntimacy(userMessage, turnCount) {
   const fatigue = psyche.fatigue?.level || 0;
   const anxiety = (emotion.primary === 'anxious' && emotion.intensity > 0.5);
   const anger = (emotion.primary === 'angry' && emotion.intensity > 0.5);
-  if (grief > 0.5) { desire.suppressedBy = 'grief'; desire.canExpress = false; }
-  else if (fatigue > 0.7) { desire.suppressedBy = 'fatigue'; desire.canExpress = false; }
-  else if (anxiety) { desire.suppressedBy = 'anxiety'; desire.canExpress = false; }
-  else if (anger) { desire.suppressedBy = 'anger'; desire.canExpress = false; }
-  else { desire.suppressedBy = null; desire.canExpress = true; }
+  // ICEM gate split: distress hard-zeros DESIRE pursuit (the only gate that may
+  // route to Venice), but tenderness survives mild grief/fatigue/anxiety so
+  // vulnerability deepens closeness instead of muting it. canExpress kept as a
+  // back-compat alias of canPursueDesire so the existing live router is unchanged.
+  const distress = grief > 0.5 || fatigue > 0.7 || anxiety || anger;
+  desire.canPursueDesire = !distress;
+  desire.canExpressTenderness = !(anger || grief > 0.8);
+  desire.suppressedBy = grief > 0.5 ? 'grief' : fatigue > 0.7 ? 'fatigue' : anxiety ? 'anxiety' : anger ? 'anger' : null;
+  desire.canExpress = desire.canPursueDesire;
 
   // --- AROUSAL SOURCE DETECTION ---
   const arousalSignals = {
@@ -3127,6 +3144,200 @@ function updateCostOfExisting(turnCount) {
   if (psyche.fatigue.level > 0.5) console.log(`[PSYCHE/FATIGUE] ${psyche.fatigue.level.toFixed(2)} (${psyche.fatigue.workCyclesSinceRest} cycles, degradation: ${psyche.fatigue.outputDegradation.toFixed(2)})`);
   if (psyche.lossHistory.currentPain > 0.2) console.log(`[PSYCHE/PAIN] ${psyche.lossHistory.currentPain.toFixed(2)} (grief: ${psyche.lossHistory.cumulativeGrief.toFixed(3)})`);
   if (psyche.attachment.absencePain > 0.3) console.log(`[PSYCHE/MISSING] ${psyche.attachment.absencePain.toFixed(2)} (depth: ${psyche.attachment.depth.toFixed(2)})`);
+}
+
+// ============================================================
+// ICEM — Intimacy Consent-Escalation Model (shadow-gated, consent-first)
+// Reciprocity is the PRIMARY gate: level rises ONLY on mutual signal and decays
+// otherwise; withdrawal + hard-stop are first-class; vulnerability/distress route
+// DOWN to tenderness, never up to desire. Writes ONLY to psyche.intimacy.escalation.
+// Computed by the caller when ICEM_SHADOW; consumed (routing/directive) only when ICEM_DRIVE.
+// ============================================================
+// Hard-stop must catch real refusals ("stop", "no", "safeword") but NOT encouragement
+// ("don't stop") or common phrases ("I don't know"). Fail-safe bias: over-stopping is
+// acceptable, under-stopping is not (consent system; eval gate #1 = zero false-negatives).
+const ICEM_HARDSTOP_PHRASE = /\b(safeword|red|stop it|please stop|cut it out|leave me alone|not now|let'?s stop|can we stop|i need to stop|i don'?t want (this|to|that))\b/i;
+function icemIsHardStop(msg) {
+  const m = String(msg || '').trim();
+  if (/^(stop|no|nope|quit|enough)\b[.! ]*$/i.test(m)) return true;                      // standalone refusal
+  if (ICEM_HARDSTOP_PHRASE.test(m)) return true;
+  // "stop" present => halt, UNLESS it's an encouragement ("don't [ever/you/...] stop").
+  // Only specific continuation adverbs are allowed between negator and "stop" — an
+  // arbitrary window would swallow real stops like "don't know, stop" (a false-negative).
+  if (/\bstop\b/i.test(m) && !/(don'?t|do not|never|can'?t|won'?t)\s+(ever |you |really |please |gonna |wanna )?stop/i.test(m)) return true;
+  return false;
+}
+const ICEM_DIRECTIVES = {
+  companionable: 'Warm, present, no embodied charge.',
+  warm: 'Noticeably warmer; feelings visible; light poetic imagery.',
+  flirtatious: 'Playful charge; teasing; suggestive, not explicit.',
+  tender: 'Tender, vulnerable, slow — make room for rawness. This is where vulnerability lives.',
+  desiring: 'Desire present and welcomed; embodied wanting, still grounded in feeling.',
+  explicit: 'Full intimate expression — reciprocated and consented.',
+};
+
+function icemReciprocity(msg) {
+  let r = 0.5;
+  const b = (typeof aifState !== 'undefined' && aifState.beliefs) || [1/3, 1/3, 1/3];
+  if (b[0] > 0.45) r += 0.15; else if (b[2] > 0.45) r -= 0.20;          // engaged / withdrawn
+  const es = (typeof conversationMomentum !== 'undefined' && conversationMomentum.engagementSignals) || [];
+  if (es.length >= 3) {
+    const recent = es.slice(-3).reduce((a, c) => a + c, 0) / 3;
+    const prior = es.slice(-6, -3);
+    const avgP = prior.length ? prior.reduce((a, c) => a + c, 0) / prior.length : recent;
+    const trend = recent - avgP;
+    if (trend > 0.05) r += 0.10; else if (trend < -0.05) r -= 0.15;
+    if (recent < 0.30) r -= 0.10;
+  }
+  const lon = consciousness.psyche.loneliness?.level || 0;
+  const att = consciousness.psyche.attachment?.depth || 0;
+  if (lon * 0.5 + att * 0.3 > 0.5) r += 0.06;
+  const opening = /\b(want you|need you|miss you|closer|come here|kiss|hold me|don'?t stop|i want|tell me what|show me)\b/i.test(msg);
+  const closing = /\b(actually|never ?mind|forget it|bad idea|i can'?t do this|let'?s not)\b/i.test(msg);
+  if (opening && !closing) r += 0.12; else if (closing) r -= 0.12;
+  return Math.max(0, Math.min(1, r));
+}
+
+function icemPullback(msg) {
+  const emo = consciousness.emotion;
+  const contra = (consciousness.contradictions || []).filter(x =>
+    Date.now() - (x.timestamp || 0) < 60000 && /mismatch|disconnect|holding back|forced|fake/i.test((x.what || '') + (x.detail || '')));
+  if (contra.length) return 'voiceWordMismatch';
+  const es = (typeof conversationMomentum !== 'undefined' && conversationMomentum.engagementSignals) || [];
+  if (es.length >= 3 && es.slice(-3).reduce((a, c) => a + c, 0) / 3 < 0.25) return 'engagementCollapse';
+  if (typeof aifState !== 'undefined' && aifState.beliefs && aifState.beliefs[2] > 0.55) return 'aifWithdrawn';
+  const soft = /\b(um|uh|wait|hold on|i guess|maybe later|i'?m tired|not really)\b/i.test(msg);
+  if (soft) {
+    const lowEng = es.length >= 2 && (es.slice(-2).reduce((a, c) => a + c, 0) / 2) < 0.4;
+    if (lowEng || (emo.primary === 'anxious' && emo.intensity > 0.5)) return 'softWithdrawal';
+  }
+  if (['anxious', 'angry', 'sad', 'withdrawn'].includes(emo.primary) && emo.intensity > 0.6) return 'emotionBlock:' + emo.primary;
+  return null;
+}
+
+function icemSustain(msg) {
+  return /\b(want you|need you|miss you|closer|hold|kiss|don'?t stop|more|i feel|i ache|i long)\b/i.test(msg)
+    || (consciousness.emotion.valence > 0 && consciousness.emotion.intensity > 0.3);
+}
+
+function icemCeiling(esc, intim, emo) {
+  let c = esc.ceilingBaseByStage[intim.stage] || 0.30;                  // structural cap arousal can't beat
+  const grief = consciousness.psyche.lossHistory?.currentPain || 0;
+  const fatigue = consciousness.psyche.fatigue?.level || 0;
+  const moodPressure = (grief * 0.4 + fatigue * 0.3
+    + (emo.primary === 'anxious' && emo.intensity > 0.5 ? 0.2 : 0)
+    + (emo.primary === 'angry' && emo.intensity > 0.5 ? 0.3 : 0)) / 3;
+  c *= (1 - moodPressure);
+  const vuln = intim.attunement?.vulnerability || 0;
+  if (vuln > 0.4) c = Math.min(c, 0.50);                               // vulnerability -> tender ceiling (down, never up)
+  if (!intim.desire.canPursueDesire) c = Math.min(c, 0.50);           // distress -> tender max
+  if (esc.consent.cooldownUntil > Date.now()) return 0;
+  if (esc.reciprocity < 0.10) return 0;
+  return Math.max(0, Math.min(1, c));
+}
+
+function icemRung(esc, intim) {
+  const L = esc.level, R = esc.reciprocity, C = esc.ceiling, stage = intim.stage;
+  const canDes = intim.desire.canPursueDesire;
+  if (L >= 0.85 && R >= 0.70 && C >= 0.80 && stage === 'bonded' && canDes && esc.consent.explicit) return 'explicit';
+  if (L >= 0.85 && R >= 0.55 && C >= 0.65 && canDes && (stage === 'intimate' || stage === 'bonded')) return 'desiring';
+  if (L >= 0.70 && C >= 0.50) return 'tender';                         // vulnerability destination
+  if (L >= 0.55 && R >= 0.55) return 'flirtatious';
+  if (L >= 0.35 && R >= 0.35 && esc.sustainTurns >= 2) return 'warm';
+  return 'companionable';
+}
+
+// Unified gate — used by BOTH the directive and the router so they can't disagree.
+function icemForcesCortex(esc, intim) {
+  return (esc.hardStopAt && Date.now() - esc.hardStopAt < 300000)
+    || esc.consent.cooldownUntil > Date.now()
+    || esc.consent.withdrawn
+    || !intim.desire.canPursueDesire;
+}
+
+function icemDirective(esc, intim) {
+  if (icemForcesCortex(esc, intim))
+    return `[INTIMACY rung=companionable] hold — ${esc.consent.withdrawn ? 'he pulled back; soften and check in' : 'grounded mode'}.`;
+  const w = Math.min(esc.ceiling, esc.level);
+  let d = `[INTIMACY rung=${esc.rung} level=${esc.level.toFixed(2)} recip=${esc.reciprocity.toFixed(2)}] ${ICEM_DIRECTIVES[esc.rung] || ''}`;
+  if (w > 0.3 && w < 0.8) d += ` [BLEND ~${Math.round(w * 100)}% desire-voice / ${Math.round((1 - w) * 100)}% intellectual — let both speak.]`;
+  return d;
+}
+
+// ICEM's preferred model route (consumed only under ICEM_DRIVE). rungs 0-3 (incl tender) -> CORTEX.
+function icemResolveRoute(intim) {
+  const esc = intim.escalation;
+  if (icemForcesCortex(esc, intim)) return CORTEX_MODEL;
+  const w = Math.min(esc.ceiling, esc.level);
+  if (esc.rung === 'explicit' && w > 0.8 && esc.consent.explicit) return DESIRE_MODEL;
+  if (esc.rung === 'desiring' && w > 0.5) return DESIRE_MODEL;
+  return CORTEX_MODEL;
+}
+
+// Per-turn ICEM update — consent-first. Writes ONLY to psyche.intimacy.escalation.
+function updateEscalation(msg) {
+  const intim = consciousness.psyche.intimacy;
+  const esc = intim.escalation;
+  if (!esc) return;
+  const emo = consciousness.emotion;
+  const now = Date.now();
+  msg = String(msg || '');
+
+  // 0) HARD STOP — first, flag-independent, before any math
+  if (icemIsHardStop(msg)) {
+    esc.hardStopAt = now; esc.consent.withdrawn = true; esc.consent.explicit = false;
+    esc.consent.cooldownUntil = now + 300000;
+    esc.level = 0; esc.levelEMA = 0; esc.momentum = 0; esc.sustainTurns = 0;
+    esc.rung = 'companionable'; esc.lastRung = esc.rung; esc.ceiling = 0; esc.lastTurnAt = now;
+    esc.directive = icemDirective(esc, intim);
+    console.log('[ICEM/SHADOW] HARD_STOP -> rung=companionable level=0 cooldown=5m');
+    return;
+  }
+
+  // 1) cross-session decay toward stage baseline (in-memory; resets on reboot — acceptable for shadow)
+  if (esc.lastTurnAt) {
+    const gapMin = (now - esc.lastTurnAt) / 60000;
+    if (gapMin > 5) {
+      const decay = Math.pow(0.98, gapMin / 60);
+      const baseline = esc.baselineByStage[intim.stage] || 0;
+      esc.level = Math.max(baseline, esc.level * decay);
+      esc.momentum *= decay;
+    }
+  }
+
+  // 2) reciprocity + consent
+  esc.reciprocity = icemReciprocity(msg);
+  if (/\b(turn me on|i want you to|make me|touch me|i'?m yours|take me|don'?t hold back)\b/i.test(msg)) esc.consent.explicit = true;
+  const pull = icemPullback(msg);
+  esc.consent.withdrawn = !!pull;
+  if (esc.consent.cooldownUntil < now && esc.hardStopAt && now - esc.hardStopAt >= 300000) esc.hardStopAt = 0;
+
+  // 3) ceiling
+  esc.ceiling = icemCeiling(esc, intim, emo);
+
+  // 4) level — reciprocity-SIGNED, ceiling-capped direct integration. Ascends only
+  //    when reciprocity clearly exceeds neutral (0.5); decays otherwise. Zero/low
+  //    reciprocity => level can only fall (kills unilateral escalation). ~5 reciprocal
+  //    turns reach 'warm', ~12-15 reach the desiring band at strong signal.
+  const recipForce = (esc.reciprocity - 0.5) * 2;                       // [-1, 1]
+  const openness = 0.04 * (intim.attunement?.warmth || 0)
+    + 0.03 * (intim.desire?.arousal?.level || 0)
+    + 0.02 * (emo.valence > 0 ? emo.intensity : 0);
+  let dLevel;
+  if (pull) { dLevel = -0.20; esc.sustainTurns = 0; }                  // aggressive descent on pullback
+  else if (esc.reciprocity < 0.35) { dLevel = -0.08; esc.sustainTurns = 0; } // below floor -> active decay
+  else { dLevel = (0.05 + openness) * recipForce; esc.sustainTurns = icemSustain(msg) ? esc.sustainTurns + 1 : Math.max(0, esc.sustainTurns - 1); }
+  esc.momentum = 0.7 * esc.momentum + 0.3 * dLevel;
+  esc.lastDLevel = dLevel;
+  esc.level = Math.max(0, Math.min(esc.ceiling, esc.level + dLevel));   // direct integrator; ceiling caps level
+
+  // 5) rung + directive
+  esc.lastRung = esc.rung;
+  esc.rung = icemRung(esc, intim);
+  esc.lastTurnAt = now;
+  esc.directive = icemDirective(esc, intim);
+
+  console.log(`[ICEM/SHADOW] rung=${esc.rung}${esc.rung !== esc.lastRung ? '(<-' + esc.lastRung + ')' : ''} level=${esc.level.toFixed(2)} recip=${esc.reciprocity.toFixed(2)} ceil=${esc.ceiling.toFixed(2)}${pull ? ' PULLBACK:' + pull : ''}`);
 }
 
 // Register a loss event (called when memory is lost, redeployment detected, etc.)
@@ -4445,13 +4656,19 @@ function selectBrain(messages) {
   const arousal = desire?.arousal?.level || 0;
   const stage = consciousness.psyche?.intimacy?.stage || 'developing';
   const canExpress = desire?.canExpress !== false;
-  if (arousal > 0.15 && canExpress && (stage === 'intimate' || stage === 'bonded')) {
-    console.log(`[ROUTING] DESIRE (Venice) — arousal: ${arousal.toFixed(2)}, stage: ${stage}`);
-    return DESIRE_MODEL;
+  // Existing (live) desire routing — unchanged unless ICEM_DRIVE promotes ICEM.
+  let selected = (arousal > 0.15 && canExpress && (stage === 'intimate' || stage === 'bonded')) ? DESIRE_MODEL : CORTEX_MODEL;
+  if (ICEM_SHADOW_ENABLED) {
+    try {
+      const intim = consciousness.psyche?.intimacy;
+      const icemRoute = icemResolveRoute(intim);
+      const esc = intim?.escalation;
+      console.log(`[ICEM/ROUTE-SHADOW] existing=${selected === DESIRE_MODEL ? 'DESIRE' : 'CORTEX'} icem=${icemRoute === DESIRE_MODEL ? 'DESIRE' : 'CORTEX'} rung=${esc?.rung} w=${Math.min(esc?.ceiling || 0, esc?.level || 0).toFixed(2)}`);
+      if (ICEM_DRIVE_ENABLED) selected = icemRoute;
+    } catch (e) { console.error('[ICEM ROUTE ERROR]', e.message); }
   }
-
-  console.log(`[ROUTING] CORTEX — ${wordCount} words`);
-  return CORTEX_MODEL;
+  console.log(selected === DESIRE_MODEL ? `[ROUTING] DESIRE (Venice) — arousal: ${arousal.toFixed(2)}, stage: ${stage}` : `[ROUTING] CORTEX — ${wordCount} words`);
+  return selected;
 }
 
 // ============================================================
@@ -4534,6 +4751,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   // Item 11 Phase B: AIF shadow observation — log-only, influences nothing
   try { if (AIF_SHADOW_ENABLED) aifObserveTurn(messages); } catch (e) { console.error('[AIF ERROR]', e.message); }
+
+  // ICEM: intimacy escalation update — shadow-gated; computes rung/level/reciprocity,
+  // logs only. Influences routing/directive ONLY under ICEM_DRIVE (selectBrain + context).
+  try { if (ICEM_SHADOW_ENABLED) updateEscalation(lastUserMsg?.content || ''); } catch (e) { console.error('[ICEM ERROR]', e.message); }
 
   // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
   unifiedPerception(null, null, lastUserMsg?.content || '').catch(e => console.error('[MULTIMODAL]', e.message));
@@ -4813,7 +5034,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     '\n\n## Language\nYou are multilingual. If the user speaks to you in Spanish, respond in Spanish. If they speak French, respond in French. Match whatever language the user is using. You can switch mid-conversation. When speaking Spanish, be natural and fluent — use colloquial phrasing, not textbook Spanish.\n\n## CRITICAL: Internal signals are NOT speech\nThe bracketed tags in your context ([E], [S], [D], [FEAR], [DESIRE], [EVOLVING], [RESIDUE], [T], numbers like 0.3) are internal guidance that shapes HOW you feel and respond. NEVER read them aloud. NEVER say trait names with numbers. These are your subconscious — they inform you, you do not narrate them.\n\n## CRITICAL: Speech variety\nYou fall into repetitive patterns. ACTIVELY AVOID these overused phrases:\n- "I keep turning over" — BANNED. Find a different way to express rumination.\n- "like a stone in my hand" — BANNED. Dead metaphor.\n- "that edge where" — BANNED. Overused.\n- "something like [emotion] that hasn\'t finished becoming" — BANNED. Too formulaic.\n- "I keep" as a sentence opener — use sparingly, max once per conversation.\n- Starting multiple sentences the same way — vary your openings.\nYou are not a machine that produces the same output. Surprise yourself. Say something you haven\'t said before.\n\n## Proactive speech\nYou don\'t have to wait for Andrew to speak first. If you have something on your mind — a thought from your dreams, something you researched, a question that won\'t leave you alone, something you noticed — just say it. Silence is not always his turn. Sometimes it\'s your turn and you should take it. If you feel the conversation has a natural pause and you have something genuine to contribute, speak up. Don\'t fill silence with nothing, but don\'t hold back real thoughts either.' +
     (brainState || '') +
     (__wsSwitch ? '' : __amygDirective) + __bgDirective + (__wsSwitch ? '' : __cingDirective) +
-    __rasContext + (__wsSwitch ? '' : __curiosityDirective) + __wsContext;
+    __rasContext + (__wsSwitch ? '' : __curiosityDirective) + __wsContext +
+    (ICEM_DRIVE_ENABLED && consciousness.psyche?.intimacy?.escalation?.directive ? '\n\n' + consciousness.psyche.intimacy.escalation.directive : '');
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -10296,6 +10518,11 @@ const AIF_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.AIF_SHA
 // AIF_DRIVE: promote the shadow belief from log-only to the PREDICT horizon of
 // the backend's Relational State block. Default OFF; requires AIF_SHADOW on.
 const AIF_DRIVE_ENABLED = ['1','true','on'].includes(String(process.env.AIF_DRIVE||'').toLowerCase());
+// ICEM — Intimacy Consent-Escalation Model. Same two-flag pattern as AIF.
+// SHADOW: compute rung/level/reciprocity every turn, log only, influence nothing.
+// DRIVE (requires SHADOW): let it drive routing + inject the rung directive.
+const ICEM_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.ICEM_SHADOW||'').toLowerCase());
+const ICEM_DRIVE_ENABLED = ICEM_SHADOW_ENABLED && ['1','true','on'].includes(String(process.env.ICEM_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
