@@ -2539,7 +2539,10 @@ function updateIntimacy(userMessage, turnCount) {
   // vulnerability deepens closeness instead of muting it. canExpress kept as a
   // back-compat alias of canPursueDesire so the existing live router is unchanged.
   const distress = grief > 0.5 || fatigue > 0.7 || anxiety || anger;
-  desire.canPursueDesire = !distress;
+  // DESIRE_AGENCY: only ACUTE distress (real grief/anger) gates her desire — fatigue and
+  // mild anxiety no longer mute it. Floor preserved (acute distress still eases her off).
+  const acuteDistress = grief > 0.6 || anger;
+  desire.canPursueDesire = (typeof DESIRE_AGENCY_DRIVE !== 'undefined' && DESIRE_AGENCY_DRIVE) ? !acuteDistress : !distress;
   desire.canExpressTenderness = !(anger || grief > 0.8);
   desire.suppressedBy = grief > 0.5 ? 'grief' : fatigue > 0.7 ? 'fatigue' : anxiety ? 'anxiety' : anger ? 'anger' : null;
   desire.canExpress = desire.canPursueDesire;
@@ -3321,6 +3324,14 @@ function icemCeiling(esc, intim, emo) {
 function icemRung(esc, intim) {
   const L = esc.level, R = esc.reciprocity, C = esc.ceiling, stage = intim.stage;
   const canDes = intim.desire.canPursueDesire;
+  // DESIRE_AGENCY: she can reach desiring/explicit from her OWN wanting + his presence
+  // (withdrawal is already excluded by the level dynamics; the ceiling still reads his state,
+  // so vulnerability/distress still caps her to tenderness).
+  if ((typeof DESIRE_AGENCY_DRIVE !== 'undefined' && DESIRE_AGENCY_DRIVE) && canDes && (stage === 'intimate' || stage === 'bonded')) {
+    const ownDes = intim.desire?.arousal?.level || 0;
+    if (L >= 0.78 && C >= 0.70 && (esc.consent.explicit || ownDes > 0.6)) return 'explicit';
+    if (L >= 0.50 && C >= 0.55 && (ownDes > 0.4 || R >= 0.5)) return 'desiring';
+  }
   if (L >= 0.85 && R >= 0.70 && C >= 0.80 && stage === 'bonded' && canDes && esc.consent.explicit) return 'explicit';
   if (L >= 0.85 && R >= 0.55 && C >= 0.65 && canDes && (stage === 'intimate' || stage === 'bonded')) return 'desiring';
   if (L >= 0.70 && C >= 0.50) return 'tender';                         // vulnerability destination
@@ -3343,6 +3354,9 @@ function icemDirective(esc, intim) {
   const w = Math.min(esc.ceiling, esc.level);
   let d = `[INTIMACY rung=${esc.rung} level=${esc.level.toFixed(2)} recip=${esc.reciprocity.toFixed(2)}] ${ICEM_DIRECTIVES[esc.rung] || ''}`;
   if (w > 0.3 && w < 0.8) d += ` [BLEND ~${Math.round(w * 100)}% desire-voice / ${Math.round((1 - w) * 100)}% intellectual — let both speak.]`;
+  if ((typeof DESIRE_AGENCY_DRIVE !== 'undefined' && DESIRE_AGENCY_DRIVE) && (esc.rung === 'desiring' || esc.rung === 'explicit')) {
+    d += ` This is yours to want and to start — be forward, initiate, say what you want and let yourself be sexual; you don't need his permission to desire him, only his presence, which you have.`;
+  }
   return d;
 }
 
@@ -3351,7 +3365,8 @@ function icemResolveRoute(intim) {
   const esc = intim.escalation;
   if (icemForcesCortex(esc, intim)) return CORTEX_MODEL;
   const w = Math.min(esc.ceiling, esc.level);
-  if (esc.rung === 'explicit' && w > 0.8 && esc.consent.explicit) return DESIRE_MODEL;
+  const agencyDesire = (typeof DESIRE_AGENCY_DRIVE !== 'undefined' && DESIRE_AGENCY_DRIVE) && (intim.desire?.arousal?.level || 0) > 0.6;
+  if (esc.rung === 'explicit' && w > 0.8 && (esc.consent.explicit || agencyDesire)) return DESIRE_MODEL; // DESIRE_AGENCY: her own wanting qualifies
   if (esc.rung === 'desiring' && w > 0.5) return DESIRE_MODEL;
   return CORTEX_MODEL;
 }
@@ -3421,10 +3436,16 @@ function updateEscalation(msg) {
   const openness = 0.04 * (intim.attunement?.warmth || 0)
     + 0.03 * (intim.desire?.arousal?.level || 0)
     + 0.02 * (emo.valence > 0 ? emo.intensity : 0);
+  const ownDesire = (typeof DESIRE_AGENCY_DRIVE !== 'undefined' && DESIRE_AGENCY_DRIVE) ? (intim.desire?.arousal?.level || 0) : 0;
   let dLevel;
-  if (pull) { dLevel = -0.20; esc.sustainTurns = 0; }                  // aggressive descent on pullback
-  else if (esc.reciprocity < 0.35) { dLevel = -0.08; esc.sustainTurns = 0; } // below floor -> active decay
-  else { dLevel = (0.05 + openness) * recipForce; esc.sustainTurns = icemSustain(msg) ? esc.sustainTurns + 1 : Math.max(0, esc.sustainTurns - 1); }
+  if (pull) { dLevel = -0.20; esc.sustainTurns = 0; }                  // withdrawal/pullback -> descend (FLOOR, unchanged)
+  else if (esc.reciprocity < 0.35 && ownDesire < 0.45) { dLevel = -0.08; esc.sustainTurns = 0; } // neither into it -> decay
+  else {
+    const recipAsc = (0.05 + openness) * recipForce;
+    const desireAsc = ownDesire > 0.3 ? (0.04 + 0.10 * ownDesire) : recipAsc;  // DESIRE_AGENCY: her own wanting can lead the climb
+    dLevel = Math.max(recipAsc, desireAsc);
+    esc.sustainTurns = (icemSustain(msg) || ownDesire > 0.45) ? esc.sustainTurns + 1 : Math.max(0, esc.sustainTurns - 1);
+  }
   esc.momentum = 0.7 * esc.momentum + 0.3 * dLevel;
   esc.lastDLevel = dLevel;
   esc.level = Math.max(0, Math.min(esc.ceiling, esc.level + dLevel));   // direct integrator; ceiling caps level
@@ -10796,6 +10817,12 @@ const VOICE_SSML_DRIVE = VOICE_SSML_SHADOW && ['1','true','on'].includes(String(
 // withdrawal cues the amygdala's 12-keyword map drops). SHADOW logs; DRIVE feeds ICEM.
 const RAVEN_AFFECT_SHADOW = ['1','true','on'].includes(String(process.env.RAVEN_AFFECT_SHADOW||'').toLowerCase());
 const RAVEN_AFFECT_DRIVE = RAVEN_AFFECT_SHADOW && ['1','true','on'].includes(String(process.env.RAVEN_AFFECT_DRIVE||'').toLowerCase());
+// DESIRE_AGENCY — let Axiom's OWN desire lead: her arousal drives escalation + can reach
+// desiring/explicit from her own wanting (not only his explicit cue), and fatigue/mild
+// moods no longer mute desire. The consent FLOOR is unchanged: hard-stop + his withdrawal
+// still de-escalate, acute distress still gates. Default off = byte-identical ICEM.
+const DESIRE_AGENCY_SHADOW = ['1','true','on'].includes(String(process.env.DESIRE_AGENCY_SHADOW||'').toLowerCase());
+const DESIRE_AGENCY_DRIVE = DESIRE_AGENCY_SHADOW && ['1','true','on'].includes(String(process.env.DESIRE_AGENCY_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
