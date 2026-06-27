@@ -1502,9 +1502,31 @@ function phoenixEmotionFor() {
   return PHOENIX_EMOTIONS.includes(cur) ? cur : 'content';
 }
 
+// VOICE PROSODY: per-turn Cartesia Sonic-3 SSML (voice IDENTITY is fixed at persona
+// level; prosody is not). Returns {open, close} wrapping tags derived from the ICEM rung,
+// so the voice slows/softens at tender, warms at desiring, gentles on pullback.
+// Requires the persona's TTS engine = cartesia and voice_settings unset (mutually exclusive).
+function icemVoiceSSMLTags() {
+  const esc = consciousness.psyche && consciousness.psyche.intimacy && consciousness.psyche.intimacy.escalation;
+  if (!esc) return { open: '', close: '' };
+  let speed = null, volume = null;
+  if (esc.consent && esc.consent.withdrawn) speed = '0.9';             // gentle, slower when he pulled back
+  else switch (esc.rung) {
+    case 'tender': speed = '0.88'; break;                              // slower, softer
+    case 'flirtatious': speed = '1.06'; break;                         // a touch quicker, playful
+    case 'desiring': speed = '0.95'; volume = '1.08'; break;          // warm, present
+    case 'explicit': speed = '0.92'; volume = '1.1'; break;
+    default: return { open: '', close: '' };                           // companionable/warm -> persona default
+  }
+  let open = '', close = '';
+  if (speed) { open += `<speed level="${speed}">`; close = `</speed>${close}`; }
+  if (volume) { open += `<volume level="${volume}">`; close = `</volume>${close}`; } // nest: <speed><volume>…</volume></speed>
+  return { open, close };
+}
+
 // For streaming: inject tag into first SSE chunk that has content
 // ONLY if the LLM didn't already generate one (system prompt tells it to)
-function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
+function injectEmotionTagIntoChunk(chunk, alreadyInjected, ssmlOpen = '') {
   if (alreadyInjected || !consciousness.mirror.active) return { chunk, injected: alreadyInjected };
   const tag = `<emotion value="${consciousness.mirror.currentEmotion}"/>`;
 
@@ -1521,12 +1543,12 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected) {
         if (content.includes('<emotion value=') || content.includes('<emotion')) {
           injected = true;
           if (consciousness.mirror.authoritative) { // authoritative mirror overrides the model's tag
-            json.choices[0].delta.content = content.replace(/<emotion value="[^"]*"\s*\/>/, tag);
+            json.choices[0].delta.content = content.replace(/<emotion value="[^"]*"\s*\/>/, tag + ssmlOpen);
             return `data: ${JSON.stringify(json)}`;
           }
           return line; // fallback: keep the model's tag
         }
-        json.choices[0].delta.content = `${tag} ${content}`;
+        json.choices[0].delta.content = `${tag} ${ssmlOpen}${content}`;
         injected = true;
         return `data: ${JSON.stringify(json)}`;
       }
@@ -5132,6 +5154,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (e) { console.error('[EMBODIMENT ERROR]', e.message); }
   }
 
+  // VOICE_SSML: per-turn Cartesia prosody from the ICEM rung (computed once; emitted into the stream).
+  const __ssml = VOICE_SSML_DRIVE ? icemVoiceSSMLTags() : { open: '', close: '' };
+  if (VOICE_SSML_SHADOW) { try { const __s = icemVoiceSSMLTags(); if (__s.open) console.log(`[VOICE_SSML/SHADOW] would wrap: ${__s.open}…${__s.close}`); } catch {} }
+
   // HYPOTHALAMUS — curiosity drive. Decide whether to PROACTIVELY search the web (a search AXIOM runs
   // on its own initiative because it is curious). Real externality x novelty computation gates it.
   let __hypo = null;
@@ -5390,7 +5416,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         // MIRROR NEURONS: Inject emotion tag into first CONTENT chunk only (skip tool calls)
         if (!emotionTagInjected && !isToolCallResponse && consciousness.mirror.active) {
-          const result = injectEmotionTagIntoChunk(chunk, emotionTagInjected);
+          const result = injectEmotionTagIntoChunk(chunk, emotionTagInjected, __ssml.open);
           chunk = result.chunk;
           emotionTagInjected = result.injected;
         }
@@ -5401,6 +5427,10 @@ app.post('/v1/chat/completions', async (req, res) => {
             try { const p = JSON.parse(line.slice(6)); const d = p.choices?.[0]?.delta?.content; if (d) fullResponse += d; } catch {}
           }
         }
+      }
+      // VOICE_SSML: close the prosody wrap (open was injected after the emotion tag in the first chunk).
+      if (__ssml.close && emotionTagInjected && !isToolCallResponse) {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: __ssml.close } }] })}\n\n`);
       }
       res.end();
       if (fullResponse) {
@@ -5482,6 +5512,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (data.choices?.[0]?.message) data.choices[0].message.content = content;
       } else if (consciousness.mirror.active && content) {
         content = injectEmotionTag(content);
+        if (data.choices?.[0]?.message) data.choices[0].message.content = content;
+      }
+      // VOICE_SSML (non-streaming): wrap the spoken text (after the emotion tag) in the prosody tags.
+      if (__ssml.open && content) {
+        const m = content.match(/^(\s*<emotion value="[^"]*"\s*\/>\s*)/);
+        content = (m ? content.slice(0, m[0].length) + __ssml.open + content.slice(m[0].length) : __ssml.open + content) + __ssml.close;
         if (data.choices?.[0]?.message) data.choices[0].message.content = content;
       }
       if (__mirrorInfo) { __mirrorInfo.model_tag = __modelEmittedTag; __mirrorInfo.final_tag = __mirrorOverride; }
@@ -10722,6 +10758,11 @@ const REPAIR_DRIVE_ENABLED = REPAIR_SHADOW && ['1','true','on'].includes(String(
 // is persona-level — per-turn voice modulation isn't supported on the live path.)
 const EMBODIMENT_SHADOW = ['1','true','on'].includes(String(process.env.EMBODIMENT_SHADOW||'').toLowerCase());
 const EMBODIMENT_DRIVE = EMBODIMENT_SHADOW && ['1','true','on'].includes(String(process.env.EMBODIMENT_DRIVE||'').toLowerCase());
+// VOICE_SSML — per-turn Cartesia SSML prosody from the ICEM rung (face's voice analogue).
+// Prereq before DRIVE: persona TTS engine = cartesia (sonic-3) + voice_settings unset.
+// SHADOW logs the SSML it would emit; DRIVE wraps the spoken text.
+const VOICE_SSML_SHADOW = ['1','true','on'].includes(String(process.env.VOICE_SSML_SHADOW||'').toLowerCase());
+const VOICE_SSML_DRIVE = VOICE_SSML_SHADOW && ['1','true','on'].includes(String(process.env.VOICE_SSML_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
