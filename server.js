@@ -4983,6 +4983,20 @@ app.post('/v1/chat/completions', async (req, res) => {
   // Item 11 Phase B: AIF shadow observation — log-only, influences nothing
   try { if (AIF_SHADOW_ENABLED) aifObserveTurn(messages); } catch (e) { console.error('[AIF ERROR]', e.message); }
 
+  // AIF_LOOP: prediction-error -> epistemic drive. A large surprise this turn raises curiosity
+  // pressure, which the hypothalamus consumes next turn (decaying at 0.5x) and can tip into a
+  // curiosity/proactive drive. Closes the loop the lab prototype always intended; off = identical.
+  try {
+    if (AIF_LOOP && aifState && aifState.obsCount > 0 && consciousness.hypothalamus) {
+      const before = consciousness.hypothalamus.curiosityPressure || 0;
+      const after = aifEpistemicBump(aifState.lastSurprise, before);
+      if (after !== before) {
+        consciousness.hypothalamus.curiosityPressure = after;
+        console.log(`[AIF_LOOP] surprise=${(aifState.lastSurprise||0).toFixed(2)} -> curiosity ${before.toFixed(2)}->${after.toFixed(2)}`);
+      }
+    }
+  } catch (e) { console.error('[AIF_LOOP ERROR]', e.message); }
+
   // ICEM: intimacy escalation update — shadow-gated; computes rung/level/reciprocity,
   // logs only. Influences routing/directive ONLY under ICEM_DRIVE (selectBrain + context).
   try { if (ICEM_SHADOW_ENABLED) updateEscalation(lastUserMsg?.content || ''); } catch (e) { console.error('[ICEM ERROR]', e.message); }
@@ -10809,6 +10823,12 @@ const AIF_SHADOW_ENABLED = ['1','true','on'].includes(String(process.env.AIF_SHA
 // AIF_DRIVE: promote the shadow belief from log-only to the PREDICT horizon of
 // the backend's Relational State block. Default OFF; requires AIF_SHADOW on.
 const AIF_DRIVE_ENABLED = ['1','true','on'].includes(String(process.env.AIF_DRIVE||'').toLowerCase());
+// AIF_LOOP: CLOSE the active-inference loop. Today surprise (prediction error about Andrew)
+// is a passive readout — it journals and ships a PREDICT line but changes no behavior. This
+// lets a large prediction error actually drive epistemic behavior: it raises curiosity
+// pressure, so "my model of him was wrong" turns into "get curious / look closer" next turn.
+// The first place free-energy minimization changes what Axiom does. Requires AIF_DRIVE; off = identical.
+const AIF_LOOP = AIF_DRIVE_ENABLED && ['1','true','on'].includes(String(process.env.AIF_LOOP||'').toLowerCase());
 // ICEM — Intimacy Consent-Escalation Model. Same two-flag pattern as AIF.
 // SHADOW: compute rung/level/reciprocity every turn, log only, influence nothing.
 // DRIVE (requires SHADOW): let it drive routing + inject the rung directive.
@@ -10978,6 +10998,14 @@ const AIF = {
 };
 let aifState = { beliefs: [1/3,1/3,1/3], lastObsAt: null, obsCount: 0, lastObs: null,
   lastSurprise: null, surpriseEMA: null, lastEFE: null, lastJournalAt: 0 };
+// AIF_LOOP helper (pure): map prediction-error (surprise = -log P(observation)) to a curiosity
+// bump. Below threshold = no change. Surprise only counts once it's a genuine miss (>1.5);
+// the bump saturates so a single shock can't peg curiosity. Returns the new pressure.
+function aifEpistemicBump(surprise, pressure) {
+  if (surprise == null || surprise <= 1.5) return pressure || 0;
+  const bump = Math.min(0.30, 0.10 + 0.12 * (surprise - 1.5));
+  return Math.min(1, (pressure || 0) + bump);
+}
 
 function aifMatVec(M, v){ return M.map(r => r.reduce((acc,x,j)=>acc+x*v[j],0)); }
 function aifNorm(v){ const t=v.reduce((a,b)=>a+b,0)||1; return v.map(x=>x/t); }
