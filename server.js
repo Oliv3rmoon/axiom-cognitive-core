@@ -3232,6 +3232,17 @@ const ICEM_DIRECTIVES = {
   explicit: 'Full intimate expression — reciprocated and consented.',
 };
 
+// RAVEN AFFECT: read the latest Raven-1 natural-language perception (richer than the
+// 12-keyword amygdala map) for engagement vs. withdrawal cues the map drops. Gated by
+// RAVEN_AFFECT_DRIVE inside the ICEM signals below; default off.
+const RAVEN_WITHDRAWAL = /\b(skeptical|distant|leaning away|leaned away|look(ing|ed)? away|glanc\w* away|distracted|disengag\w*|guarded|uncomfortable|closed off|arms crossed|frown\w*|tense|withdrawn|pulling away|pulled away|avoidant|checked out|unimpressed|wary|hesitant|stiffen\w*|unsettled|flat affect)\b/i;
+const RAVEN_OPENING = /\b(leaning in|leaned in|smil\w*|warm\w*|soften\w*|soft expression|relaxed|eye contact|holding (your |the )?gaze|nodding|open expression|brighten\w*|delighted|drawn in|attentive|leaning closer|blush\w*|tender)\b/i;
+function ravenAffect() {
+  const txt = (consciousness.perception && consciousness.perception.lastFrame) || '';
+  if (!txt) return { withdrawal: false, opening: false };
+  return { withdrawal: RAVEN_WITHDRAWAL.test(txt), opening: RAVEN_OPENING.test(txt) };
+}
+
 function icemReciprocity(msg) {
   let r = 0.5;
   const b = (typeof aifState !== 'undefined' && aifState.beliefs) || [1/3, 1/3, 1/3];
@@ -3251,11 +3262,21 @@ function icemReciprocity(msg) {
   const opening = /\b(want you|need you|miss you|closer|come here|kiss|hold me|don'?t stop|i want|tell me what|show me)\b/i.test(msg);
   const closing = /\b(actually|never ?mind|forget it|bad idea|i can'?t do this|let'?s not)\b/i.test(msg);
   if (opening && !closing) r += 0.12; else if (closing) r -= 0.12;
+  // Raven-1 live facial/vocal read (richer than amygdala's 12-keyword map)
+  if (typeof RAVEN_AFFECT_DRIVE !== 'undefined' && RAVEN_AFFECT_DRIVE) {
+    const ra = ravenAffect();
+    if (ra.opening && !ra.withdrawal) r += 0.12; else if (ra.withdrawal) r -= 0.15;
+  }
   return Math.max(0, Math.min(1, r));
 }
 
 function icemPullback(msg) {
   const emo = consciousness.emotion;
+  // Raven-1 facial/vocal withdrawal cues the amygdala map misses (skeptical, leaning away…)
+  if (typeof RAVEN_AFFECT_DRIVE !== 'undefined' && RAVEN_AFFECT_DRIVE) {
+    const ra = ravenAffect();
+    if (ra.withdrawal && !ra.opening) return 'ravenWithdrawal';
+  }
   const contra = (consciousness.contradictions || []).filter(x =>
     Date.now() - (x.timestamp || 0) < 60000 && /mismatch|disconnect|holding back|forced|fake/i.test((x.what || '') + (x.detail || '')));
   if (contra.length) return 'voiceWordMismatch';
@@ -4950,6 +4971,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   // REPAIR/LOSS: shadow-log the repair/cascade directive it WOULD inject.
   try { if (REPAIR_SHADOW) { const __rd = buildRepairDirective(); if (__rd) console.log('[REPAIR/SHADOW]', __rd.replace(/\n/g, ' | ').slice(0, 180)); } } catch (e) { console.error('[REPAIR ERROR]', e.message); }
+
+  // RAVEN_AFFECT: shadow-log what the live Raven read would contribute to ICEM reciprocity/pullback.
+  try { if (RAVEN_AFFECT_SHADOW) { const __ra = ravenAffect(); if (__ra.withdrawal || __ra.opening) console.log(`[RAVEN_AFFECT/SHADOW] withdrawal=${__ra.withdrawal} opening=${__ra.opening}`); } } catch (e) {}
 
   // MULTIMODAL PERCEPTION — unified encoding of text (+ vision/audio when available)
   unifiedPerception(null, null, lastUserMsg?.content || '').catch(e => console.error('[MULTIMODAL]', e.message));
@@ -10763,6 +10787,10 @@ const EMBODIMENT_DRIVE = EMBODIMENT_SHADOW && ['1','true','on'].includes(String(
 // SHADOW logs the SSML it would emit; DRIVE wraps the spoken text.
 const VOICE_SSML_SHADOW = ['1','true','on'].includes(String(process.env.VOICE_SSML_SHADOW||'').toLowerCase());
 const VOICE_SSML_DRIVE = VOICE_SSML_SHADOW && ['1','true','on'].includes(String(process.env.VOICE_SSML_DRIVE||'').toLowerCase());
+// RAVEN_AFFECT — let ICEM reciprocity/pullback read Raven-1's rich NL affect (engagement/
+// withdrawal cues the amygdala's 12-keyword map drops). SHADOW logs; DRIVE feeds ICEM.
+const RAVEN_AFFECT_SHADOW = ['1','true','on'].includes(String(process.env.RAVEN_AFFECT_SHADOW||'').toLowerCase());
+const RAVEN_AFFECT_DRIVE = RAVEN_AFFECT_SHADOW && ['1','true','on'].includes(String(process.env.RAVEN_AFFECT_DRIVE||'').toLowerCase());
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
