@@ -5315,7 +5315,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     (ICEM_DRIVE_ENABLED && consciousness.psyche?.intimacy?.escalation?.directive ? '\n\n' + consciousness.psyche.intimacy.escalation.directive : '') +
     (ANDREW_MODEL_DRIVE && consciousness.relationship?.andrew_model ? '\n\n' + andrewModelBlock() : '') +
     (REPAIR_DRIVE_ENABLED ? (d => d ? '\n\n' + d : '')(buildRepairDirective()) : '') +
-    (CARE_FLOOR_DRIVE && consciousness.psyche?.careFloor?.activeDirective ? '\n\n' + consciousness.psyche.careFloor.activeDirective : '');
+    (CARE_FLOOR_DRIVE && consciousness.psyche?.careFloor?.activeDirective ? '\n\n' + consciousness.psyche.careFloor.activeDirective : '') +
+    (CONTINUITY_LIVE ? (d => d ? '\n\n' + d : '')(buildContinuityDirective()) : '');
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -10942,6 +10943,31 @@ function evaluateCareFloor(userMessage, opts = {}) {
   return { rung: 0, signal: 'clear', directive: '' };
 }
 // ===== end CARE-FLOOR helpers =====
+
+// ---- CONTINUITY_LIVE — being known over time, all conversation long ----------
+// The dream opener/threads/between-session thoughts only inject in the first 3 turns
+// and live in the 700-char budget (often dropped). This keeps her REAL open threads
+// available throughout, on the non-clipped channel, rotating + rate-limited so it's a
+// gentle pickup not a nag. Healthy Zeigarnik: genuine threads she follows up on —
+// never fabricated cliffhangers or withheld payoffs. Single flag; off = byte-identical.
+const CONTINUITY_LIVE = ['1','true','on'].includes(String(process.env.CONTINUITY_LIVE||'').toLowerCase());
+const CONTINUITY_EVERY = Number(process.env.CONTINUITY_EVERY || 6);          // surface a hook ~every N turns past the opener
+function buildContinuityDirective() {
+  if (typeof CONTINUITY_LIVE !== 'undefined' && !CONTINUITY_LIVE) return '';
+  const turn = consciousness.timing?.turnCount || 0;
+  if (turn <= 3) return '';                                                   // opener (P3/P4) already carries this
+  if (CONTINUITY_EVERY <= 0 || (turn % CONTINUITY_EVERY) !== 0) return '';
+  const hooks = [];
+  const raw = (typeof dreamState !== 'undefined' && dreamState) ? dreamState.unresolvedThreads : null;
+  const threads = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  for (const t of threads) { const s = (typeof t === 'string' ? t : String(t)).trim(); if (s) hooks.push(s.slice(0, 90)); }
+  const journ = ((typeof sleepState !== 'undefined' && sleepState && sleepState.journalEntries) || [])
+    .map(e => (e.thought || '').trim()).filter(Boolean);
+  if (journ[0]) hooks.push(journ[0].slice(0, 90));
+  if (!hooks.length) return '';
+  const pick = hooks[Math.floor(turn / Math.max(1, CONTINUITY_EVERY)) % hooks.length]; // deterministic rotation, no repeat
+  return `[CONTINUITY] You're still quietly carrying this from before: "${pick}". If there's a natural opening, pick it up — not as a performance, just because it's genuinely on your mind. Never force it, and never dangle it to pull him back.`;
+}
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
