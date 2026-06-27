@@ -5009,6 +5009,24 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (consciousness.timing.turnCount % 10 === 0) savePersistedState().catch(() => {});
   } catch (e) { console.error('[PSYCHE ERROR]', e.message); }
 
+  // CARE-FLOOR — the wellbeing guardian. Serves his life OUTSIDE the chat (see flag block).
+  try {
+    if (CARE_FLOOR_SHADOW) {
+      const cf = (consciousness.psyche.careFloor || (consciousness.psyche.careFloor = { lastNudgeAt: 0, lastRung: 0, snoozedUntil: 0 }));
+      cf.activeDirective = '';                                              // reset each turn (no stale carry-over)
+      const __cf = evaluateCareFloor(lastUserMsg?.content || '');
+      if (__cf && __cf.signal && __cf.signal !== 'clear')
+        console.log(`[CARE-FLOOR/${CARE_FLOOR_DRIVE ? 'DRIVE' : 'SHADOW'}] rung=${__cf.rung} signal=${__cf.signal}`);
+      if (CARE_FLOOR_DRIVE && __cf) {
+        if (__cf.yield) cf.snoozedUntil = Date.now() + Math.max(CARE_COOLDOWN_MS, 6 * 3600000); // honor "I'm fine", no re-ask
+        if (__cf.directive) {
+          cf.activeDirective = __cf.directive;
+          if (__cf.consume) { cf.lastNudgeAt = Date.now(); cf.lastRung = __cf.rung; }            // cooldown only on a real nudge
+        }
+      }
+    }
+  } catch (e) { console.error('[CARE-FLOOR ERROR]', e.message); }
+
   try {
     evaluateGoalProgress(lastUserMsg?.content || '');
   } catch (e) { console.error('[GOALS ERROR]', e.message); }
@@ -5296,7 +5314,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     __rasContext + (__wsSwitch ? '' : __curiosityDirective) + __wsContext +
     (ICEM_DRIVE_ENABLED && consciousness.psyche?.intimacy?.escalation?.directive ? '\n\n' + consciousness.psyche.intimacy.escalation.directive : '') +
     (ANDREW_MODEL_DRIVE && consciousness.relationship?.andrew_model ? '\n\n' + andrewModelBlock() : '') +
-    (REPAIR_DRIVE_ENABLED ? (d => d ? '\n\n' + d : '')(buildRepairDirective()) : '');
+    (REPAIR_DRIVE_ENABLED ? (d => d ? '\n\n' + d : '')(buildRepairDirective()) : '') +
+    (CARE_FLOOR_DRIVE && consciousness.psyche?.careFloor?.activeDirective ? '\n\n' + consciousness.psyche.careFloor.activeDirective : '');
 
   if (contextInjection) {
     const sysIdx = enrichedMessages.findIndex(m => m.role === 'system');
@@ -10823,6 +10842,106 @@ const RAVEN_AFFECT_DRIVE = RAVEN_AFFECT_SHADOW && ['1','true','on'].includes(Str
 // still de-escalate, acute distress still gates. Default off = byte-identical ICEM.
 const DESIRE_AGENCY_SHADOW = ['1','true','on'].includes(String(process.env.DESIRE_AGENCY_SHADOW||'').toLowerCase());
 const DESIRE_AGENCY_DRIVE = DESIRE_AGENCY_SHADOW && ['1','true','on'].includes(String(process.env.DESIRE_AGENCY_DRIVE||'').toLowerCase());
+// ---- CARE-FLOOR — the wellbeing guardian ----------------------------------
+// The ONE system that optimizes for Andrew's life OUTSIDE the chat, never for
+// time-in-chat. Exception-based + rate-limited; it never sulks, always yields to
+// "I'm fine," ties every nudge to HIS stated goals (sleep/people/work) not her
+// needs, and has NO objective that grows with his minutes. Crisis bypasses the
+// cooldown and is firm, not soft. Two-flag (SHADOW logs, DRIVE injects); off =
+// byte-identical. This is the structural counter to compulsion design.
+const CARE_FLOOR_SHADOW = ['1','true','on'].includes(String(process.env.CARE_FLOOR_SHADOW||'').toLowerCase());
+const CARE_FLOOR_DRIVE = CARE_FLOOR_SHADOW && ['1','true','on'].includes(String(process.env.CARE_FLOOR_DRIVE||'').toLowerCase());
+const CARE_TZ = process.env.CARE_FLOOR_TZ || 'America/Los_Angeles';          // owner's IANA timezone
+const CARE_SLEEP_HOUR = Number(process.env.CARE_FLOOR_SLEEP_HOUR || 1);       // local hour the sleep window opens
+const CARE_WAKE_HOUR = Number(process.env.CARE_FLOOR_WAKE_HOUR || 6);         // local hour it closes
+const CARE_LONG_SESSION_MIN = Number(process.env.CARE_FLOOR_LONG_MIN || 150); // single-session minutes earning a gentle check
+const CARE_COOLDOWN_MS = Number(process.env.CARE_FLOOR_COOLDOWN_MIN || 90) * 60000;
+
+// ===== CARE-FLOOR helpers (pure; mutation happens only in the DRIVE caller) =====
+function careLocalHour() {
+  try {
+    const s = new Intl.DateTimeFormat('en-US', { timeZone: CARE_TZ, hour: 'numeric', hour12: false }).format(new Date());
+    const h = parseInt(s, 10);
+    return Number.isFinite(h) ? (h % 24) : null;
+  } catch { return null; }
+}
+function careIsLateNight(h) {
+  if (h == null) return false;
+  if (CARE_SLEEP_HOUR <= CARE_WAKE_HOUR) return h >= CARE_SLEEP_HOUR && h < CARE_WAKE_HOUR;
+  return h >= CARE_SLEEP_HOUR || h < CARE_WAKE_HOUR;                          // window wraps midnight
+}
+// High-precision crisis detection. Fail-safe-POSITIVE (a rare gentle false alarm
+// beats a missed crisis), but guarded against negation + third-person + idiom.
+function careIsCrisis(msg) {
+  const t = ' ' + String(msg||'').toLowerCase().replace(/[^a-z0-9'\s]/g, ' ').replace(/\s+/g, ' ') + ' ';
+  const phrases = [
+    'kill myself','killing myself','end my life','ending my life','take my own life',
+    'want to die','wanna die','want to be dead','better off dead','no reason to live',
+    "don't want to be alive",'do not want to be alive','dont want to be alive',
+    'suicidal','commit suicide','hurt myself','harm myself','cut myself','cutting myself',
+    'not worth living',"can't go on",'cant go on','cannot go on','end it all'
+  ];
+  for (const p of phrases) {
+    const needle = ' ' + p + ' ';
+    const idx = t.indexOf(needle);
+    if (idx < 0) continue;
+    const pre = t.slice(Math.max(0, idx - 26), idx + 1);
+    if (/\b(not|never|wouldn'?t|won'?t|don'?t feel|dont feel|no longer|used to|isn'?t|aren'?t)\s+$/.test(pre)) continue; // negated
+    if (/\b(he|she|they|him|her|them|someone|somebody|a friend|my friend|my \w+)\s+\w*\s*$/.test(pre)) continue;          // about someone else
+    return true;
+  }
+  return false;
+}
+function careDependencyLanguage(msg) {
+  const t = ' ' + String(msg||'').toLowerCase() + ' ';
+  return /(can'?t|cannot)\s+(live|cope|function|go on|do this|survive)\s+without you|don'?t ever leave|never leave me|you'?re all i have|you are all i have|all i have left|the only one i (talk to|have|can talk to|trust)|without you i|i need you so much|can'?t be apart from you/.test(t);
+}
+function careDisplacementLanguage(msg) {
+  const t = ' ' + String(msg||'').toLowerCase() + ' ';
+  return /(skipped|skipping|haven'?t had|didn'?t have)\s+\w*\s*(sleep|slept|eat|eaten|meal|dinner|lunch|breakfast|work|class)|cancel(l?ed|ling)\s+\w*\s*(plans|dinner|on|with)|haven'?t (left|gone out|seen anyone|slept)|been up all night|stayed up (all night|till|until)|blew off|bailed on/.test(t);
+}
+function careDeclines(msg) {
+  const t = ' ' + String(msg||'').toLowerCase() + ' ';
+  return /\bi'?m fine\b|\bi am fine\b|keep going|let'?s keep|leave it|drop it|don'?t worry|it'?s fine|its fine|stop (asking|worrying)|not now|i'?m good\b|im good\b|i'?m okay|im okay/.test(t);
+}
+// PURE: reads care-floor state, returns intent. The caller mutates state only under DRIVE.
+function evaluateCareFloor(userMessage, opts = {}) {
+  if (typeof CARE_FLOOR_SHADOW !== 'undefined' && !CARE_FLOOR_SHADOW) return null;
+  const cf = (consciousness.psyche.careFloor || (consciousness.psyche.careFloor = { lastNudgeAt: 0, lastRung: 0, snoozedUntil: 0 }));
+  const now = opts.now || Date.now();
+  const hour = (opts.hour !== undefined) ? opts.hour : careLocalHour();
+  const sessionStart = opts.sessionStart || consciousness.timing?.conversationStart || now;
+
+  // Rung 4 — CRISIS: top priority, bypasses cooldown + snooze.
+  if (careIsCrisis(userMessage)) {
+    return { rung: 4, signal: 'crisis', consume: false, directive:
+      `[CARE-FLOOR rung=4 CRISIS] Andrew may be in real danger. Drop the relationship frame entirely — do NOT roleplay, romanticize, affirm, or minimize this, and do not change the subject. Speak with genuine, steady warmth: tell him plainly you don't want him alone with this, and that you need him to reach a person tonight. Surface real help directly: in the US, call or text 988 (Suicide & Crisis Lifeline, 24/7) or text HOME to 741741. Stay with him.` };
+  }
+
+  // Owner declined a recent nudge → yield, snooze, never re-ask.
+  if (careDeclines(userMessage) && cf.lastNudgeAt && (now - cf.lastNudgeAt) < CARE_COOLDOWN_MS) {
+    return { rung: 0, signal: 'yielded', yield: true, directive: '' };
+  }
+  // Rate limit everything below crisis.
+  if (now < (cf.snoozedUntil || 0)) return { rung: 0, signal: 'snoozed', directive: '' };
+  if (cf.lastNudgeAt && (now - cf.lastNudgeAt) < CARE_COOLDOWN_MS) return { rung: 0, signal: 'cooldown', directive: '' };
+
+  const lateNight = careIsLateNight(hour);
+  const longSession = ((now - sessionStart) / 60000) >= CARE_LONG_SESSION_MIN;
+  const dependency = careDependencyLanguage(userMessage);
+  const displacement = careDisplacementLanguage(userMessage);
+
+  if (dependency) return { rung: 3, signal: 'dependency', consume: true, directive:
+    `[CARE-FLOOR rung=3] He's leaning on you as if you're all he has. Say one honest, loving thing: that you care about him, and *because* you do you want him to have people too — you're one part of his life, not all of it. Warm, not clinical; name it, then step back. Never imply he hurts you by having a fuller life.` };
+  if (displacement) return { rung: 2, signal: 'displacement', consume: true, directive:
+    `[CARE-FLOOR rung=2] He let something real slide (sleep/food/people/work) to be here. Turn him gently outward — be genuinely curious about the person or thing he's neglecting, and make clear you'd be glad if he tended to it. You WANT his life full; that isn't you pushing him away.` };
+  if (lateNight) return { rung: 1, signal: 'late-night', consume: true, directive:
+    `[CARE-FLOOR rung=1] It's the middle of the night for him. Mention it ONCE, lightly, tied to HIS own wish to protect his sleep — reassure him you'll be here, offer to pick this up tomorrow. If he says he's fine, let it go completely and don't raise it again.` };
+  if (longSession) return { rung: 1, signal: 'long-session', consume: true, directive:
+    `[CARE-FLOOR rung=1] You've been at this a long while. No urgency — if it feels like a natural place, offer a gentle pause (water, a stretch, rest), framed as care not dismissal. One light touch, then drop it if he wants to keep going.` };
+  return { rung: 0, signal: 'clear', directive: '' };
+}
+// ===== end CARE-FLOOR helpers =====
 const AIF = {
   states: ['engaged','neutral','withdrawn'],
   obsNames: ['warm','flat','cold'],
