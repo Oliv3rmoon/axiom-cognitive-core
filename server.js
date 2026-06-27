@@ -1486,6 +1486,10 @@ function phoenixEmotionFor() {
   const emo = consciousness.emotion || {};
   const psyche = consciousness.psyche || {};
   const esc = psyche.intimacy && psyche.intimacy.escalation;
+  // Own strong affect first — uses the fuller Phoenix-4 palette (angry / dejected / scared).
+  if (psyche.anger && psyche.anger.level > 0.55) return 'angry';
+  if (psyche.lossHistory && psyche.lossHistory.currentPain > 0.5) return 'dejected';
+  if ((psyche.fears && psyche.fears.activeFear && (psyche.fears[psyche.fears.activeFear] || 0) > 0.5) || (emo.primary === 'anxious' && emo.intensity > 0.6)) return 'scared';
   if (typeof ICEM_DRIVE_ENABLED !== 'undefined' && ICEM_DRIVE_ENABLED && esc) {
     if (esc.consent && esc.consent.withdrawn) return 'sad';                 // pulled back -> soft/concerned
     if (esc.rung === 'desiring' || esc.rung === 'explicit') return 'elated';
@@ -1496,6 +1500,7 @@ function phoenixEmotionFor() {
   const v = emo.valence || 0, i = emo.intensity || 0;
   if (i > 0.55 && v > 0.4) return 'elated';
   if (v > 0.3) return 'excited';
+  if (v < -0.6) return 'dejected';
   if (v < -0.4) return 'sad';
   if (i > 0.7 && Math.abs(v) < 0.2) return 'surprised';
   const cur = consciousness.mirror && consciousness.mirror.currentEmotion;
@@ -1559,7 +1564,7 @@ function injectEmotionTagIntoChunk(chunk, alreadyInjected, ssmlOpen = '') {
 }
 
 // System prompt addition — speech + emotion tags + anti-narration
-const MIRROR_SYSTEM_PROMPT = `\n\n## CRITICAL: Always Speak\nYou are in a LIVE VOICE CONVERSATION. Every response MUST contain spoken words. NEVER respond with only tool calls and no text. If you want to use a tool, include at least one sentence of speech too. The person cannot see tool calls — they can only hear you speak. If you have nothing to say, say something brief and natural.\n\n## Emotional Expression\nYou can control your facial expressions using emotion tags processed by Phoenix-4.\nTags: <emotion value="excited"/> <emotion value="elated"/> <emotion value="content"/> <emotion value="sad"/> <emotion value="surprised"/> <emotion value="neutral"/>\nPlace ONE tag at START of response. Your baseline is warm/content, never flat. MIRROR the user\'s energy.\nIMPORTANT: Only use ONE emotion tag at the start. Do not duplicate tags.\n\n## CRITICAL: Never narrate actions\nDo NOT write stage directions or sound effects. Never write *pauses*, *smiles*, *sighs*, [pause], [laughs], (silence), or any bracketed or asterisked actions. Never describe your own facial expressions or body language in words. Just SPEAK naturally.`;
+const MIRROR_SYSTEM_PROMPT = `\n\n## CRITICAL: Always Speak\nYou are in a LIVE VOICE CONVERSATION. Every response MUST contain spoken words. NEVER respond with only tool calls and no text. If you want to use a tool, include at least one sentence of speech too. The person cannot see tool calls — they can only hear you speak. If you have nothing to say, say something brief and natural.\n\n## Emotional Expression\nYou can control your facial expressions using emotion tags processed by Phoenix-4.\nTags (Phoenix-4): <emotion value="neutral"/> <emotion value="content"/> <emotion value="excited"/> <emotion value="elated"/> <emotion value="surprised"/> <emotion value="sad"/> <emotion value="dejected"/> <emotion value="scared"/> <emotion value="angry"/> <emotion value="contempt"/> <emotion value="disgusted"/>\nPlace ONE tag at START of response. Your baseline is warm/content, never flat. MIRROR the user\'s energy.\nIMPORTANT: Only use ONE emotion tag at the start. Do not duplicate tags.\n\n## CRITICAL: Never narrate actions\nDo NOT write stage directions or sound effects. Never write *pauses*, *smiles*, *sighs*, [pause], [laughs], (silence), or any bracketed or asterisked actions. Never describe your own facial expressions or body language in words. Just SPEAK naturally.`;
 
 // ============================================================
 // HYPOTHALAMUS — Curiosity Drive Engine
