@@ -457,7 +457,7 @@ const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
 function ensureProtocol(url) { return url && !url.startsWith('http') ? `https://${url}` : url; }
 
 // DUAL BRAIN CONFIGURATION
-const CORTEX_MODEL = 'claude-sonnet-4-6';
+const CORTEX_MODEL = 'claude-opus-4-8';
 const PREFRONTAL_MODEL = 'claude-fable-5';
 const PREFRONTAL_FALLBACK = 'claude-opus-4-8'; // Mythos classifier / empty-completion retry target
 const BRAINSTEM_MODEL = 'claude-haiku-4-5';
