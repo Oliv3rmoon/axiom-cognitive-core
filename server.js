@@ -5453,6 +5453,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   }
 
+  let __mainTimer;
+  const __mainTimeoutMs = parseInt(process.env.MAIN_FETCH_TIMEOUT_MS || '120000', 10);
+  const __mainCtrl = new AbortController();
+  __mainTimer = setTimeout(() => __mainCtrl.abort(), __mainTimeoutMs);
   try {
     const proxyRes = await fetch(`${LLM_PROXY_URL}/v1/chat/completions`, {
       method: 'POST',
@@ -5465,6 +5469,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         ...rest,
         ...(__insulaTemp != null ? { temperature: __insulaTemp } : {}),
       }),
+      signal: __mainCtrl.signal,
     });
 
     // Check for LLM proxy errors (rate limits, model errors, etc.)
@@ -5653,6 +5658,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     console.log(`[FALLBACK] Sent: "${fallback}"`);
+  } finally {
+    clearTimeout(__mainTimer);
   }
 });
 
