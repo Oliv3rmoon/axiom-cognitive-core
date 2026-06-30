@@ -452,6 +452,7 @@ const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
 const BROWSER_URL = process.env.BROWSER_URL || 'https://axiom-browser-production.up.railway.app';
 const BROWSER_KEY = process.env.BROWSER_KEY || 'axiom-browser-2026';
 const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || '';
+const SKILLS_EXECUTABLE = ['1', 'true', 'yes', 'on'].includes(String(process.env.SKILLS_EXECUTABLE || '').toLowerCase());
 
 // Ensure all external URLs have protocol prefix
 function ensureProtocol(url) { return url && !url.startsWith('http') ? `https://${url}` : url; }
@@ -7298,8 +7299,7 @@ async function createPlanForGoal(goal) {
     }
     const skills = await loadMatchingSkills(goal);
     if (skills.length > 0) {
-      skillsContext = '\n\nSKILLS YOU HAVE LEARNED (use these approaches):\n' +
-        skills.map(s => `- "${s.skill_name}" (${(s.success_rate*100).toFixed(0)}% success, used ${s.times_used}x): ${s.approach.slice(0, 150)}`).join('\n');
+      skillsContext = renderSkillsContext(skills);
       if (skills[0].steps_template) {
         skillsContext += `\n\nBEST KNOWN APPROACH for this type of goal:\n${skills[0].steps_template.slice(0, 300)}`;
       }
@@ -10059,6 +10059,103 @@ async function loadMatchingSkills(goal) {
     return data.skills || [];
   } catch (e) { return []; }
 }
+
+function safeSkillName(skill) {
+  return `skill_${String(skill.id || skill.skill_name || 'unknown').replace(/[^0-9A-Za-z_]/g, '_')}`;
+}
+
+function verifiedExecutableSkill(skill) {
+  return !!(skill && skill.code && skill.verified_on);
+}
+
+function skillSignature(skill) {
+  const metadata = skill.metadata && typeof skill.metadata === 'object' ? skill.metadata : {};
+  const signature = metadata.signature || metadata.sig || 'solve(input)';
+  return String(signature).replace(/\bsolve\b/g, safeSkillName(skill)).slice(0, 120);
+}
+
+function renderSkillsContext(skills) {
+  let context = '\n\nSKILLS YOU HAVE LEARNED (use these approaches):\n' +
+    skills.map(s => `- "${s.skill_name}" (${(s.success_rate*100).toFixed(0)}% success, used ${s.times_used}x): ${s.approach.slice(0, 150)}`).join('\n');
+
+  if (!SKILLS_EXECUTABLE) return context;
+
+  const executable = skills.filter(verifiedExecutableSkill);
+  if (!executable.length) return context;
+
+  context += '\n\nVERIFIED EXECUTABLE SKILLS (callable helpers; use only when they fit the goal):\n';
+  context += executable.slice(0, 5).map(s => {
+    const fn = safeSkillName(s);
+    const metadata = s.metadata && typeof s.metadata === 'object' ? s.metadata : {};
+    const purpose = metadata.purpose || metadata.prompt || s.goal_pattern || s.approach || '';
+    const code = String(s.code || '').slice(0, 1200);
+    return `- ${fn}: ${skillSignature(s)} [${s.language || 'python'}, verified_on=${s.verified_on}]\n  Purpose: ${String(purpose).slice(0, 220)}\n  Code:\n\`\`\`${s.language || 'python'}\n${code}\n\`\`\``;
+  }).join('\n');
+  context += '\nOnly call these helpers by their listed skill_* names. Do not invent helper names or treat unverified snippets as executable.';
+  return context;
+}
+
+function containsSecretLikeContent(text) {
+  return /\b(sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|BEGIN (?:RSA|OPENSSH|PRIVATE) KEY)\b/.test(String(text || ''));
+}
+
+function hasVerificationEvidence(payload) {
+  const metadata = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
+  const verification = payload.verification && typeof payload.verification === 'object' ? payload.verification : {};
+  return !!(
+    payload.verified_on ||
+    metadata.verified_on ||
+    metadata.tests_passed === true ||
+    metadata.verifier === 'retention.py' ||
+    verification.passed === true
+  );
+}
+
+async function storeVerifiedExecutableSkill(payload) {
+  if (!payload || !payload.code) throw new Error('code required');
+  if (!payload.verified_on) throw new Error('verified_on required');
+  if (!hasVerificationEvidence(payload)) throw new Error('verification evidence required');
+  if (containsSecretLikeContent(payload.code) || containsSecretLikeContent(JSON.stringify(payload.metadata || {}))) {
+    throw new Error('skill payload appears to contain secret material');
+  }
+
+  const language = payload.language || 'python';
+  const metadata = {
+    ...(payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {}),
+    verification: payload.verification || null,
+    admitted_by: 'axiom-cognitive-core',
+    admitted_at: new Date().toISOString(),
+  };
+  const res = await fetch(`${BACKEND_URL}/api/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      skill_name: payload.skill_name,
+      goal_pattern: payload.goal_pattern,
+      approach: payload.approach,
+      steps_template: payload.steps_template || null,
+      code: payload.code,
+      verified_on: payload.verified_on,
+      language,
+      purpose_embedding: payload.purpose_embedding || null,
+      metadata,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `backend rejected skill (${res.status})`);
+  return data;
+}
+
+// Low-risk local admission point for verified executable skills from lab harnesses.
+// Runtime use still requires SKILLS_EXECUTABLE=1, and unverified code is refused.
+app.post('/api/skills/executable/verified', async (req, res) => {
+  try {
+    const saved = await storeVerifiedExecutableSkill(req.body || {});
+    res.json({ saved: true, id: saved.id });
+  } catch (e) {
+    res.status(400).json({ saved: false, error: e.message });
+  }
+});
 
 // After a goal is completed, analyze what worked and create a skill
 async function analyzeGoalCompletion(goal, plan) {
