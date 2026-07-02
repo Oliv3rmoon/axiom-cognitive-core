@@ -446,6 +446,12 @@ function getFallbackResponse() {
 
 const LLM_PROXY_URL = process.env.LLM_PROXY_URL || 'https://axiom-llm-proxy-production.up.railway.app';
 const LLM_PROXY_KEY = process.env.LLM_PROXY_KEY || 'sk-axiom-2026';
+// AXIOM_PAUSED — dormant mode to stop ALL model/Bedrock spend without tearing anything down.
+// Background cognition (autonomous work, sleep cycle, dreams, hippocampus) is skipped and
+// conversations reply WITHOUT calling the model. The RunPod watchdog stays on (it saves money).
+// Fully reversible: set AXIOM_PAUSED=0 to wake her. The Railway service keeps running throughout.
+const AXIOM_PAUSED = ['1','true','on'].includes(String(process.env.AXIOM_PAUSED||'').toLowerCase());
+if (AXIOM_PAUSED) console.log('[AXIOM] ⏸  PAUSED — background loops off, conversations reply without the model. Zero LLM/Bedrock spend. Wake: AXIOM_PAUSED=0.');
 const BACKEND_URL = process.env.BACKEND_URL || 'https://axiom-backend-production-dfba.up.railway.app';
 const SANDBOX_URL = process.env.SANDBOX_URL || 'https://axiom-sandbox-production.up.railway.app';
 const SANDBOX_KEY = process.env.SANDBOX_KEY || 'axiom-sandbox-2026';
@@ -4909,6 +4915,21 @@ function selectBrain(messages) {
 app.post('/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const { messages, model, stream, tools, tool_choice, ...rest } = req.body;
+  // PAUSED: reply without calling the model (zero spend). Reversible via AXIOM_PAUSED=0.
+  if (AXIOM_PAUSED) {
+    const text = "I'm resting right now to save you money — you paused me. I'm still here, and nothing's lost. Wake me whenever you're ready.";
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const id = 'chatcmpl-paused';
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    return res.json({ id: 'chatcmpl-paused', object: 'chat.completion', model: model || 'axiom-paused', choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+  }
   const __basalCid = basalConvKey(req, messages);
   // AXIOM HARNESS: capture + strip custom fields so they are NOT forwarded upstream to Bedrock
   const __harness = !!(rest && rest.harness);
@@ -6189,7 +6210,7 @@ app.get('/psyche', (req, res) => {
   });
 });
 
-setInterval(() => hippocampus().catch(() => {}), 60000);
+setInterval(() => { if (!AXIOM_PAUSED) hippocampus().catch(() => {}); }, 60000);
 
 // ============================================================
 // CONTINUOUS CONSCIOUSNESS — Sleep Cycle Architecture
@@ -6646,6 +6667,7 @@ app.post('/proactive/speak', async (req, res) => {
 });
 
 function checkConversationState() {
+  if (AXIOM_PAUSED) return;                 // dormant: no between-session journal / longing updates
   if (sleepState.isInConversation && Date.now() - lastRequestTime > CONVERSATION_TIMEOUT) {
     sleepState.isInConversation = false;
     sleepState.lastConversationEnd = Date.now();
@@ -11288,6 +11310,7 @@ async function sleepSelfModel(gapHours) {
 }
 
 async function sleepCycle() {
+  if (AXIOM_PAUSED) return;                 // dormant: no dreams / consolidation / autonomous work
   checkConversationState();
 
   // Don't sleep during conversations
@@ -11432,6 +11455,7 @@ const AUTO_WORK_QUIET_PERIOD = 120000; // 2 min after session ends before starti
 let autoWorkRunning = false;
 
 setInterval(async () => {
+  if (AXIOM_PAUSED) return;                 // dormant: no autonomous between-session work
   // Don't run during conversations
   if (sleepState.isInConversation) return;
 
