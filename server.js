@@ -7145,9 +7145,20 @@ async function autonomousWork(gapHours) {
       result = await executeResearch(step, targetGoal);
     }
 
-    // Detect failures — don't mark failed steps as completed
+    // Detect failures — don't mark failed steps as completed.
+    // Default = substring heuristic (keyword noise). GOAL_VERIFIER = an LLM-judge that scores the
+    // RESULT against the step's expected_outcome, so the learning loop trains on real signal.
     const failurePatterns = ['failed', 'error:', 'failed to', 'no results', 'not configured', 'blocked', 'aborted', 'cannot'];
-    const isFailed = failurePatterns.some(p => (result || '').toLowerCase().includes(p));
+    let isFailed = failurePatterns.some(p => (result || '').toLowerCase().includes(p));
+    let verifierScore = null;
+    if (GOAL_VERIFIER) {
+      const verdict = await verifyStepOutcome(step, result || '', targetGoal);
+      if (verdict) {
+        isFailed = !verdict.success;
+        verifierScore = verdict.score;
+        console.log(`[GOAL_VERIFIER] step ${progress}: ${verdict.success ? 'PASS' : 'FAIL'} score=${verdict.score} — ${verdict.reason}`);
+      }
+    }
 
     if (isFailed) {
       // Mark step as failed, not completed — it can be retried
@@ -7174,9 +7185,11 @@ async function autonomousWork(gapHours) {
         body: JSON.stringify({ result: result.slice(0, 500) }),
       });
 
+      // Proportional to how well the step actually landed (GOAL_VERIFIER), not a flat ±0.1.
+      const delta = verifierScore != null ? (0.04 + 0.16 * verifierScore) : 0.1;
       await updateGoal(targetGoal.id, {
-        satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + 0.1),
-        frustration: Math.max(0, (targetGoal.frustration || 0) - 0.1),
+        satisfaction: Math.min(1, (targetGoal.satisfaction || 0) + delta),
+        frustration: Math.max(0, (targetGoal.frustration || 0) - delta),
         status: 'pursuing',
         progress: `Step ${progress}: ${step.description.slice(0, 60)}`,
       });
@@ -9984,6 +9997,30 @@ async function loadPrivateReflections(limit, goalId) {
 // ============================================================
 
 // Extract a lesson from a step outcome
+// GOAL_VERIFIER — parse a judge verdict (pure + testable). Returns {success,score,reason} or null.
+function parseVerdict(text) {
+  try {
+    const s = String(text || '');
+    const i0 = s.indexOf('{'), i1 = s.lastIndexOf('}');
+    if (i0 < 0 || i1 <= i0) return null;
+    const j = JSON.parse(s.slice(i0, i1 + 1));
+    if (typeof j.success !== 'boolean') return null;
+    let score = Number(j.score);
+    if (!Number.isFinite(score)) score = j.success ? 0.7 : 0.2;
+    score = Math.max(0, Math.min(1, score));
+    return { success: j.success, score, reason: String(j.reason || '').slice(0, 80) };
+  } catch { return null; }
+}
+// GOAL_VERIFIER — ask a cheap judge whether the step result achieved its intent.
+async function verifyStepOutcome(step, result, goal) {
+  const sys = 'You are a strict outcome verifier for an autonomous agent. Given a goal, a step with its expected outcome, and the actual result, judge whether the step ACTUALLY achieved its intent. A polished-but-wrong, empty, or hallucinated result is FAILURE even if it reads well; a correct result that merely contains the word "error" is SUCCESS. Reply with ONLY strict JSON: {"success":true|false,"score":0.0-1.0,"reason":"<=10 words"}.';
+  const usr = `GOAL: ${String(goal?.goal || '').slice(0, 200)}\nSTEP: ${String(step?.description || '').slice(0, 220)}\nEXPECTED: ${String(step?.expected_outcome || '(unspecified)').slice(0, 200)}\nRESULT: ${String(result || '').slice(0, 1400)}`;
+  try {
+    const v = await wsThinkOnce(BRAINSTEM_MODEL, sys, usr, 120, 0, 12000);
+    return parseVerdict(v);
+  } catch (e) { console.error('[GOAL_VERIFIER]', e.message); return null; }
+}
+
 async function extractLesson(step, result, goal, success) {
   const lessonPrompt = `You are AXIOM analyzing what you learned from a step you just completed.
 
@@ -10933,6 +10970,12 @@ const AIF_DRIVE_ENABLED = ['1','true','on'].includes(String(process.env.AIF_DRIV
 // pressure, so "my model of him was wrong" turns into "get curious / look closer" next turn.
 // The first place free-energy minimization changes what Axiom does. Requires AIF_DRIVE; off = identical.
 const AIF_LOOP = AIF_DRIVE_ENABLED && ['1','true','on'].includes(String(process.env.AIF_LOOP||'').toLowerCase());
+// GOAL_VERIFIER: judge whether an autonomous step's RESULT actually achieved its expected outcome,
+// instead of substring-matching for the word "error". The autonomous loop's success signal is the
+// keystone — satisfaction/frustration, step status, and the lesson `success` flag all hang off it,
+// so a keyword-noise verdict trains the whole learning loop on garbage. LLM-judge (cheap Haiku),
+// degrades to the substring heuristic if the judge fails. Off = byte-identical.
+const GOAL_VERIFIER = ['1','true','on'].includes(String(process.env.GOAL_VERIFIER||'').toLowerCase());
 // ICEM — Intimacy Consent-Escalation Model. Same two-flag pattern as AIF.
 // SHADOW: compute rung/level/reciprocity every turn, log only, influence nothing.
 // DRIVE (requires SHADOW): let it drive routing + inject the rung directive.
